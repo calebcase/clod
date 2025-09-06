@@ -1,0 +1,103 @@
+#!/bin/env bash
+set -euo pipefail
+
+reinit=${CLOD_REINIT:-false}
+config=${CLOD_CONFIG:-$HOME/.config.json}
+
+# Who are you?
+user_id=$(id -u)
+user_name=$(id -nu)
+group_id=$(id -u)
+group_name=$(id -nu)
+
+# Is this directory initialized?
+initialize() {
+  mkdir -p .clod/claude
+
+  # Use an existing config if available.
+  if [[ ! -f .clod/claude/claude.json && -f "$config" ]]; then
+    cp "$config" .clod/claude/claude.json
+  fi
+
+  cwd=$(pwd)
+  name=$(basename "$cwd")
+  printf '%s\n' "$name" > .clod/name
+
+  # Create a unique id for this directory so that
+  # we can have a short name.
+  if [[ ! -f .clod/id ]]; then
+    uuid=$(uuidgen)
+    id=${uuid:0:8}
+    printf '%s\n' "$id" > .clod/id
+  else
+    id=$(<.clod/id)
+  fi
+
+  cat <<EOF > .clod/Dockerfile
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
+    --mount=type=cache,sharing=locked,target=/var/lib/apt \
+    apt-get update \
+ && apt-get install -qq -y npm
+
+COPY <<DEOF /usr/bin/claude-wrapper
+#!/bin/bash
+set -euo pipefail
+
+if [[ -f ~/.claude/claude.json ]]; then
+  cp ~/.claude/claude.json ~/.claude.json
+fi
+
+trap 'cp ~/.claude.json ~/.claude/claude.json' EXIT
+
+claude "\$@"
+DEOF
+RUN chmod u+x /usr/bin/claude-wrapper
+
+RUN (groupdel \$(getent group $group_id | cut -d: -f1) || true) \
+ && (userdel \$(getent passwd $user_id | cut -d: -f1) || true) \
+ && groupadd -g $group_id $group_name \
+ && useradd -m -u $user_id -g $group_name $user_name
+
+USER $user_name
+WORKDIR $cwd
+
+RUN mkdir ~/.npm \
+ && npm config set prefix ~/.npm \
+ && npm install -g @anthropic-ai/claude-code
+ENV PATH=\$PATH:/home/$user_name/bin:/home/$user_name/.npm/bin
+
+ENTRYPOINT ["claude-wrapper"]
+EOF
+  docker build -f .clod/Dockerfile -t "clod-$name-$id" .clod
+
+  cat <<EOF > .clod/run
+#!/bin/env bash
+set -euo pipefail
+
+exec docker run -it --rm \
+  --hostname "clod-$name-$id" \
+  -v "$cwd/.clod/claude:/home/$user_name/.claude" \
+  -v "$cwd:$cwd" \
+  "clod-$name-$id" "\$@"
+EOF
+  chmod u+x .clod/run
+}
+
+if [[ ! -d .clod || $reinit == 'true' ]]; then
+  read -p "Initialize the .clod directory? [Y/n] " yn
+  case $yn in
+    [Yy]* | '')
+      printf 'initializing...\n'
+      initialize
+      ;;
+    *)
+      exit
+      ;;
+  esac
+fi
+
+# It's go time!
+exec .clod/run "$@"
