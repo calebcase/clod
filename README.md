@@ -46,7 +46,7 @@ editing run `.clod/build` to rebuild the docker image.
 If you need to adjust the docker run command (e.g. adding a port forward or
 additional mount), edit `.clod/run`.
 
-If this containment mechanism is sufficent for you, then you can also reduce
+If this containment mechanism is sufficient for you, then you can also reduce
 the burden of claude asking for permissions to do things, either in the claude
 config, or [command line flags][claude-permission-modes]:
 
@@ -76,6 +76,33 @@ Options:
   --verbose                                         Override verbose mode setting from config
 ...
 ```
+
+#### Sharing Customizations
+
+clod configuration is also "relocatable" (*with care*) - meaning that you can
+check in parts of the `.clod` directory and future checkouts will be able to
+use whatever customizations to the `.clod/Dockerfile`, `.clod/build`,
+`.clod/run`, etc that you added. *It is important to avoid checking in files
+with credentials.* I would avoid checking in `.clod/claude` due to the
+credentials and also the hard coded path information added in various config
+files in that directory.
+
+Recommended `.gitignore`:
+
+```
+/.clod/claude
+/.clod/id
+/.clod/name
+```
+
+Files that are probably safe to check in:
+
+* `.clod/Dockerfile`
+* `.clod/build`
+* `.clod/run`
+
+If you are **really careful** what you add to the `.clod/claude/claude.json` it
+might also be checked in.
 
 #### Similar Projects
 

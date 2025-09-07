@@ -4,12 +4,6 @@ set -euo pipefail
 reinit=${CLOD_REINIT:-false}
 config=${CLOD_CONFIG:-$HOME/.claude.json}
 
-# Who are you?
-user_id=$(id -u)
-user_name=$(id -nu)
-group_id=$(id -u)
-group_name=$(id -nu)
-
 # Is this directory initialized?
 initialize() {
   mkdir -p .clod/claude
@@ -62,18 +56,22 @@ claude "\\\$@"
 DEOF
 RUN chmod u+x /usr/bin/claude-wrapper
 
-RUN (groupdel \$(getent group $group_id | cut -d: -f1) || true) \\
- && (userdel \$(getent passwd $user_id | cut -d: -f1) || true) \\
- && groupadd -g $group_id $group_name \\
- && useradd -m -u $user_id -g $group_name $user_name
+ARG GROUP_ID
+ARG GROUP_NAME
+ARG USER_ID
+ARG USER_NAME
+RUN (groupdel \$(getent group "\$GROUP_ID" | cut -d: -f1) || true) \\
+ && (userdel \$(getent passwd "\$USER_ID" | cut -d: -f1) || true) \\
+ && groupadd -g "\$GROUP_ID" "\$GROUP_NAME" \\
+ && useradd -m -u "\$USER_ID" -g "\$GROUP_NAME" "\$USER_NAME"
 
-USER $user_name
-WORKDIR $cwd
+USER "\$USER_NAME"
+WORKDIR "/home/\$USER_NAME"
 
 RUN mkdir ~/.npm \\
  && npm config set prefix ~/.npm \\
  && npm install -g @anthropic-ai/claude-code
-ENV PATH=\$PATH:/home/$user_name/bin:/home/$user_name/.npm/bin
+ENV PATH="\$PATH:/home/\$USER_NAME/bin:/home/\$USER_NAME/.npm/bin"
 
 ENTRYPOINT ["claude-wrapper"]
 
@@ -93,25 +91,44 @@ set -euo pipefail
 name=\$(<.clod/name)
 id=\$(<.clod/id)
 
-exec docker build -f .clod/Dockerfile -t "clod-\$name-\$id" .clod
+# Who are you?
+user_id=\$(id -u)
+user_name=\$(id -nu)
+group_id=\$(id -u)
+group_name=\$(id -nu)
+
+exec docker build \\
+  --build-arg "USER_ID=\$user_id" \\
+  --build-arg "USER_NAME=\$user_name" \\
+  --build-arg "GROUP_ID=\$group_id" \\
+  --build-arg "GROUP_NAME=\$group_name" \\
+  -t "clod-\$name-\$id" \\
+  - < .clod/Dockerfile
 EOF
   fi
   chmod u+x .clod/build
-  .clod/build
 
   if [[ ! -f .clod/run ]]; then
     cat <<EOF > .clod/run
 #!/bin/env bash
 set -euo pipefail
 
+cwd=\$(pwd)
 name=\$(<.clod/name)
 id=\$(<.clod/id)
+user_name=\$(id -nu)
+
+if [[ -v CLOD_ENTRYPOINT ]]; then
+  entrypoint="--entrypoint \$CLOD_ENTRYPOINT"
+fi
 
 exec docker run -it --rm \\
   --hostname "clod-\$name-\$id" \\
-  -v "$cwd:$cwd" \\
-  -v "$cwd/.clod:$cwd/.clod:ro" \\
-  -v "$cwd/.clod/claude:/home/$user_name/.claude" \\
+  -v "\$cwd:\$cwd" \\
+  -v "\$cwd/.clod:\$cwd/.clod:ro" \\
+  -v "\$cwd/.clod/claude:/home/\$user_name/.claude" \\
+  -w "\$cwd" \\
+  \${entrypoint:-} \\
   "clod-\$name-\$id" "\$@"
 EOF
   fi
@@ -132,4 +149,5 @@ if [[ ! -d .clod || $reinit == 'true' ]]; then
 fi
 
 # It's go time!
+.clod/build
 exec .clod/run "$@"
