@@ -45,3 +45,48 @@ editing run `.clod/build` to rebuild the docker image.
 
 If you need to adjust the docker run command (e.g. adding a port forward or
 additional mount), edit `.clod/run`.
+
+If this containment mechanism is sufficent for you, then you can also reduce
+the burden of claude asking for permissions to do things, either in the claude
+config, or [command line flags][claude-permission-modes]:
+
+```
+clod --permission-mode acceptEdits
+```
+
+Or even disable them entirely if you don't mind it having [unfettered access to
+the internet and such][claude-dangerously-skip-permissions]:
+
+```
+clod --dangerously-skip-permissions
+```
+
+clod plumbs the flags directly to claude:
+
+```
+$ clod --help
+Claude Code - starts an interactive session by default, use -p/--print for non-interactive output
+
+Arguments:
+  prompt                                            Your prompt
+
+Options:
+  -d, --debug [filter]                              Enable debug mode with optional category filtering (e.g., "api,hooks" or
+                                                    "!statsig,!file")
+  --verbose                                         Override verbose mode setting from config
+...
+```
+
+#### Similar Projects
+
+There are several similar projects. If the design choices for clod aren't to
+your liking possibly one of these will be:
+
+* https://docs.anthropic.com/en/docs/claude-code/devcontainer
+* https://github.com/RchGrav/claudebox
+* https://github.com/VishalJ99/claude-docker
+
+---
+
+[claude-permission-modes]: https://docs.anthropic.com/en/docs/claude-code/iam#permission-modes
+[claude-dangerously-skip-permissions]: https://docs.anthropic.com/en/docs/claude-code/devcontainer
