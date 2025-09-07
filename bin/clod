@@ -109,8 +109,9 @@ id=\$(<.clod/id)
 
 exec docker run -it --rm \\
   --hostname "clod-\$name-\$id" \\
-  -v "$cwd/.clod/claude:/home/$user_name/.claude" \\
   -v "$cwd:$cwd" \\
+  -v "$cwd/.clod:$cwd/.clod:ro" \\
+  -v "$cwd/.clod/claude:/home/$user_name/.claude" \\
   "clod-\$name-\$id" "\$@"
 EOF
   fi
