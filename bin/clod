@@ -2,7 +2,7 @@
 set -euo pipefail
 
 reinit=${CLOD_REINIT:-false}
-config=${CLOD_CONFIG:-$HOME/.config.json}
+config=${CLOD_CONFIG:-$HOME/.claude.json}
 
 # Who are you?
 user_id=$(id -u)
@@ -19,27 +19,33 @@ initialize() {
     cp "$config" .clod/claude/claude.json
   fi
 
-  cwd=$(pwd)
-  name=$(basename "$cwd")
-  printf '%s\n' "$name" > .clod/name
+  local cwd=$(pwd)
+
+  if [[ ! -f .clod/name ]]; then
+    local name=$(basename "$cwd")
+    printf '%s\n' "$name" > .clod/name
+  else
+    local name=$(<.clod/name)
+  fi
 
   # Create a unique id for this directory so that
   # we can have a short name.
   if [[ ! -f .clod/id ]]; then
-    uuid=$(uuidgen)
-    id=${uuid:0:8}
+    local uuid=$(uuidgen)
+    local id=${uuid:0:8}
     printf '%s\n' "$id" > .clod/id
   else
-    id=$(<.clod/id)
+    local id=$(<.clod/id)
   fi
 
-  cat <<EOF > .clod/Dockerfile
+  if [[ ! -f .clod/Dockerfile ]]; then
+    cat <<EOF > .clod/Dockerfile
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
-    --mount=type=cache,sharing=locked,target=/var/lib/apt \
-    apt-get update \
+RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \\
+    --mount=type=cache,sharing=locked,target=/var/lib/apt \\
+    apt-get update \\
  && apt-get install -qq -y npm
 
 COPY <<DEOF /usr/bin/claude-wrapper
@@ -52,37 +58,62 @@ fi
 
 trap 'cp ~/.claude.json ~/.claude/claude.json' EXIT
 
-claude "\$@"
+claude "\\\$@"
 DEOF
 RUN chmod u+x /usr/bin/claude-wrapper
 
-RUN (groupdel \$(getent group $group_id | cut -d: -f1) || true) \
- && (userdel \$(getent passwd $user_id | cut -d: -f1) || true) \
- && groupadd -g $group_id $group_name \
+RUN (groupdel \$(getent group $group_id | cut -d: -f1) || true) \\
+ && (userdel \$(getent passwd $user_id | cut -d: -f1) || true) \\
+ && groupadd -g $group_id $group_name \\
  && useradd -m -u $user_id -g $group_name $user_name
 
 USER $user_name
 WORKDIR $cwd
 
-RUN mkdir ~/.npm \
- && npm config set prefix ~/.npm \
+RUN mkdir ~/.npm \\
+ && npm config set prefix ~/.npm \\
  && npm install -g @anthropic-ai/claude-code
 ENV PATH=\$PATH:/home/$user_name/bin:/home/$user_name/.npm/bin
 
 ENTRYPOINT ["claude-wrapper"]
-EOF
-  docker build -f .clod/Dockerfile -t "clod-$name-$id" .clod
 
-  cat <<EOF > .clod/run
+# Uncomment to add additional apt dependencies:
+#RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \\
+#    --mount=type=cache,sharing=locked,target=/var/lib/apt \\
+#    apt-get update \\
+# && apt-get install -qq -y jq
+EOF
+  fi
+
+  if [[ ! -f .clod/build ]]; then
+    cat <<EOF > .clod/build
 #!/bin/env bash
 set -euo pipefail
 
-exec docker run -it --rm \
-  --hostname "clod-$name-$id" \
-  -v "$cwd/.clod/claude:/home/$user_name/.claude" \
-  -v "$cwd:$cwd" \
-  "clod-$name-$id" "\$@"
+name=\$(<.clod/name)
+id=\$(<.clod/id)
+
+exec docker build -f .clod/Dockerfile -t "clod-\$name-\$id" .clod
 EOF
+  fi
+  chmod u+x .clod/build
+  .clod/build
+
+  if [[ ! -f .clod/run ]]; then
+    cat <<EOF > .clod/run
+#!/bin/env bash
+set -euo pipefail
+
+name=\$(<.clod/name)
+id=\$(<.clod/id)
+
+exec docker run -it --rm \\
+  --hostname "clod-\$name-\$id" \\
+  -v "$cwd/.clod/claude:/home/$user_name/.claude" \\
+  -v "$cwd:$cwd" \\
+  "clod-\$name-\$id" "\$@"
+EOF
+  fi
   chmod u+x .clod/run
 }
 

@@ -10,6 +10,15 @@ Via user's home bin directory:
 ln -s $(pwd)/bin/clod ~/bin/clod
 ```
 
+If you don't have a home bin directory, you can make:
+
+```bash
+mkdir -p ~/bin
+export PATH=$PATH:$HOME/bin
+```
+
+Add that export to your shell configuration (e.g. `.bashrc`).
+
 #### Usage
 
 ```bash
@@ -23,7 +32,7 @@ created. After the session is ended you can save the claude config and reuse
 it:
 
 ```bash
-cp .clod/config/claude.json ~/claude.json
+cp .clod/claude/claude.json ~/.claude.json
 ```
 
 Now when a new directory is initialized it will reuse that base config. Put the
@@ -31,4 +40,8 @@ settings you want used globally in this config.
 
 Once initialized the `.clod` directory has the configuration files and they can
 be modified if necessary. For example, if you want to install additional
-packages edit `.clod/Dockerfile` and add a new `RUN`.
+packages edit `.clod/Dockerfile` and add a new `RUN`. After you are done
+editing run `.clod/build` to rebuild the docker image.
+
+If you need to adjust the docker run command (e.g. adding a port forward or
+additional mount), edit `.clod/run`.
