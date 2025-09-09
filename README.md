@@ -1,6 +1,18 @@
 # clod <sub>*ˈkläd*</sub>
 
-Run claude code in a modestly more secure way.
+Run [claude code][claude-code] in a modestly more secure way.
+
+#### Features
+
+The main feature of `clod` is that you don't have to worry about what shell
+`1a7d6a` is or what would happen if it was killed:
+
+![Kill shell: 1a7d6a](kill-shell-1a7d6a.png "Kill shell: 1a7d6a")
+
+These bots are imperfect. They do unexpected things. If they are running as you
+on your main system they can do *a lot* of damage.
+
+Use `clod` and save a ~~kitten~~ home directory today.
 
 #### Install
 
@@ -61,7 +73,7 @@ the internet and such][claude-dangerously-skip-permissions]:
 clod --dangerously-skip-permissions
 ```
 
-clod plumbs the flags directly to claude:
+`clod` plumbs the flags directly to claude:
 
 ```
 $ clod --help
@@ -79,7 +91,7 @@ Options:
 
 #### Sharing Customizations
 
-clod configuration is also "relocatable" (*with care*) - meaning that you can
+`clod` configuration is also "relocatable" (*with care*) - meaning that you can
 check in parts of the `.clod` directory and future checkouts will be able to
 use whatever customizations to the `.clod/Dockerfile`, `.clod/build`,
 `.clod/run`, etc that you added. *It is important to avoid checking in files
@@ -104,9 +116,16 @@ Files that are probably safe to check in:
 If you are **really careful** what you add to the `.clod/claude/claude.json` it
 might also be checked in.
 
+#### Contributions
+
+`clod` is under active development. If you have a feature request please open a
+Github issue so it can be discussed. If you have some idea of how it would be
+implemented you are welcome to open a *draft PR*, but the feature request
+ticket is still required. Link the PR to the issue discussing the new feature.
+
 #### Similar Projects
 
-There are several similar projects. If the design choices for clod aren't to
+There are several similar projects. If the design choices for `clod` aren't to
 your liking possibly one of these will be:
 
 * https://docs.anthropic.com/en/docs/claude-code/devcontainer
@@ -115,5 +134,6 @@ your liking possibly one of these will be:
 
 ---
 
+[claude-code]: https://www.anthropic.com/claude-code
 [claude-permission-modes]: https://docs.anthropic.com/en/docs/claude-code/iam#permission-modes
 [claude-dangerously-skip-permissions]: https://docs.anthropic.com/en/docs/claude-code/devcontainer
