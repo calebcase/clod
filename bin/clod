@@ -32,15 +32,37 @@ initialize() {
     local id=$(<.clod/id)
   fi
 
-  if [[ ! -f .clod/Dockerfile ]]; then
-    cat <<EOF > .clod/Dockerfile
-FROM ubuntu:24.04
+  if [[ ! -f .clod/image ]]; then
+    printf '%s\n' "${CLOD_IMAGE:-ubuntu:24.04}" > .clod/image
+  fi
+  local image=$(<.clod/image)
+
+
+  cat <<EOF > .clod/Dockerfile_base
+FROM $image AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \\
     --mount=type=cache,sharing=locked,target=/var/lib/apt \\
     apt-get update \\
  && apt-get install -qq -y npm
+EOF
+
+  if [[ ! -f .clod/Dockerfile_project ]]; then
+    cat <<EOF > .clod/Dockerfile_project
+FROM base AS project
+
+# Uncomment to add project specific dependencies.
+#ARG DEBIAN_FRONTEND=noninteractive
+#RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \\
+#    --mount=type=cache,sharing=locked,target=/var/lib/apt \\
+#    apt-get update \\
+# && apt-get install -qq -y npm
+EOF
+  fi
+
+  cat <<EOF > .clod/Dockerfile_wrapper
+FROM project AS wrapper
 
 COPY <<DEOF /usr/bin/claude-wrapper
 #!/bin/bash
@@ -74,17 +96,9 @@ RUN mkdir ~/.npm \\
 ENV PATH="\$PATH:/home/\$USER_NAME/bin:/home/\$USER_NAME/.npm/bin"
 
 ENTRYPOINT ["claude-wrapper"]
-
-# Uncomment to add additional apt dependencies:
-#RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \\
-#    --mount=type=cache,sharing=locked,target=/var/lib/apt \\
-#    apt-get update \\
-# && apt-get install -qq -y jq
 EOF
-  fi
 
-  if [[ ! -f .clod/build ]]; then
-    cat <<EOF > .clod/build
+  cat <<EOF > .clod/build
 #!/bin/env bash
 set -euo pipefail
 
@@ -97,6 +111,8 @@ user_name=\$(id -nu)
 group_id=\$(id -u)
 group_name=\$(id -nu)
 
+cat .clod/Dockerfile_base .clod/Dockerfile_project .clod/Dockerfile_wrapper > .clod/Dockerfile
+
 exec docker build \\
   --build-arg "USER_ID=\$user_id" \\
   --build-arg "USER_NAME=\$user_name" \\
@@ -105,11 +121,9 @@ exec docker build \\
   -t "clod-\$name-\$id" \\
   - < .clod/Dockerfile
 EOF
-  fi
   chmod u+x .clod/build
 
-  if [[ ! -f .clod/run ]]; then
-    cat <<EOF > .clod/run
+  cat <<EOF > .clod/run
 #!/bin/env bash
 set -euo pipefail
 
@@ -131,7 +145,6 @@ exec docker run -it --rm \\
   \${entrypoint:-} \\
   "clod-\$name-\$id" "\$@"
 EOF
-  fi
   chmod u+x .clod/run
 }
 
