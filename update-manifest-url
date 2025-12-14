@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Update the Slack App manifest URL in README.md
+
+MANIFEST_FILE="./bot/manifest.yaml"
+README_FILE="./README.md"
+
+if [[ ! -f "$MANIFEST_FILE" ]]; then
+    echo "Error: Manifest file not found: $MANIFEST_FILE" >&2
+    exit 1
+fi
+
+if [[ ! -f "$README_FILE" ]]; then
+    echo "Error: README file not found: $README_FILE" >&2
+    exit 1
+fi
+
+echo "Reading manifest from $MANIFEST_FILE..."
+MANIFEST_CONTENT=$(cat "$MANIFEST_FILE")
+
+echo "URL-encoding manifest..."
+ENCODED_MANIFEST=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.stdin.read(), safe=''))" <<< "$MANIFEST_CONTENT")
+
+MANIFEST_URL="https://api.slack.com/apps?new_app=1&manifest_yaml=${ENCODED_MANIFEST}"
+
+echo "Updating $README_FILE..."
+
+# Find and replace the manifest URL in the README using Python
+python3 << EOF
+import re
+import sys
+
+with open("$README_FILE", 'r') as f:
+    content = f.read()
+
+# Pattern to match the Clod Bot link (handles both FIXME and existing URLs)
+pattern = r'\[Click here to create Clod Bot[^\]]*\]\([^)]*\)'
+replacement = '[Click here to create Clod Bot from manifest.]($MANIFEST_URL)'
+
+# Check if pattern exists
+if not re.search(pattern, content):
+    print("Warning: Could not find 'Click here to create Clod Bot' link in README.md", file=sys.stderr)
+    sys.exit(1)
+
+# Replace the pattern
+new_content = re.sub(pattern, replacement, content)
+
+# Write back to file
+with open("$README_FILE", 'w') as f:
+    f.write(new_content)
+
+print("✓ Successfully updated manifest URL in README.md")
+EOF
