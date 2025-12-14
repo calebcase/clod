@@ -1,7 +1,7 @@
 #!/bin/env bash
 set -euo pipefail
 
-CLOD_VERSION="0.2.8"
+CLOD_VERSION="0.2.9"
 
 reinit=${CLOD_REINIT:-false}
 noninteractive=${CLOD_NONINTERACTIVE:-false}
@@ -211,6 +211,110 @@ fi
 # Allow CLOD_CONCURRENT to override the default
 concurrent="\${CLOD_CONCURRENT:-\$concurrent_default}"
 
+# SSH credential forwarding support
+ssh_default="false"
+if [[ -f .clod/ssh ]]; then
+  ssh_file=\$(<.clod/ssh)
+  if [[ "\$ssh_file" == "true" ]]; then
+    ssh_default="true"
+  elif [[ "\$ssh_file" != "false" ]]; then
+    # Not true/false, treat as potential key file path
+    ssh_default="\$ssh_file"
+  fi
+fi
+
+# Allow CLOD_SSH to override the default
+ssh="\${CLOD_SSH:-\$ssh_default}"
+
+# Variable to track if we started our own agent
+clod_ssh_agent_started="false"
+
+if [[ "\$ssh" == "true" ]]; then
+  # Use existing SSH agent
+  # Detect platform and set SSH socket path
+  if [[ -e /run/host-services/ssh-auth.sock ]]; then
+    # macOS with Docker Desktop
+    ssh_socket="/run/host-services/ssh-auth.sock"
+  elif [[ -v SSH_AUTH_SOCK ]]; then
+    # Linux or macOS with SSH_AUTH_SOCK set
+    ssh_socket="\$SSH_AUTH_SOCK"
+  fi
+
+  # Only set SSH forwarding if we found a socket
+  if [[ -n "\$ssh_socket" ]]; then
+    ssh_volume="-v \$ssh_socket:\$ssh_socket"
+    ssh_env="-e SSH_AUTH_SOCK=\$ssh_socket"
+  fi
+elif [[ "\$ssh" != "false" ]]; then
+  # Treat as a key file path - expand tilde and validate
+  # Use eval to properly expand tilde
+  eval ssh_key_file="\$ssh"
+
+  echo "[clod] SSH key file specified: \$ssh" >&2
+  echo "[clod] Expanded SSH key file: \$ssh_key_file" >&2
+
+  if [[ -f "\$ssh_key_file" ]]; then
+    echo "[clod] Starting dedicated SSH agent..." >&2
+
+    # Start a dedicated SSH agent with only this key
+    # Create a temporary directory for the agent socket to avoid conflicts
+    clod_ssh_tmpdir="\$(mktemp -d -t clod-ssh-agent.XXXXXXXXXX)"
+    clod_ssh_socket="\$clod_ssh_tmpdir/agent.sock"
+
+    # ssh-agent needs a clean environment without SSH_AUTH_SOCK set
+    unset SSH_AUTH_SOCK
+    ssh_agent_output=\$(ssh-agent -s -a "\$clod_ssh_socket" 2>&1)
+    echo "[clod] SSH agent output: \$ssh_agent_output" >&2
+    eval "\$ssh_agent_output"
+
+    echo "[clod] SSH_AUTH_SOCK after agent start: \$SSH_AUTH_SOCK" >&2
+    echo "[clod] SSH_AGENT_PID: \$SSH_AGENT_PID" >&2
+
+    # Add the specified key to the agent
+    echo "[clod] Adding key \$ssh_key_file to agent..." >&2
+    ssh_add_output=\$(ssh-add "\$ssh_key_file" 2>&1) || ssh_add_status=\$?
+
+    if [[ -z "\${ssh_add_status:-}" ]]; then
+      echo "[clod] Successfully added key to agent" >&2
+      echo "[clod] ssh-add output: \$ssh_add_output" >&2
+      clod_ssh_agent_started="true"
+      ssh_socket="\$SSH_AUTH_SOCK"
+      ssh_volume="-v \$ssh_socket:\$ssh_socket"
+      ssh_env="-e SSH_AUTH_SOCK=\$ssh_socket"
+
+      # Store the agent PID for cleanup
+      clod_ssh_agent_pid="\$SSH_AGENT_PID"
+    else
+      echo "[clod] Failed to add key to agent (exit code: \$ssh_add_status)" >&2
+      echo "[clod] ssh-add output: \$ssh_add_output" >&2
+      # Kill the agent we just started since we can't use it
+      kill "\$SSH_AGENT_PID" 2>/dev/null || true
+    fi
+  else
+    echo "[clod] SSH key file not found: \$ssh_key_file" >&2
+  fi
+fi
+
+# GPU support
+gpus_value=""
+if [[ -v CLOD_GPUS ]]; then
+  # Environment variable takes priority
+  gpus_value="\$CLOD_GPUS"
+elif [[ -f .clod/gpus ]]; then
+  # Use value from .clod/gpus file
+  gpus_value=\$(<.clod/gpus)
+else
+  # Auto-detect: test if --gpus flag works
+  if docker run --gpus all --rm hello-world &>/dev/null; then
+    gpus_value="all"
+  fi
+fi
+
+# Set the GPU flag if we have a value
+if [[ -n "\$gpus_value" ]]; then
+  gpus_flag="--gpus \$gpus_value"
+fi
+
 # Generate unique suffix for concurrent mode
 runtime_suffix=""
 if [[ "\$concurrent" == "true" ]]; then
@@ -227,8 +331,17 @@ fi
 runtime_dir=".clod/runtime\${runtime_suffix}"
 mkdir -p "\$runtime_dir"
 
-# Set up cleanup trap to remove runtime directory on exit
-trap "rm -rf '\$runtime_dir'" EXIT
+# Set up cleanup trap to remove runtime directory and kill SSH agent on exit
+cleanup() {
+  rm -rf "\$runtime_dir"
+  if [[ "\$clod_ssh_agent_started" == "true" ]] && [[ -n "\$clod_ssh_agent_pid" ]]; then
+    kill "\$clod_ssh_agent_pid" 2>/dev/null || true
+  fi
+  if [[ -n "\${clod_ssh_tmpdir:-}" ]] && [[ -d "\$clod_ssh_tmpdir" ]]; then
+    rm -rf "\$clod_ssh_tmpdir"
+  fi
+}
+trap cleanup EXIT
 
 # Always name the container, adding suffix in concurrent mode
 container_name="--name clod-\${name,,}-\$id\${runtime_suffix}"
@@ -240,9 +353,12 @@ docker run \${tty_flag:-} --rm \\
   -v "\$cwd/.clod:\$cwd/.clod:ro" \\
   -v "\$cwd/\$runtime_dir:\$cwd/\$runtime_dir:rw" \\
   -v "\$cwd/.clod/claude:/home/\$user_name/.claude" \\
+  \${ssh_volume:-} \\
   -w "\$cwd" \\
   -e "CLOD_RUNTIME_DIR=\$runtime_dir" \\
   \${mcp_env:-} \\
+  \${ssh_env:-} \\
+  \${gpus_flag:-} \\
   \${entrypoint:-} \\
   "clod-\${name,,}-\$id" "\$@"
 EOF

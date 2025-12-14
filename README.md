@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] in a modestly more secure way.
 
-**Version 0.2.8**
+**Version 0.2.9**
 
 ## Features
 
@@ -22,14 +22,33 @@ Use `clod` and save a ~~kitten~~ home directory today.
 - **Automatic version tracking** - Detects and upgrades when clod version changes
 - **Change detection** - SHA256 hashing triggers rebuild when `.clod/` files are modified
 - **Project dependencies preserved** - Your `Dockerfile_project` customizations survive upgrades
+- **SSH credential forwarding** - Forward SSH agent or specific keys into containers (v0.2.9)
+- **GPU support** - Auto-detect and forward NVIDIA GPUs for AI/ML workloads (v0.2.9)
 - **Slack bot integration** - Run agents remotely via Socket Mode bot (see [bot/](./bot/))
 
 ## Install
 
-Via user's home bin directory:
+### Quick Install (One-Liner)
+
+Copy and paste this command to install clod:
 
 ```bash
-ln -s $(pwd)/bin/clod ~/bin/clod
+mkdir -p ~/src/github.com/calebcase && cd ~/src/github.com/calebcase && git clone https://github.com/calebcase/clod.git && mkdir -p ~/bin && ln -sf ~/src/github.com/calebcase/clod/bin/clod ~/bin/clod && RCFILE="${HOME}/.$(basename $SHELL)rc" && grep -q 'PATH.*HOME/bin' "$RCFILE" 2>/dev/null || echo 'export PATH=$PATH:$HOME/bin' >> "$RCFILE" && export PATH=$PATH:$HOME/bin && echo "✓ Installation complete! Run 'clod' to start, or restart your shell."
+```
+
+This will:
+1. Clone the repo to `~/src/github.com/calebcase/clod`
+2. Create `~/bin` directory if needed
+3. Add `~/bin` to your PATH in shell config (`.bashrc`, `.zshrc`, etc.)
+4. Add `~/bin` to current shell's PATH
+5. Create symlink to the clod script
+
+### Manual Install
+
+If you already have the repo cloned, link it to your home bin directory:
+
+```bash
+ln -sf ~/src/github.com/calebcase/clod/bin/clod ~/bin/clod
 ```
 
 If you don't have a home bin directory:
@@ -39,7 +58,7 @@ mkdir -p ~/bin
 export PATH=$PATH:$HOME/bin
 ```
 
-Add that export to your shell configuration (e.g. `.bashrc`).
+Add that export to your shell configuration (e.g. `.bashrc` or `.zshrc`).
 
 ## Usage
 
@@ -155,9 +174,11 @@ After initialization, the `.clod/` directory contains:
 ├── id                        # Unique 8-char container ID
 ├── name                      # Directory name
 ├── image                     # Base image (ubuntu:24.04 or golang:latest)
-├── version                   # Clod version (0.2.3)
+├── version                   # Clod version (0.2.9)
 ├── .hash                     # SHA256 hash for change detection
 ├── concurrent                # Optional: "true" enables concurrent instances
+├── ssh                       # Optional: SSH forwarding ("true", "false", or key path)
+├── gpus                      # Optional: GPU support ("all", device IDs, or empty)
 ├── runtime-{suffix}/         # Runtime files (FIFOs, MCP config) - per instance
 └── claude/                   # Claude configuration (gitignored)
     ├── claude.json           # API key, settings, sessions
@@ -204,6 +225,198 @@ Edit `.clod/image` to use a different base:
 
 ```bash
 echo "golang:latest" > .clod/image
+```
+
+## SSH Credential Forwarding
+
+Clod supports forwarding SSH credentials into the container, enabling Claude Code to access private Git repositories, remote servers, and other SSH-authenticated resources.
+
+### Configuration Methods
+
+SSH forwarding can be configured via:
+
+1. **Configuration file** (per-directory default):
+   ```bash
+   echo "true" > .clod/ssh
+   ```
+
+2. **Environment variable** (overrides file):
+   ```bash
+   export CLOD_SSH="true"
+   ```
+
+### SSH Modes
+
+#### Mode 1: Use Existing SSH Agent (Recommended)
+
+```bash
+echo "true" > .clod/ssh
+```
+
+Forwards your existing SSH agent into the container. Clod auto-detects the SSH socket path:
+- **macOS with Docker Desktop**: Uses `/run/host-services/ssh-auth.sock`
+- **Linux or macOS with SSH_AUTH_SOCK**: Uses your `$SSH_AUTH_SOCK`
+
+This mode is ideal when you already have `ssh-add` loaded with your keys.
+
+#### Mode 2: Use Specific SSH Key
+
+```bash
+echo "~/.ssh/id_ed25519" > .clod/ssh
+# or
+export CLOD_SSH="~/.ssh/id_rsa"
+```
+
+Starts a dedicated SSH agent with only the specified key. Clod will:
+1. Create an isolated SSH agent for this session
+2. Add the specified key (prompting for passphrase if needed)
+3. Forward the agent into the container
+4. Automatically clean up the agent on exit
+
+This mode is useful for:
+- Specific per-project keys
+- Keys with different passphrases
+- Temporary key access without affecting your main agent
+
+#### Mode 3: Disable SSH Forwarding
+
+```bash
+echo "false" > .clod/ssh
+# or
+export CLOD_SSH="false"
+```
+
+Explicitly disables SSH forwarding (default behavior).
+
+### Usage Examples
+
+**Clone private repository inside container:**
+
+```bash
+echo "true" > .clod/ssh
+clod "Clone the backend repo from git@github.com:company/backend.git"
+```
+
+**Deploy to remote server:**
+
+```bash
+export CLOD_SSH="~/.ssh/deploy_key"
+clod "Deploy the application to production"
+```
+
+**Use project-specific key:**
+
+```bash
+echo "~/.ssh/project_key" > .clod/ssh
+clod "Run the deployment script"
+```
+
+### Security Notes
+
+- SSH agent sockets are mounted read-only into containers
+- Dedicated agents (key file mode) are isolated and cleaned up automatically
+- Keys are never copied into the container - only the agent socket is forwarded
+- The `.clod/ssh` file should be added to `.gitignore` if it contains key paths
+
+## GPU Support
+
+Clod can forward GPU access into containers for AI/ML workloads, CUDA development, or any GPU-accelerated tasks.
+
+### Configuration Methods
+
+GPU support can be configured via:
+
+1. **Configuration file** (per-directory default):
+   ```bash
+   echo "all" > .clod/gpus
+   ```
+
+2. **Environment variable** (overrides file):
+   ```bash
+   export CLOD_GPUS="all"
+   ```
+
+3. **Auto-detection** (default):
+   If neither file nor environment variable is set, clod tests if `docker run --gpus all` works. If successful, GPU support is automatically enabled.
+
+### GPU Values
+
+The value can be any valid `--gpus` flag value:
+
+- `all` - Forward all GPUs (most common)
+- `0` - Forward only GPU 0
+- `0,1` - Forward GPUs 0 and 1
+- `"device=0,2"` - Forward specific devices
+- (empty) - Disable GPU forwarding
+
+### Requirements
+
+To use GPU support, you need:
+
+1. **NVIDIA GPU** and drivers installed on host
+2. **NVIDIA Container Toolkit** installed:
+   ```bash
+   # Ubuntu/Debian
+   distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+   curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
+   curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | \
+     sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+   sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+   sudo systemctl restart docker
+   ```
+
+3. **Docker 19.03+** with GPU support
+
+### Usage Examples
+
+**Enable GPUs for ML development:**
+
+```bash
+echo "all" > .clod/gpus
+clod "Set up PyTorch and train the model using GPU"
+```
+
+**Use specific GPU:**
+
+```bash
+export CLOD_GPUS="0"
+clod "Run the inference script on GPU 0"
+```
+
+**Temporarily disable GPU:**
+
+```bash
+CLOD_GPUS="" clod "Run CPU-only tests"
+```
+
+### Customizing GPU Image
+
+For GPU workloads, you may want a CUDA-enabled base image:
+
+```bash
+echo "nvidia/cuda:12.3.0-devel-ubuntu22.04" > .clod/image
+```
+
+Edit `.clod/Dockerfile_project` to add ML frameworks:
+
+```dockerfile
+FROM base AS project
+
+RUN apt-get update && apt-get install -y \
+    python3-pip \
+    python3-venv
+
+RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+### Verifying GPU Access
+
+Inside a clod session:
+
+```bash
+clod
+# Then in the Claude Code session, ask:
+# "Run nvidia-smi to verify GPU access"
 ```
 
 ## Permission Modes
@@ -336,6 +549,7 @@ Clod configuration is "relocatable" (with care) - you can check in parts of
 /.clod/claude        # Contains API keys and credentials
 /.clod/id            # Machine-specific container ID
 /.clod/runtime*      # Runtime files (FIFOs, MCP config) - includes all suffixed dirs
+/.clod/ssh           # May contain SSH key paths (user-specific)
 ```
 
 **Safe to commit:**
@@ -347,6 +561,7 @@ Clod configuration is "relocatable" (with care) - you can check in parts of
 - `.clod/run` - Run script (if customized)
 - `.clod/version` - Version tracking
 - `.clod/concurrent` - Concurrency setting (optional)
+- `.clod/gpus` - GPU configuration (optional, safe if not user-specific)
 
 ### Example Team Workflow
 
@@ -369,6 +584,8 @@ contains no credentials or hard-coded paths.
 - `CLOD_ENTRYPOINT` - Override entrypoint (optional)
 - `CLOD_CONCURRENT` - Enable concurrent instances (overrides `.clod/concurrent` file)
 - `CLOD_RUNTIME_SUFFIX` - Specify runtime directory suffix (auto-generated if not set)
+- `CLOD_SSH` - SSH credential forwarding: `true`, `false`, or path to key file (overrides `.clod/ssh` file)
+- `CLOD_GPUS` - GPU support: `all`, specific GPU IDs, or empty to disable (overrides `.clod/gpus` file)
 - `MCP_TOOL_TIMEOUT` - Permission prompt timeout (optional)
 
 ### Example: Force Reinit
