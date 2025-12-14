@@ -1,8 +1,56 @@
 #!/bin/env bash
 set -euo pipefail
 
+CLOD_VERSION="0.2.0"
+
 reinit=${CLOD_REINIT:-false}
 config=${CLOD_CONFIG:-$HOME/.claude.json}
+
+# Compute hash of all files in .clod directory (not subdirectories)
+compute_clod_hash() {
+  # Hash all regular files in .clod (excluding subdirs like claude/)
+  # Sort for consistency, exclude the hash file itself
+  find .clod -maxdepth 1 -type f ! -name '.hash' -print0 2>/dev/null \
+    | sort -z \
+    | xargs -0 sha256sum 2>/dev/null \
+    | sha256sum \
+    | cut -d' ' -f1
+}
+
+changes_detected() {
+  local stored_hash=''
+  if [[ -f .clod/.hash ]]; then
+    local stored_hash=$(<.clod/.hash)
+  fi
+
+  local current_hash=$(compute_clod_hash)
+
+  [[ "$stored_hash" == "$current_hash" ]]
+}
+
+save_hash() {
+  compute_clod_hash > .clod/.hash
+}
+
+# Compare semantic versions. Returns 0 if $1 > $2, 1 otherwise.
+version_gt() {
+  local v1=$1 v2=$2
+  if [[ "$v1" == "$v2" ]]; then
+    return 1
+  fi
+  local IFS=.
+  local i v1_parts=($v1) v2_parts=($v2)
+  for ((i=0; i<${#v1_parts[@]}; i++)); do
+    local n1=${v1_parts[i]:-0}
+    local n2=${v2_parts[i]:-0}
+    if ((n1 > n2)); then
+      return 0
+    elif ((n1 < n2)); then
+      return 1
+    fi
+  done
+  return 1
+}
 
 # Is this directory initialized?
 initialize() {
@@ -32,15 +80,37 @@ initialize() {
     local id=$(<.clod/id)
   fi
 
-  if [[ ! -f .clod/Dockerfile ]]; then
-    cat <<EOF > .clod/Dockerfile
-FROM ubuntu:24.04
+  if [[ ! -f .clod/image ]]; then
+    printf '%s\n' "${CLOD_IMAGE:-ubuntu:24.04}" > .clod/image
+  fi
+  local image=$(<.clod/image)
+
+
+  cat <<EOF > .clod/Dockerfile_base
+FROM $image AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \\
     --mount=type=cache,sharing=locked,target=/var/lib/apt \\
     apt-get update \\
  && apt-get install -qq -y npm
+EOF
+
+  if [[ ! -f .clod/Dockerfile_project ]]; then
+    cat <<EOF > .clod/Dockerfile_project
+FROM base AS project
+
+# Uncomment to add project specific dependencies.
+#ARG DEBIAN_FRONTEND=noninteractive
+#RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \\
+#    --mount=type=cache,sharing=locked,target=/var/lib/apt \\
+#    apt-get update \\
+# && apt-get install -qq -y npm
+EOF
+  fi
+
+  cat <<EOF > .clod/Dockerfile_wrapper
+FROM project AS wrapper
 
 COPY <<DEOF /usr/bin/claude-wrapper
 #!/bin/bash
@@ -74,17 +144,9 @@ RUN mkdir ~/.npm \\
 ENV PATH="\$PATH:/home/\$USER_NAME/bin:/home/\$USER_NAME/.npm/bin"
 
 ENTRYPOINT ["claude-wrapper"]
-
-# Uncomment to add additional apt dependencies:
-#RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \\
-#    --mount=type=cache,sharing=locked,target=/var/lib/apt \\
-#    apt-get update \\
-# && apt-get install -qq -y jq
 EOF
-  fi
 
-  if [[ ! -f .clod/build ]]; then
-    cat <<EOF > .clod/build
+  cat <<EOF > .clod/build
 #!/bin/env bash
 set -euo pipefail
 
@@ -97,19 +159,20 @@ user_name=\$(id -nu)
 group_id=\$(id -u)
 group_name=\$(id -nu)
 
+cat .clod/Dockerfile_base .clod/Dockerfile_project .clod/Dockerfile_wrapper > .clod/Dockerfile
+
 exec docker build \\
   --build-arg "USER_ID=\$user_id" \\
   --build-arg "USER_NAME=\$user_name" \\
   --build-arg "GROUP_ID=\$group_id" \\
   --build-arg "GROUP_NAME=\$group_name" \\
-  -t "clod-\$name-\$id" \\
-  - < .clod/Dockerfile
+  -t "clod-\${name,,}-\$id" \\
+  -f .clod/Dockerfile \\
+  .
 EOF
-  fi
   chmod u+x .clod/build
 
-  if [[ ! -f .clod/run ]]; then
-    cat <<EOF > .clod/run
+  cat <<EOF > .clod/run
 #!/bin/env bash
 set -euo pipefail
 
@@ -122,32 +185,70 @@ if [[ -v CLOD_ENTRYPOINT ]]; then
   entrypoint="--entrypoint \$CLOD_ENTRYPOINT"
 fi
 
-exec docker run -it --rm \\
+if [[ -t 0 ]]; then
+  tty_flag="-it"
+fi
+
+# Pass through MCP timeout if set (for permission prompts)
+if [[ -v MCP_TOOL_TIMEOUT ]]; then
+  mcp_env="-e MCP_TOOL_TIMEOUT=\$MCP_TOOL_TIMEOUT"
+fi
+
+exec docker run \${tty_flag:-} --rm \\
   --hostname "clod-\$name-\$id" \\
   -v "\$cwd:\$cwd" \\
   -v "\$cwd/.clod:\$cwd/.clod:ro" \\
   -v "\$cwd/.clod/claude:/home/\$user_name/.claude" \\
   -w "\$cwd" \\
+  \${mcp_env:-} \\
   \${entrypoint:-} \\
-  "clod-\$name-\$id" "\$@"
+  "clod-\${name,,}-\$id" "\$@"
 EOF
-  fi
   chmod u+x .clod/run
+
+  # Store the version used to initialize
+  printf '%s\n' "$CLOD_VERSION" > .clod/version
+  save_hash
 }
 
-if [[ ! -d .clod || $reinit == 'true' ]]; then
+# Check if we need to initialize or upgrade
+needs_init=false
+needs_upgrade=false
+
+if [[ ! -d .clod ]]; then
+  needs_init=true
+elif [[ $reinit == 'true' ]]; then
+  needs_init=true
+elif changes_detected; then
+  printf 'Detected changes in .clod files, reinitializing...\n'
+  needs_upgrade=true
+elif [[ ! -f .clod/version ]]; then
+  needs_upgrade=true
+else
+  installed_version=$(<.clod/version)
+  if version_gt "$CLOD_VERSION" "$installed_version"; then
+    needs_upgrade=true
+  fi
+fi
+
+if [[ $needs_init == 'true' ]]; then
   read -p "Initialize the .clod directory? [Y/n] " yn
   case $yn in
     [Yy]* | '')
-      printf 'initializing...\n'
+      printf 'Initializing clod v%s...\n' "$CLOD_VERSION"
       initialize
       ;;
     *)
       exit
       ;;
   esac
+elif [[ $needs_upgrade == 'true' ]]; then
+  installed_version=${installed_version:-"unknown"}
+  printf 'Upgrading clod from v%s to v%s...\n' "$installed_version" "$CLOD_VERSION"
+  initialize
 fi
 
-# It's go time!
+
+ # It's go time!
 .clod/build
 exec .clod/run "$@"
