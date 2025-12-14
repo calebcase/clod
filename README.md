@@ -323,9 +323,6 @@ Reply in threads to continue sessions:
 Find the users that will be impacted by the deprecations.
 ```
 
-See [bot/README.md](./bot/README.md) for complete setup and usage
-documentation.
-
 ## Sharing Configurations
 
 Clod configuration is "relocatable" (with care) - you can check in parts of
