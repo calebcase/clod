@@ -240,27 +240,24 @@ session persistence and permission management.
 
 ### Quick Start
 
-1. **Create Slack App from Manifest**
+1. **Create Slack App**
 
-   Use our pre-configured manifest to skip manual setup:
-   ```bash
-   # Manifest at: clod/bot/manifest.yaml
-   # Instructions in main README.md
-   ```
+   [Click here to create Clod Bot.](https://api.slack.com/apps?new_app=1&manifest_yaml=https://raw.githubusercontent.com/calebcase/clod/main/bot/manifest.yaml)
 
 2. **Configure Bot**
 
-   Use the helper script:
-   ```bash
-   ./scripts/configure-bot.sh
+   ```bash                   
+   export SLACK_BOT_TOKEN="xoxb-..."
+   export SLACK_APP_TOKEN="xapp-..."
+   export ALLOWED_USERS="U12345678,U87654321"  # Comma-separated
+   export AGENTS_PATH="/path/to/agents"
    ```
 
 3. **Run Bot**
 
    ```bash
-   cd /path/to/agents
-   source .env
-   go run ./clod/bot
+   go install github.com/calebcase/clod/bot@latest
+   bot
    ```
 
 ### Bot Usage
