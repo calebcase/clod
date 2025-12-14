@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Update version number in README.md and bin/clod from VERSION file
+
+VERSION_FILE="./VERSION"
+README_FILE="./README.md"
+CLOD_SCRIPT="./bin/clod"
+
+if [[ ! -f "$VERSION_FILE" ]]; then
+    echo "Error: VERSION file not found: $VERSION_FILE" >&2
+    exit 1
+fi
+
+if [[ ! -f "$README_FILE" ]]; then
+    echo "Error: README file not found: $README_FILE" >&2
+    exit 1
+fi
+
+if [[ ! -f "$CLOD_SCRIPT" ]]; then
+    echo "Error: clod script not found: $CLOD_SCRIPT" >&2
+    exit 1
+fi
+
+echo "Reading version from $VERSION_FILE..."
+VERSION=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+
+if [[ -z "$VERSION" ]]; then
+    echo "Error: VERSION file is empty" >&2
+    exit 1
+fi
+
+echo "Updating version to: $VERSION"
+
+# Update README.md
+echo "Updating $README_FILE..."
+python3 << EOF
+import re
+import sys
+
+with open("$README_FILE", 'r') as f:
+    content = f.read()
+
+# Pattern to match the version line in README
+pattern = r'\*\*Version [0-9]+\.[0-9]+\.[0-9]+\*\*'
+replacement = '**Version $VERSION**'
+
+# Check if pattern exists
+if not re.search(pattern, content):
+    print("Warning: Could not find version line in README.md", file=sys.stderr)
+    sys.exit(1)
+
+# Replace the pattern
+new_content = re.sub(pattern, replacement, content)
+
+# Write back to file
+with open("$README_FILE", 'w') as f:
+    f.write(new_content)
+
+print("✓ Successfully updated version in README.md")
+EOF
+
+# Update bin/clod script
+echo "Updating $CLOD_SCRIPT..."
+python3 << EOF
+import re
+import sys
+
+with open("$CLOD_SCRIPT", 'r') as f:
+    content = f.read()
+
+# Pattern to match CLOD_VERSION variable
+pattern = r'CLOD_VERSION="[0-9]+\.[0-9]+\.[0-9]+"'
+replacement = 'CLOD_VERSION="$VERSION"'
+
+# Check if pattern exists
+if not re.search(pattern, content):
+    print("Warning: Could not find CLOD_VERSION in bin/clod", file=sys.stderr)
+    sys.exit(1)
+
+# Replace the pattern
+new_content = re.sub(pattern, replacement, content)
+
+# Write back to file
+with open("$CLOD_SCRIPT", 'w') as f:
+    f.write(new_content)
+
+print("✓ Successfully updated version in bin/clod")
+EOF
+
+echo ""
+echo "Version update complete!"
+echo "Updated to version: $VERSION"
