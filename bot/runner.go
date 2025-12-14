@@ -310,7 +310,8 @@ func (r *Runner) Start(
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
 
 	// Create permission FIFO for MCP communication (must be done before building args).
-	permFIFO, err := NewPermissionFIFO(taskPath, r.logger)
+	// Pass empty string to generate a unique runtime suffix for concurrent instances.
+	permFIFO, err := NewPermissionFIFO(taskPath, "", r.logger)
 	if err != nil {
 		cancel()
 		return nil, oops.Trace(err)
@@ -363,8 +364,6 @@ func (r *Runner) Start(
 	// Images (if any) will be sent via stream-json as a follow-up message.
 	args = append(args, prompt)
 
-	runPath := filepath.Join(taskPath, ".clod", "run")
-
 	r.logger.Debug().
 		Str("task_path", taskPath).
 		Str("session_id", sessionID).
@@ -372,17 +371,25 @@ func (r *Runner) Start(
 		Msg("starting clod with pty")
 
 	//nolint:gosec
-	cmd := exec.CommandContext(runCtx, runPath, args...)
+	cmd := exec.CommandContext(runCtx, "clod", args...)
 	cmd.Dir = taskPath
 
 	// Set MCP tool timeout to allow time for user to respond to permission prompts
 	// Default is too short (causes "technical issues" when user doesn't respond quickly)
 	// 5 minutes = 300000ms should be plenty for interactive approval
-	cmd.Env = append(os.Environ(), "MCP_TOOL_TIMEOUT=300000")
+	cmd.Env = append(os.Environ(),
+		"MCP_TOOL_TIMEOUT=300000",
+		"CLOD_RUNTIME_SUFFIX="+permFIFO.RuntimeSuffix(),
+		"CLOD_CONCURRENT=true",
+		"CLOD_NONINTERACTIVE=true",
+	)
 
 	r.logger.Debug().
 		Str("MCP_TOOL_TIMEOUT", "300000").
-		Msg("setting MCP_TOOL_TIMEOUT env var")
+		Str("CLOD_RUNTIME_SUFFIX", permFIFO.RuntimeSuffix()).
+		Bool("CLOD_NONINTERACTIVE", true).
+		Bool("CLOD_CONCURRENT", true).
+		Msg("setting environment variables for clod run")
 
 	// Set up process group for clean termination
 	cmd.SysProcAttr = &syscall.SysProcAttr{

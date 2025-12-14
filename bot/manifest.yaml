@@ -1,0 +1,32 @@
+_metadata:
+  major_version: 2
+  minor_version: 1
+
+display_information:
+  name: Clod Bot
+  description: Run Claude Code agents via Slack with isolated Docker execution
+  background_color: "#4A154B"
+  long_description: "Clod Bot enables you to run Claude Code agents directly from Slack. Each agent runs in an isolated Docker container with its own dependencies and configuration. The bot supports file uploads, session persistence across threads, and interactive permission prompts."
+
+features:
+  bot_user:
+    display_name: clod-bot
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - channels:history
+      - groups:history
+      - files:read
+      - files:write
+
+settings:
+  socket_mode_enabled: true
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups

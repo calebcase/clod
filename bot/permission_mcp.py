@@ -17,22 +17,17 @@ import sys
 from typing import Any
 
 
-# FIFO paths relative to .clod-runtime directory
+# FIFO paths relative to runtime directory
 FIFO_REQUEST = "permission_request.fifo"
 FIFO_RESPONSE = "permission_response.fifo"
 
 
 def find_runtime_dir() -> str:
-    """Find the .clod-runtime directory by walking up from cwd."""
-    cwd = os.getcwd()
-    path = cwd
-    while path != "/":
-        runtime_path = os.path.join(path, ".clod-runtime")
-        if os.path.isdir(runtime_path):
-            return runtime_path
-        path = os.path.dirname(path)
-    # Fallback to cwd/.clod-runtime
-    return os.path.join(cwd, ".clod-runtime")
+    """Find the runtime directory from CLOD_RUNTIME_DIR environment variable."""
+    runtime_dir = os.environ.get("CLOD_RUNTIME_DIR")
+    if not runtime_dir:
+        raise RuntimeError("CLOD_RUNTIME_DIR environment variable not set")
+    return os.path.abspath(runtime_dir)
 
 
 def log(msg: str) -> None:

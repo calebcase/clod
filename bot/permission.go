@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -12,9 +14,6 @@ import (
 	"github.com/calebcase/oops"
 	"github.com/rs/zerolog"
 )
-
-//go:embed permission_hook.py
-var permissionHookScript []byte
 
 //go:embed permission_mcp.py
 var permissionMCPScript []byte
@@ -48,24 +47,35 @@ type PermissionResponse struct {
 
 // PermissionFIFO manages the FIFO for permission requests/responses.
 type PermissionFIFO struct {
-	taskPath     string
-	requestPath  string
-	responsePath string
-	requests     chan PermissionRequest
-	responses    chan PermissionResponse
-	logger       zerolog.Logger
-	cancel       context.CancelFunc
+	taskPath      string
+	runtimeSuffix string
+	requestPath   string
+	responsePath  string
+	requests      chan PermissionRequest
+	responses     chan PermissionResponse
+	logger        zerolog.Logger
+	cancel        context.CancelFunc
 }
 
-// HookScriptName is the name of the permission hook script.
-const HookScriptName = "permission_hook.py"
-
 // NewPermissionFIFO creates and initializes the permission FIFO.
-// FIFOs are created in the task directory (not .clod) so they're accessible
-// from inside the Docker container where .clod is mounted read-only.
-func NewPermissionFIFO(taskPath string, logger zerolog.Logger) (*PermissionFIFO, error) {
-	// Put FIFOs in .clod-runtime which will be writable from inside container
-	runtimeDir := filepath.Join(taskPath, ".clod-runtime")
+// FIFOs are created in .clod/runtime so they're accessible from inside the
+// Docker container where .clod/runtime is mounted read-write.
+// If runtimeSuffix is provided, it will be used to create a unique runtime directory.
+// If empty, generates a random suffix for concurrent instances.
+func NewPermissionFIFO(taskPath string, runtimeSuffix string, logger zerolog.Logger) (*PermissionFIFO, error) {
+	// Generate random suffix if not provided (for concurrent mode)
+	if runtimeSuffix == "" {
+		// Generate 6 random hex characters
+		randomBytes := make([]byte, 3)
+		if _, err := rand.Read(randomBytes); err != nil {
+			return nil, oops.Trace(err)
+		}
+		runtimeSuffix = fmt.Sprintf("%x", randomBytes)
+	}
+
+	// Put FIFOs in .clod/runtime-{suffix} for concurrent instances
+	runtimeDirName := filepath.Join(".clod", "runtime-"+runtimeSuffix)
+	runtimeDir := filepath.Join(taskPath, runtimeDirName)
 	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
 		return nil, oops.Trace(err)
 	}
@@ -75,12 +85,6 @@ func NewPermissionFIFO(taskPath string, logger zerolog.Logger) (*PermissionFIFO,
 	// Remove existing FIFOs if they exist
 	os.Remove(requestPath)
 	os.Remove(responsePath)
-
-	// Write the hook script to the runtime directory (legacy, kept for compatibility)
-	hookPath := filepath.Join(runtimeDir, HookScriptName)
-	if err := os.WriteFile(hookPath, permissionHookScript, 0755); err != nil {
-		return nil, oops.Trace(err)
-	}
 
 	// Write the MCP server script to the runtime directory
 	mcpPath := filepath.Join(runtimeDir, MCPScriptName)
@@ -99,12 +103,13 @@ func NewPermissionFIFO(taskPath string, logger zerolog.Logger) (*PermissionFIFO,
 	}
 
 	return &PermissionFIFO{
-		taskPath:     taskPath,
-		requestPath:  requestPath,
-		responsePath: responsePath,
-		requests:     make(chan PermissionRequest, 10),
-		responses:    make(chan PermissionResponse, 10),
-		logger:       logger.With().Str("component", "permission_fifo").Logger(),
+		taskPath:      taskPath,
+		runtimeSuffix: runtimeSuffix,
+		requestPath:   requestPath,
+		responsePath:  responsePath,
+		requests:      make(chan PermissionRequest, 10),
+		responses:     make(chan PermissionResponse, 10),
+		logger:        logger.With().Str("component", "permission_fifo").Logger(),
 	}, nil
 }
 
@@ -252,54 +257,9 @@ func (p *PermissionFIFO) ResponsePath() string {
 	return p.responsePath
 }
 
-// HookScriptPath returns the path to the permission hook script.
-func (p *PermissionFIFO) HookScriptPath() string {
-	return filepath.Join(filepath.Dir(p.requestPath), HookScriptName)
-}
-
-// SettingsPath returns the path to the generated settings file with hook configuration.
-// This file can be passed to claude via --settings flag.
-func (p *PermissionFIFO) SettingsPath() string {
-	return filepath.Join(filepath.Dir(p.requestPath), "settings.json")
-}
-
-// CreateSettings generates a settings.json file with the permission hook configured.
-// Returns the path to the settings file which can be passed via --settings flag.
-func (p *PermissionFIFO) CreateSettings() (string, error) {
-	settingsPath := p.SettingsPath()
-	hookCmd := p.HookScriptPath()
-
-	settings := map[string]interface{}{
-		"hooks": map[string]interface{}{
-			"PermissionRequest": []map[string]interface{}{
-				{
-					"matcher": "*",
-					"hooks": []map[string]interface{}{
-						{
-							"type":    "command",
-							"command": hookCmd,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	data, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return "", oops.Trace(err)
-	}
-
-	if err := os.WriteFile(settingsPath, data, 0644); err != nil {
-		return "", oops.Trace(err)
-	}
-
-	p.logger.Debug().
-		Str("settings_path", settingsPath).
-		Str("hook_command", hookCmd).
-		Msg("created settings file with permission hook")
-
-	return settingsPath, nil
+// RuntimeSuffix returns the runtime directory suffix for this FIFO.
+func (p *PermissionFIFO) RuntimeSuffix() string {
+	return p.runtimeSuffix
 }
 
 // MCPScriptPath returns the path to the MCP server script.

@@ -1,9 +1,10 @@
 #!/bin/env bash
 set -euo pipefail
 
-CLOD_VERSION="0.2.0"
+CLOD_VERSION="0.2.7"
 
 reinit=${CLOD_REINIT:-false}
+noninteractive=${CLOD_NONINTERACTIVE:-false}
 config=${CLOD_CONFIG:-$HOME/.claude.json}
 
 # Compute hash of all files in .clod directory (not subdirectories)
@@ -25,7 +26,11 @@ changes_detected() {
 
   local current_hash=$(compute_clod_hash)
 
-  [[ "$stored_hash" == "$current_hash" ]]
+  if [[ "$stored_hash" == "$current_hash" ]]; then
+    return 1
+  fi
+
+  return 0
 }
 
 save_hash() {
@@ -194,12 +199,49 @@ if [[ -v MCP_TOOL_TIMEOUT ]]; then
   mcp_env="-e MCP_TOOL_TIMEOUT=\$MCP_TOOL_TIMEOUT"
 fi
 
-exec docker run \${tty_flag:-} --rm \\
+# Determine default concurrency from .clod/concurrent file
+concurrent_default="false"
+if [[ -f .clod/concurrent ]]; then
+  concurrent_file=\$(<.clod/concurrent)
+  if [[ "\$concurrent_file" == "true" ]]; then
+    concurrent_default="true"
+  fi
+fi
+
+# Allow CLOD_CONCURRENT to override the default
+concurrent="\${CLOD_CONCURRENT:-\$concurrent_default}"
+
+# Generate unique suffix for concurrent mode
+runtime_suffix=""
+if [[ "\$concurrent" == "true" ]]; then
+  # Use provided suffix or generate one
+  if [[ -v CLOD_RUNTIME_SUFFIX ]]; then
+    runtime_suffix="-\$CLOD_RUNTIME_SUFFIX"
+  else
+    # Generate 6 random hex characters
+    runtime_suffix="-\$(head -c 3 /dev/urandom | xxd -p)"
+  fi
+fi
+
+# Determine runtime directory and create it
+runtime_dir=".clod/runtime\${runtime_suffix}"
+mkdir -p "\$runtime_dir"
+
+# Set up cleanup trap to remove runtime directory on exit
+trap "rm -rf '\$runtime_dir'" EXIT
+
+# Always name the container, adding suffix in concurrent mode
+container_name="--name clod-\${name,,}-\$id\${runtime_suffix}"
+
+docker run \${tty_flag:-} --rm \\
+  \${container_name} \\
   --hostname "clod-\$name-\$id" \\
   -v "\$cwd:\$cwd" \\
   -v "\$cwd/.clod:\$cwd/.clod:ro" \\
+  -v "\$cwd/\$runtime_dir:\$cwd/\$runtime_dir:rw" \\
   -v "\$cwd/.clod/claude:/home/\$user_name/.claude" \\
   -w "\$cwd" \\
+  -e "CLOD_RUNTIME_DIR=\$runtime_dir" \\
   \${mcp_env:-} \\
   \${entrypoint:-} \\
   "clod-\${name,,}-\$id" "\$@"
@@ -232,6 +274,10 @@ else
 fi
 
 if [[ $needs_init == 'true' ]]; then
+  if [[ $noninteractive == 'true' ]]; then
+    printf 'ERROR: .clod directory not initialized. Run clod interactively first.\n' >&2
+    exit 1
+  fi
   read -p "Initialize the .clod directory? [Y/n] " yn
   case $yn in
     [Yy]* | '')
