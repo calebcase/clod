@@ -73,9 +73,43 @@ type StreamContentBlock struct {
 	Name  string         `json:"name,omitempty"` // Tool name (Bash, Read, etc.).
 	Input map[string]any `json:"input,omitempty"`
 	// For tool_result blocks.
-	ToolUseID string `json:"tool_use_id,omitempty"`
-	Content   string `json:"content,omitempty"`
-	IsError   bool   `json:"is_error,omitempty"`
+	ToolUseID  string          `json:"tool_use_id,omitempty"`
+	Content    json.RawMessage `json:"content,omitempty"` // Can be string or []ContentBlock.
+	IsError    bool            `json:"is_error,omitempty"`
+}
+
+// ToolResultContentBlock represents a content block inside a tool_result.
+type ToolResultContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+// GetContentText extracts the text content from a tool_result block.
+// Handles both string content and array of content blocks.
+func (b *StreamContentBlock) GetContentText() string {
+	if len(b.Content) == 0 {
+		return ""
+	}
+
+	// Try to unmarshal as string first.
+	var strContent string
+	if err := json.Unmarshal(b.Content, &strContent); err == nil {
+		return strContent
+	}
+
+	// Try to unmarshal as array of content blocks.
+	var blocks []ToolResultContentBlock
+	if err := json.Unmarshal(b.Content, &blocks); err == nil {
+		var texts []string
+		for _, block := range blocks {
+			if block.Type == "text" && block.Text != "" {
+				texts = append(texts, block.Text)
+			}
+		}
+		return strings.Join(texts, "\n")
+	}
+
+	return ""
 }
 
 // ContentBlockDelta represents a partial content update during streaming.
@@ -463,22 +497,26 @@ func (r *Runner) Start(
 				// User messages contain tool results.
 				if msg.Message != nil {
 					for _, block := range msg.Message.Content {
-						if block.Type == "tool_result" && block.Content != "" {
+						if block.Type == "tool_result" {
+							contentText := block.GetContentText()
+							if contentText == "" {
+								continue
+							}
 							info := toolInfos[block.ToolUseID]
-							contentLen := len(block.Content)
+							contentLen := len(contentText)
 							r.logger.Debug().
 								Str("tool_use_id", block.ToolUseID).
 								Str("tool_name", info.Name).
 								Bool("is_error", block.IsError).
 								Int("content_len", contentLen).
 								Msg("received tool result")
-							outputBuilder.WriteString(block.Content)
+							outputBuilder.WriteString(contentText)
 
 							// Send tool results to Slack:
 							// - Short Bash output (<=500 bytes): inline code block
 							// - Everything else: summary line + collapsible snippet
 							const maxInlineLen = 500
-							trimmedContent := strings.TrimRight(block.Content, " \t\n\r")
+							trimmedContent := strings.TrimRight(contentText, " \t\n\r")
 
 							var outputMsg string
 							if info.Name == "Bash" && contentLen <= maxInlineLen {
