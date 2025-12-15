@@ -1,7 +1,7 @@
 #!/bin/env bash
 set -euo pipefail
 
-CLOD_VERSION="0.2.11"
+CLOD_VERSION="0.3.0"
 
 reinit=${CLOD_REINIT:-false}
 noninteractive=${CLOD_NONINTERACTIVE:-false}
@@ -20,8 +20,8 @@ compute_clod_hash() {
 
 changes_detected() {
   local stored_hash=''
-  if [[ -f .clod/.hash ]]; then
-    local stored_hash=$(<.clod/.hash)
+  if [[ -f .clod/system/hash ]]; then
+    local stored_hash=$(<.clod/system/hash)
   fi
 
   local current_hash=$(compute_clod_hash)
@@ -34,7 +34,7 @@ changes_detected() {
 }
 
 save_hash() {
-  compute_clod_hash > .clod/.hash
+  compute_clod_hash > .clod/system/hash
 }
 
 # Compare semantic versions. Returns 0 if $1 > $2, 1 otherwise.
@@ -60,6 +60,7 @@ version_gt() {
 # Is this directory initialized?
 initialize() {
   mkdir -p .clod/claude
+  mkdir -p .clod/system
 
   # Use an existing config if available.
   if [[ ! -f .clod/claude/claude.json && -f "$config" ]]; then
@@ -91,7 +92,7 @@ initialize() {
   local image=$(<.clod/image)
 
 
-  cat <<EOF > .clod/Dockerfile_base
+  cat <<EOF > .clod/system/Dockerfile_base
 FROM $image AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -114,7 +115,7 @@ FROM base AS project
 EOF
   fi
 
-  cat <<'EOF' > .clod/Dockerfile_wrapper
+  cat <<'EOF' > .clod/system/Dockerfile_wrapper
 FROM project AS wrapper
 
 COPY <<DEOF /usr/bin/claude-wrapper
@@ -162,7 +163,7 @@ ENV PATH="$PATH:$USER_HOME/bin:$USER_HOME/.npm/bin"
 ENTRYPOINT ["claude-wrapper"]
 EOF
 
-  cat <<'EOF' > .clod/build
+  cat <<'EOF' > .clod/system/build
 #!/bin/env bash
 set -euo pipefail
 
@@ -182,7 +183,7 @@ else
   user_home="/home/$user_name"
 fi
 
-cat .clod/Dockerfile_base .clod/Dockerfile_project .clod/Dockerfile_wrapper > .clod/Dockerfile
+cat .clod/system/Dockerfile_base .clod/Dockerfile_project .clod/system/Dockerfile_wrapper > .clod/system/Dockerfile
 
 exec docker build \
   --build-arg "USER_ID=$user_id" \
@@ -191,12 +192,12 @@ exec docker build \
   --build-arg "GROUP_NAME=$group_name" \
   --build-arg "USER_HOME=$user_home" \
   -t "clod-${name,,}-$id" \
-  -f .clod/Dockerfile \
+  -f .clod/system/Dockerfile \
   .
 EOF
-  chmod u+x .clod/build
+  chmod u+x .clod/system/build
 
-  cat <<EOF > .clod/run
+  cat <<EOF > .clod/system/run
 #!/bin/env bash
 set -euo pipefail
 
@@ -389,12 +390,40 @@ docker run \${tty_flag:-} --rm \\
   \${entrypoint:-} \\
   "clod-\${name,,}-\$id" "\$@"
 EOF
-  chmod u+x .clod/run
+  chmod u+x .clod/system/run
 
   # Store the version used to initialize
-  printf '%s\n' "$CLOD_VERSION" > .clod/version
+  printf '%s\n' "$CLOD_VERSION" > .clod/system/version
   save_hash
 }
+
+# Migrate old installations to new structure FIRST
+migrate_to_system_dir() {
+  # Check if migration needed (system dir doesn't exist)
+  if [[ ! -d .clod/system ]]; then
+    printf 'Migrating .clod structure to v%s...\n' "$CLOD_VERSION"
+
+    # Create system directory
+    mkdir -p .clod/system
+
+    # Move system files to new location
+    [[ -f .clod/Dockerfile_base ]] && mv .clod/Dockerfile_base .clod/system/
+    [[ -f .clod/Dockerfile_wrapper ]] && mv .clod/Dockerfile_wrapper .clod/system/
+    [[ -f .clod/Dockerfile ]] && mv .clod/Dockerfile .clod/system/
+    [[ -f .clod/build ]] && mv .clod/build .clod/system/
+    [[ -f .clod/run ]] && mv .clod/run .clod/system/
+    [[ -f .clod/version ]] && mv .clod/version .clod/system/
+    [[ -f .clod/.hash ]] && mv .clod/.hash .clod/system/hash
+    [[ -f .clod/hash ]] && mv .clod/hash .clod/system/
+
+    printf 'Migration complete.\n'
+  fi
+}
+
+# Run migration before checking upgrade needs
+if [[ -d .clod ]]; then
+  migrate_to_system_dir
+fi
 
 # Check if we need to initialize or upgrade
 needs_init=false
@@ -407,10 +436,10 @@ elif [[ $reinit == 'true' ]]; then
 elif changes_detected; then
   printf 'Detected changes in .clod files, reinitializing...\n'
   needs_upgrade=true
-elif [[ ! -f .clod/version ]]; then
+elif [[ ! -f .clod/system/version ]]; then
   needs_upgrade=true
 else
-  installed_version=$(<.clod/version)
+  installed_version=$(<.clod/system/version)
   if version_gt "$CLOD_VERSION" "$installed_version"; then
     needs_upgrade=true
   fi
@@ -437,7 +466,6 @@ elif [[ $needs_upgrade == 'true' ]]; then
   initialize
 fi
 
-
- # It's go time!
-.clod/build
-exec .clod/run "$@"
+# It's go time!
+.clod/system/build
+exec .clod/system/run "$@"

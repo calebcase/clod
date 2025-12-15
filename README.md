@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] in a modestly more secure way.
 
-**Version 0.2.11**
+**Version 0.3.0**
 
 ## Features
 
@@ -165,20 +165,22 @@ After initialization, the `.clod/` directory contains:
 
 ```
 .clod/
-├── Dockerfile_base           # Auto-generated base
+├── system/                   # System-managed files (auto-generated)
+│   ├── Dockerfile_base       # Auto-generated base
+│   ├── Dockerfile_wrapper    # Auto-generated wrapper
+│   ├── Dockerfile            # Combined (generated)
+│   ├── build                 # Script: builds Docker image
+│   ├── run                   # Script: runs container
+│   ├── version               # Clod version (0.3.0)
+│   └── hash                  # SHA256 hash for change detection
 ├── Dockerfile_project        # Your customizations (edit this!)
-├── Dockerfile_wrapper        # Auto-generated wrapper
-├── Dockerfile                # Combined (generated)
-├── build                     # Script: builds Docker image
-├── run                       # Script: runs container
 ├── id                        # Unique 8-char container ID
 ├── name                      # Directory name
 ├── image                     # Base image (ubuntu:24.04 or golang:latest)
-├── version                   # Clod version (0.2.9)
-├── .hash                     # SHA256 hash for change detection
 ├── concurrent                # Optional: "true" enables concurrent instances
 ├── ssh                       # Optional: SSH forwarding ("true", "false", or key path)
 ├── gpus                      # Optional: GPU support ("all", device IDs, or empty)
+├── claude-default-flags      # Optional: Default flags
 ├── runtime-{suffix}/         # Runtime files (FIFOs, MCP config) - per instance
 └── claude/                   # Claude configuration (gitignored)
     ├── claude.json           # API key, settings, sessions
@@ -611,20 +613,19 @@ Clod configuration is "relocatable" (with care) - you can check in parts of
 ```gitignore
 /.clod/claude        # Contains API keys and credentials
 /.clod/id            # Machine-specific container ID
-/.clod/runtime*      # Runtime files (FIFOs, MCP config) - includes all suffixed dirs
+/.clod/runtime*      # Runtime files (FIFOs, MCP config)
 /.clod/ssh           # May contain SSH key paths (user-specific)
+/.clod/system        # System-managed auto-generated files
 ```
 
 **Safe to commit:**
 
-- `.clod/Dockerfile_base` - Generated but stable
 - `.clod/Dockerfile_project` - **Your customizations** (commit this!)
-- `.clod/Dockerfile_wrapper` - Generated but stable
-- `.clod/build` - Build script
-- `.clod/run` - Run script (if customized)
-- `.clod/version` - Version tracking
+- `.clod/name` - Directory name (optional)
+- `.clod/image` - Base image selection (optional)
 - `.clod/concurrent` - Concurrency setting (optional)
-- `.clod/gpus` - GPU configuration (optional, safe if not user-specific)
+- `.clod/gpus` - GPU configuration (optional)
+- `.clod/claude-default-flags` - Default flags (optional)
 
 ### Example Team Workflow
 

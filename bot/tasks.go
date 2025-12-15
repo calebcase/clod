@@ -57,7 +57,7 @@ func (r *TaskRegistry) Discover() error {
 		}
 
 		// Check if run script exists
-		runPath := filepath.Join(clodPath, "run")
+		runPath := filepath.Join(clodPath, "system", "run")
 		if _, err := os.Stat(runPath); err != nil {
 			// run doesn't exist, skip this task
 			continue

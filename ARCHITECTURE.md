@@ -39,7 +39,7 @@ Clod is a security-focused wrapper for Claude Code that provides safe execution 
 │  │               │                  │    │  ┌──────────▼───────────────────┐││
 │  │  ┌────────────▼───────────────┐ │    │  │  Bot Core (bot.go)           │││
 │  │  │  Build Image               │ │    │  │  - Slack client              │││
-│  │  │  .clod/build               │ │    │  │  - Socket mode handler       │││
+│  │  │  .clod/system/build        │ │    │  │  - Socket mode handler       │││
 │  │  │  - Dockerfile_base         │ │    │  │  - Event routing             │││
 │  │  │  - Dockerfile_project      │ │    │  └──────────┬───────────────────┘││
 │  │  │  - Dockerfile_wrapper      │ │    │             │                     ││
@@ -47,7 +47,7 @@ Clod is a security-focused wrapper for Claude Code that provides safe execution 
 │  │               │                  │    │  │  Handler (handlers.go)       │││
 │  │  ┌────────────▼───────────────┐ │    │  │  - app_mention               │││
 │  │  │  Run Container             │ │    │  │  - message (threads)         │││
-│  │  │  .clod/run                 │ │    │  │  - interactive (buttons)     │││
+│  │  │  .clod/system/run          │ │    │  │  - interactive (buttons)     │││
 │  │  │  - Mount working dir       │ │    │  └──────────┬───────────────────┘││
 │  │  │  - Mount .clod/claude      │ │    │             │                     ││
 │  │  │  - Execute claude-wrapper  │ │    │  ┌──────────▼───────────────────┐││
@@ -139,31 +139,36 @@ Clod is a security-focused wrapper for Claude Code that provides safe execution 
 ```
 agent_directory/
 ├── .clod/                              # Docker build configuration
-│   ├── Dockerfile_base                 # Generated: Base image with npm
+│   ├── system/                         # System-managed files (auto-generated)
+│   │   ├── Dockerfile_base             # Generated: Base image with npm
+│   │   ├── Dockerfile_wrapper          # Generated: User setup, Claude install
+│   │   ├── Dockerfile                  # Combined (auto-generated)
+│   │   ├── build                       # Script: Build Docker image
+│   │   ├── run                         # Script: Run Docker container
+│   │   ├── version                     # clod version
+│   │   └── hash                        # Change detection hash
 │   ├── Dockerfile_project              # User-editable: Custom dependencies
-│   ├── Dockerfile_wrapper              # Generated: User setup, Claude install
-│   ├── Dockerfile                      # Combined (auto-generated)
-│   ├── build                           # Script: Build Docker image
-│   ├── run                             # Script: Run Docker container
 │   ├── id                              # Unique container ID
 │   ├── name                            # Container name
-│   ├── version                         # clod version
-│   ├── .hash                           # Change detection hash
-│   └── claude/                         # Claude configuration (gitignored)
-│       └── claude.json                 # Settings, sessions, permissions
-│
-├── .clod-runtime/                      # Runtime files (created by bot)
-│   ├── permission_request.fifo         # Permission requests → bot
-│   ├── permission_response.fifo        # Permission responses → Claude
-│   ├── permission_mcp.py               # MCP permission server
-│   └── mcp_config.json                 # MCP server configuration
+│   ├── image                           # Base image selection
+│   ├── concurrent                      # Optional: concurrency setting
+│   ├── ssh                             # Optional: SSH forwarding config
+│   ├── gpus                            # Optional: GPU config
+│   ├── claude-default-flags            # Optional: default flags
+│   ├── claude/                         # Claude configuration (gitignored)
+│   │   └── claude.json                 # Settings, sessions, permissions
+│   └── runtime-{suffix}/               # Runtime files (per instance)
+│       ├── permission_request.fifo     # Permission requests → bot
+│       ├── permission_response.fifo    # Permission responses → Claude
+│       ├── permission_mcp.py           # MCP permission server
+│       └── mcp_config.json             # MCP server configuration
 │
 ├── [project files]                     # Your working directory
 │   ├── src/
 │   ├── README.md
 │   └── ...
 │
-└── .gitignore                          # Excludes .clod/claude, .clod-runtime
+└── .gitignore                          # Excludes sensitive dirs
 ```
 
 ---
@@ -191,7 +196,7 @@ User
              ▼
 ┌────────────────────────────────────┐
 │  Build Docker Image                │
-│  Execute: .clod/build              │
+│  Execute: .clod/system/build       │
 │  - Builds image from Dockerfiles   │
 │  - Tags as clod-<name>-<id>        │
 │  - Installs Claude Code            │
@@ -200,7 +205,7 @@ User
              ▼
 ┌────────────────────────────────────┐
 │  Run Container                     │
-│  Execute: .clod/run [args]         │
+│  Execute: .clod/system/run [args]  │
 │  - Mount working directory         │
 │  - Mount .clod/claude              │
 │  - Run claude-wrapper              │
@@ -246,7 +251,7 @@ Slack User
 │  3. Generate mcp_config.json            │
 │  4. Copy permission_mcp.py              │
 │  5. Execute: cd task_path &&            │
-│     .clod/run --output-format           │
+│     .clod/system/run --output-format    │
 │     stream-json --prompt "..."          │
 │     --mcp-config ...                    │
 └─────────────┬───────────────────────────┘
@@ -374,22 +379,22 @@ Slack User
               │
               │  Found session ID
               ▼
-┌─────────────────────────────────┐
-│  Runner: Resume Task            │
-│  Execute: cd task_path &&       │
-│  .clod/run --output-format      │
-│  stream-json --prompt "..."     │
-│  --session-id <existing-id>     │
-└─────────────┬───────────────────┘
-              │
-              ▼
-┌─────────────────────────────────┐
-│  Container: Claude Resumes      │
-│  - Loads session from           │
-│    .clod/claude/claude.json     │
-│  - Has full conversation history│
-│  - Continues from context       │
-└─────────────┬───────────────────┘
+┌─────────────────────────────────────────┐
+│  Runner: Resume Task                    │
+│  Execute: cd task_path &&               │
+│  .clod/system/run --output-format       │
+│  stream-json --prompt "..."             │
+│  --session-id <existing-id>             │
+└─────────────────┬───────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────┐
+│  Container: Claude Resumes              │
+│  - Loads session from                   │
+│    .clod/claude/claude.json             │
+│  - Has full conversation history        │
+│  - Continues from context               │
+└─────────────────┬───────────────────────┘
               │
               ▼
         (Output stream
@@ -488,7 +493,7 @@ type RunningTask interface {
 ```go
 // Scans AGENTS_PATH for:
 // - Directories with .clod/ subdirectory
-// - Containing executable .clod/run script
+// - Containing executable .clod/system/run script
 // Maps: lowercase(dirname) → absolute path
 ```
 
@@ -858,7 +863,7 @@ git commit -m "Add approved tool patterns"
 
 **Resource Limits**:
 - Docker container resources (CPU, memory)
-- Configurable via Docker run flags in `.clod/run`
+- Configurable via Docker run flags in `.clod/system/run`
 
 **Slack Rate Limits**:
 - Message updates batched (2-second intervals)
@@ -867,7 +872,7 @@ git commit -m "Add approved tool patterns"
 
 ### Optimization Tips
 
-1. **Image Caching**: Reuse built images (tracked by .clod/.hash)
+1. **Image Caching**: Reuse built images (tracked by .clod/system/hash)
 2. **Session Reuse**: Continue threads for faster context loading
 3. **Pattern Approval**: Pre-approve common patterns for automation
 4. **Log Levels**: Use `info` or `warn` in production
@@ -885,11 +890,11 @@ docker ps -a                    # Check container status
 docker logs clod-<name>-<id>    # View logs
 
 # Permission denied
-ls -la .clod/run                # Check executable bit
-chmod +x .clod/run              # Fix if needed
+ls -la .clod/system/run         # Check executable bit
+chmod +x .clod/system/run       # Fix if needed
 
 # Wrong version
-rm .clod/version                # Force rebuild
+rm .clod/system/version         # Force rebuild
 clod                            # Reinitialize
 ```
 
@@ -921,7 +926,7 @@ LOG_LEVEL=trace LOG_FORMAT=json go run . server > bot.log
 
 **CLI**:
 ```bash
-# Add to .clod/run
+# Add to .clod/system/run
 docker run ... --env DEBUG=1 ...
 ```
 
