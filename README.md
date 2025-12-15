@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] in a modestly more secure way.
 
-**Version 0.2.10**
+**Version 0.2.11**
 
 ## Features
 
@@ -320,7 +320,8 @@ clod "Run the deployment script"
 
 ## GPU Support
 
-Clod can forward GPU access into containers for AI/ML workloads, CUDA development, or any GPU-accelerated tasks.
+Clod can forward GPU access into containers for AI/ML workloads, CUDA
+development, or any GPU-accelerated tasks.
 
 ### Configuration Methods
 
@@ -337,7 +338,8 @@ GPU support can be configured via:
    ```
 
 3. **Auto-detection** (default):
-   If neither file nor environment variable is set, clod tests if `docker run --gpus all` works. If successful, GPU support is automatically enabled.
+   If neither file nor environment variable is set, clod tests if `docker run
+   --gpus all` works. If successful, GPU support is automatically enabled.
 
 ### GPU Values
 
@@ -418,6 +420,67 @@ clod
 # Then in the Claude Code session, ask:
 # "Run nvidia-smi to verify GPU access"
 ```
+
+## Configuration File for Default Flags
+
+You can configure per-directory default flags that are automatically passed to
+every `claude` invocation by creating a `.clod/claude-default-flags` file.
+Write flags exactly as you would pass them on the command line.
+
+### Example: Set Permission Mode
+
+Create `.clod/claude-default-flags`:
+
+```
+--permission-mode acceptEdits
+```
+
+Now all invocations in this directory automatically use `--permission-mode acceptEdits`:
+
+```bash
+clod "Your prompt here"
+# Equivalent to: clod --permission-mode acceptEdits "Your prompt here"
+```
+
+### Example: Set System Prompt
+
+Create `.clod/claude-default-flags`:
+
+```
+--system-prompt "You are a helpful assistant that specializes in Python development. Always follow PEP 8 style guidelines."
+```
+
+This applies your custom system prompt to every session in this directory.
+
+### Combining Multiple Flags
+
+You can combine multiple flags in `.clod/claude-default-flags`:
+
+```
+--permission-mode acceptEdits --system-prompt "You are a backend developer. Focus on performance and security."
+```
+
+Or split across multiple lines for readability:
+
+```
+--permission-mode acceptEdits
+--system-prompt "You are a backend developer. Focus on performance and security."
+```
+
+Flags from the file are applied first, then command-line arguments:
+
+```bash
+clod --session-id abc123 "Continue work"
+# Equivalent to: clod --permission-mode acceptEdits --system-prompt "..." --session-id abc123 "Continue work"
+```
+
+### Notes
+
+- Write flags exactly as you would on the command line (space-separated, quotes as needed)
+- Arguments passed on the command line can override defaults where supported
+- The file is read on every `clod` invocation
+- This file is safe to commit if it contains project-specific settings
+- Individual developers can create their own `.clod/claude-default-flags` for personal preferences (add to `.gitignore` if needed)
 
 ## Permission Modes
 

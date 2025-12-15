@@ -1,7 +1,7 @@
 #!/bin/env bash
 set -euo pipefail
 
-CLOD_VERSION="0.2.10"
+CLOD_VERSION="0.2.11"
 
 reinit=${CLOD_REINIT:-false}
 noninteractive=${CLOD_NONINTERACTIVE:-false}
@@ -127,7 +127,12 @@ fi
 
 trap 'cp ~/.claude.json ~/.claude/claude.json' EXIT
 
-claude "\$@"
+# Read default flags from .clod/claude-default-flags if it exists.
+if [[ -f .clod/claude-default-flags ]]; then
+  eval "claude \$(<.clod/claude-default-flags) \"\$@\""
+else
+  claude "\$@"
+fi
 DEOF
 RUN chmod u+x /usr/bin/claude-wrapper
 
