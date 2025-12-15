@@ -34,6 +34,12 @@ type DownloadedFile struct {
 	LocalPath string // Only set if saved to disk
 }
 
+// uploadedFile tracks upload state for output file watching.
+type uploadedFile struct {
+	modTime        time.Time // Last modification time when uploaded
+	lastUploadTime time.Time // When the file was last uploaded (for rate limiting)
+}
+
 // DownloadToMemory downloads a Slack file to memory using the slack-go client.
 // Returns the file data and metadata without writing to disk.
 func (f *FileHandler) DownloadToMemory(file slack.File) (*DownloadedFile, error) {
@@ -79,13 +85,13 @@ func (f *FileHandler) DownloadToMemory(file slack.File) (*DownloadedFile, error)
 
 // DownloadToTask downloads a Slack file to the task directory.
 // Returns the local file path where the file was saved.
-func (f *FileHandler) DownloadToTask(file slack.File, taskPath string) (string, error) {
+func (f *FileHandler) DownloadToTask(file slack.File, taskPath string) (localPath string, err error) {
 	// Determine the filename (use Slack's filename, sanitize if needed).
 	filename := file.Name
 	if filename == "" {
 		filename = file.ID
 	}
-	localPath := filepath.Join(taskPath, filename)
+	localPath = filepath.Join(taskPath, filename)
 
 	f.logger.Info().
 		Str("file_id", file.ID).
@@ -113,15 +119,18 @@ func (f *FileHandler) DownloadToTask(file slack.File, taskPath string) (string, 
 	if err != nil {
 		return "", oops.Trace(err)
 	}
-	defer out.Close()
+	defer func() {
+		oops.ChainP(&err, out.Close())
+	}()
 
 	// Use slack-go's GetFile method which handles authentication properly.
-	if err := f.client.GetFile(url, out); err != nil {
+	if err = f.client.GetFile(url, out); err != nil {
 		return "", oops.Trace(err)
 	}
 
 	// Get file size for logging.
-	info, err := out.Stat()
+	var info os.FileInfo
+	info, err = out.Stat()
 	if err != nil {
 		return "", oops.Trace(err)
 	}
@@ -131,7 +140,7 @@ func (f *FileHandler) DownloadToTask(file slack.File, taskPath string) (string, 
 		Int64("bytes_written", info.Size()).
 		Msg("file downloaded successfully")
 
-	return localPath, nil
+	return
 }
 
 // UploadFromTaskOutputs uploads a file from the task's outputs directory to Slack.
@@ -288,13 +297,18 @@ func (f *FileHandler) WatchOutputs(
 	threadTS string,
 	done <-chan struct{},
 ) {
-	// Track files we've already uploaded.
-	uploaded := make(map[string]bool)
+	// Track files we've already uploaded with their modification times.
+	uploaded := make(map[string]*uploadedFile)
 
 	// Get initial file list to avoid uploading pre-existing files.
 	entries, _ := os.ReadDir(taskPath)
 	for _, e := range entries {
-		uploaded[e.Name()] = true
+		if info, err := e.Info(); err == nil {
+			uploaded[e.Name()] = &uploadedFile{
+				modTime:        info.ModTime(),
+				lastUploadTime: time.Now(),
+			}
+		}
 	}
 
 	f.logger.Debug().
@@ -319,12 +333,12 @@ func (f *FileHandler) WatchOutputs(
 	}
 }
 
-// uploadNewFiles checks for and uploads any new files in the task directory.
+// uploadNewFiles checks for and uploads any new or modified files in the task directory.
 func (f *FileHandler) uploadNewFiles(
 	taskPath string,
 	channelID string,
 	threadTS string,
-	uploaded map[string]bool,
+	uploaded map[string]*uploadedFile,
 ) {
 	entries, err := os.ReadDir(taskPath)
 	if err != nil {
@@ -338,16 +352,36 @@ func (f *FileHandler) uploadNewFiles(
 		}
 
 		name := entry.Name()
-		if uploaded[name] {
+		localPath := filepath.Join(taskPath, name)
+
+		// Get file info to check modification time.
+		info1, err := entry.Info()
+		if err != nil {
 			continue
 		}
 
-		// New file found.
-		localPath := filepath.Join(taskPath, name)
+		// Check if file should be uploaded (new or modified).
+		tracked, exists := uploaded[name]
+		shouldUpload := false
 
-		// Check if file is still being written (size is changing).
-		info1, err := entry.Info()
-		if err != nil {
+		if !exists {
+			// New file - upload it.
+			shouldUpload = true
+		} else if info1.ModTime().After(tracked.modTime) {
+			// File has been modified since last upload.
+			// Apply cooldown period to prevent rapid re-uploads.
+			cooldownPeriod := 10 * time.Second
+			if time.Since(tracked.lastUploadTime) >= cooldownPeriod {
+				shouldUpload = true
+				f.logger.Debug().
+					Str("file", name).
+					Time("old_modtime", tracked.modTime).
+					Time("new_modtime", info1.ModTime()).
+					Msg("file modified, re-uploading")
+			}
+		}
+
+		if !shouldUpload {
 			continue
 		}
 
@@ -370,6 +404,10 @@ func (f *FileHandler) uploadNewFiles(
 			continue
 		}
 
-		uploaded[name] = true
+		// Track the upload with current modification time and timestamp.
+		uploaded[name] = &uploadedFile{
+			modTime:        info2.ModTime(),
+			lastUploadTime: time.Now(),
+		}
 	}
 }

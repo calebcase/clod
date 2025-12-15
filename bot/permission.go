@@ -83,8 +83,8 @@ func NewPermissionFIFO(taskPath string, runtimeSuffix string, logger zerolog.Log
 	responsePath := filepath.Join(runtimeDir, FIFOResponseName)
 
 	// Remove existing FIFOs if they exist
-	os.Remove(requestPath)
-	os.Remove(responsePath)
+	_ = os.Remove(requestPath) // Ignore error if file doesn't exist
+	_ = os.Remove(responsePath) // Ignore error if file doesn't exist
 
 	// Write the MCP server script to the runtime directory
 	mcpPath := filepath.Join(runtimeDir, MCPScriptName)
@@ -98,7 +98,7 @@ func NewPermissionFIFO(taskPath string, runtimeSuffix string, logger zerolog.Log
 	}
 
 	if err := syscall.Mkfifo(responsePath, 0600); err != nil {
-		os.Remove(requestPath)
+		_ = os.Remove(requestPath) // Cleanup on error, ignore if already removed
 		return nil, oops.Trace(err)
 	}
 
@@ -165,12 +165,14 @@ func (p *PermissionFIFO) readRequests(ctx context.Context) {
 			select {
 			case p.requests <- req:
 			case <-ctx.Done():
-				file.Close()
+				_ = file.Close()
 				return
 			}
 		}
 
-		file.Close()
+		if err := file.Close(); err != nil {
+			p.logger.Error().Err(err).Msg("failed to close request FIFO")
+		}
 
 		if ctx.Err() != nil {
 			return
@@ -198,7 +200,7 @@ func (p *PermissionFIFO) writeResponses(ctx context.Context) {
 			data, err := json.Marshal(resp)
 			if err != nil {
 				p.logger.Error().Err(err).Msg("failed to marshal response")
-				file.Close()
+				_ = file.Close()
 				continue
 			}
 
@@ -207,7 +209,9 @@ func (p *PermissionFIFO) writeResponses(ctx context.Context) {
 				p.logger.Error().Err(err).Msg("failed to write response")
 			}
 
-			file.Close()
+			if err := file.Close(); err != nil {
+				p.logger.Error().Err(err).Msg("failed to close response FIFO")
+			}
 
 			p.logger.Debug().
 				Str("behavior", resp.Behavior).
@@ -238,8 +242,8 @@ func (p *PermissionFIFO) Close() {
 	}
 
 	// Remove the FIFOs
-	os.Remove(p.requestPath)
-	os.Remove(p.responsePath)
+	_ = os.Remove(p.requestPath)  // Ignore error if already removed
+	_ = os.Remove(p.responsePath) // Ignore error if already removed
 
 	close(p.requests)
 	close(p.responses)

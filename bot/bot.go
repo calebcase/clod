@@ -36,6 +36,7 @@ func NewBot(
 	tasks *TaskRegistry,
 	sessions *SessionStore,
 	runner *Runner,
+	verboseTools []string,
 	logger zerolog.Logger,
 ) (*Bot, error) {
 	client := slack.New(
@@ -63,7 +64,7 @@ func NewBot(
 		logger:        logger.With().Str("component", "bot").Logger(),
 	}
 
-	bot.handler = NewHandler(bot)
+	bot.handler = NewHandler(bot, verboseTools)
 
 	// Register event handlers using the socketmode handler pattern
 	bot.registerEventHandlers()
@@ -172,6 +173,10 @@ func (b *Bot) handleCallbackEvent(ctx context.Context, innerEvent slackevents.Ev
 		b.handler.HandleAppMention(ctx, ev)
 	case *slackevents.MessageEvent:
 		b.handler.HandleMessage(ctx, ev)
+	case *slackevents.ReactionAddedEvent:
+		b.handler.HandleReactionAdded(ctx, ev)
+	case *slackevents.ReactionRemovedEvent:
+		b.handler.HandleReactionRemoved(ctx, ev)
 	default:
 		b.logger.Debug().
 			Str("type", innerEvent.Type).

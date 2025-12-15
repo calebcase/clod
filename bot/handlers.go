@@ -35,13 +35,26 @@ type Handler struct {
 
 	// Track threads waiting for permission responses
 	pendingPermissions sync.Map // key -> *PendingPermission
+
+	// Tools affected by verbosity toggle (controlled by VERBOSE_TOOLS env var)
+	verboseTools map[string]bool
 }
 
+// Emoji used to toggle verbosity in a thread
+const verbosityEmoji = "speech_balloon"
+
 // NewHandler creates a new Handler.
-func NewHandler(bot *Bot) *Handler {
+func NewHandler(bot *Bot, verboseTools []string) *Handler {
+	// Build map for O(1) lookup
+	verboseToolsMap := make(map[string]bool, len(verboseTools))
+	for _, tool := range verboseTools {
+		verboseToolsMap[tool] = true
+	}
+
 	return &Handler{
-		bot:    bot,
-		logger: bot.logger.With().Str("component", "handler").Logger(),
+		bot:          bot,
+		logger:       bot.logger.With().Str("component", "handler").Logger(),
+		verboseTools: verboseToolsMap,
 	}
 }
 
@@ -68,7 +81,9 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 	// Check authorization
 	if !h.bot.auth.IsAuthorized(ev.User) {
 		logger.Warn().Msg("unauthorized user")
-		h.bot.PostMessage(ev.Channel, h.bot.auth.RejectMessage(), threadTS)
+		if _, err := h.bot.PostMessage(ev.Channel, h.bot.auth.RejectMessage(), threadTS); err != nil {
+			logger.Error().Err(err).Msg("failed to post authorization rejection message")
+		}
 		return
 	}
 
@@ -153,11 +168,13 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 				return
 			}
 			// Not a clear yes/no, remind them to use buttons
-			h.bot.PostMessage(
+			if _, err := h.bot.PostMessage(
 				ev.Channel,
 				"_Please use the buttons above to respond, or type_ `yes` _or_ `no`_._",
 				threadTS,
-			)
+			); err != nil {
+				logger.Error().Err(err).Msg("failed to post permission reminder message")
+			}
 			return
 		}
 
@@ -174,11 +191,13 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 	if session == nil {
 		// No session for this thread. Let the user know.
 		logger.Debug().Msg("no running task or saved session for thread")
-		h.bot.PostMessage(
+		if _, err := h.bot.PostMessage(
 			ev.Channel,
 			":question: I don't have a saved session for this thread. Use `@bot task_name: your instructions` to start a new task.",
 			threadTS,
-		)
+		); err != nil {
+			logger.Error().Err(err).Msg("failed to post no session message")
+		}
 		return
 	}
 
@@ -206,20 +225,24 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 	// Download files to disk for Claude to read.
 	var downloadedFiles []string
 	if len(slackFiles) > 0 {
-		h.bot.PostMessage(
+		if _, err := h.bot.PostMessage(
 			ev.Channel,
 			fmt.Sprintf(":inbox_tray: Downloading %d file(s)...", len(slackFiles)),
 			threadTS,
-		)
+		); err != nil {
+			logger.Error().Err(err).Msg("failed to post file download message")
+		}
 		for _, file := range slackFiles {
 			localPath, err := h.bot.files.DownloadToTask(file, session.TaskPath)
 			if err != nil {
 				logger.Error().Err(err).Str("file_id", file.ID).Msg("failed to download file")
-				h.bot.PostMessage(
+				if _, postErr := h.bot.PostMessage(
 					ev.Channel,
 					fmt.Sprintf(":warning: Failed to download `%s`: %v", file.Name, err),
 					threadTS,
-				)
+				); postErr != nil {
+					logger.Error().Err(postErr).Msg("failed to post download error message")
+				}
 				continue
 			}
 			logger.Info().
@@ -240,11 +263,13 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 	}
 
 	// Post status
-	h.bot.PostMessage(
+	if _, err := h.bot.PostMessage(
 		ev.Channel,
 		fmt.Sprintf(":arrows_counterclockwise: Resuming task `%s`...", session.TaskName),
 		threadTS,
-	)
+	); err != nil {
+		logger.Error().Err(err).Msg("failed to post resume task message")
+	}
 
 	// Run clod with existing session
 	h.runClod(
@@ -258,6 +283,123 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		threadTS,
 		logger,
 	)
+}
+
+// HandleReactionAdded processes reaction_added events.
+func (h *Handler) HandleReactionAdded(ctx context.Context, ev *slackevents.ReactionAddedEvent) {
+	// Only handle the verbosity toggle emoji
+	if ev.Reaction != verbosityEmoji {
+		return
+	}
+
+	logger := h.logger.With().
+		Str("channel", ev.Item.Channel).
+		Str("item_ts", ev.Item.Timestamp).
+		Str("user", ev.User).
+		Str("reaction", ev.Reaction).
+		Logger()
+
+	// Determine thread TS - the reacted item could be the thread root or a reply
+	threadTS, err := h.getThreadTS(ev.Item.Channel, ev.Item.Timestamp)
+	if err != nil {
+		logger.Debug().Err(err).Msg("failed to get thread TS for reaction")
+		return
+	}
+
+	logger = logger.With().Str("thread_ts", threadTS).Logger()
+	logger.Info().Msg("enabling verbose mode for thread")
+
+	// Enable verbose mode for this thread
+	h.bot.sessions.SetVerbose(ev.Item.Channel, threadTS, true)
+
+	// Save to persist the change
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Error().Err(err).Msg("failed to save session after verbosity change")
+	}
+
+	// Post confirmation message to the thread
+	if _, err := h.bot.PostMessage(
+		ev.Item.Channel,
+		":speech_balloon: Verbose mode enabled - tool outputs will include full content.",
+		threadTS,
+	); err != nil {
+		logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
+	}
+}
+
+// HandleReactionRemoved processes reaction_removed events.
+func (h *Handler) HandleReactionRemoved(ctx context.Context, ev *slackevents.ReactionRemovedEvent) {
+	// Only handle the verbosity toggle emoji
+	if ev.Reaction != verbosityEmoji {
+		return
+	}
+
+	logger := h.logger.With().
+		Str("channel", ev.Item.Channel).
+		Str("item_ts", ev.Item.Timestamp).
+		Str("user", ev.User).
+		Str("reaction", ev.Reaction).
+		Logger()
+
+	// Determine thread TS
+	threadTS, err := h.getThreadTS(ev.Item.Channel, ev.Item.Timestamp)
+	if err != nil {
+		logger.Debug().Err(err).Msg("failed to get thread TS for reaction")
+		return
+	}
+
+	logger = logger.With().Str("thread_ts", threadTS).Logger()
+	logger.Info().Msg("disabling verbose mode for thread")
+
+	// Disable verbose mode for this thread
+	h.bot.sessions.SetVerbose(ev.Item.Channel, threadTS, false)
+
+	// Save to persist the change
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Error().Err(err).Msg("failed to save session after verbosity change")
+	}
+
+	// Post confirmation message to the thread
+	if _, err := h.bot.PostMessage(
+		ev.Item.Channel,
+		":mute: Verbose mode disabled - tool outputs will show summaries only.",
+		threadTS,
+	); err != nil {
+		logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
+	}
+}
+
+// getThreadTS determines the thread timestamp for a message.
+// If the message is a thread reply, returns the thread_ts.
+// If the message is a thread root, returns the message ts.
+func (h *Handler) getThreadTS(channelID, messageTS string) (string, error) {
+	// Fetch the message to check if it's in a thread
+	params := &slack.GetConversationHistoryParameters{
+		ChannelID: channelID,
+		Latest:    messageTS,
+		Oldest:    messageTS,
+		Inclusive: true,
+		Limit:     1,
+	}
+
+	history, err := h.bot.client.GetConversationHistory(params)
+	if err != nil {
+		return "", err
+	}
+
+	if len(history.Messages) == 0 {
+		// Message not found, assume it's the thread root
+		return messageTS, nil
+	}
+
+	msg := history.Messages[0]
+	if msg.ThreadTimestamp != "" {
+		// Message is a reply in a thread
+		return msg.ThreadTimestamp, nil
+	}
+
+	// Message is a thread root (or standalone)
+	return messageTS, nil
 }
 
 // handleNewTask processes a new task request.
@@ -274,7 +416,9 @@ func (h *Handler) handleNewTask(
 			"I didn't understand that. Please use the format: `@bot task_name: your instructions`\n\n%s",
 			h.bot.tasks.ListFormatted(),
 		)
-		h.bot.PostMessage(ev.Channel, msg, threadTS)
+		if _, err := h.bot.PostMessage(ev.Channel, msg, threadTS); err != nil {
+			logger.Error().Err(err).Msg("failed to post parse error message")
+		}
 		return
 	}
 
@@ -291,7 +435,9 @@ func (h *Handler) handleNewTask(
 			parsed.TaskName,
 			h.bot.tasks.ListFormatted(),
 		)
-		h.bot.PostMessage(ev.Channel, msg, threadTS)
+		if _, postErr := h.bot.PostMessage(ev.Channel, msg, threadTS); postErr != nil {
+			logger.Error().Err(postErr).Msg("failed to post unknown task message")
+		}
 		return
 	}
 
@@ -311,20 +457,24 @@ func (h *Handler) handleNewTask(
 	// Download files to disk for Claude to read.
 	var downloadedFiles []string
 	if len(slackFiles) > 0 {
-		h.bot.PostMessage(
+		if _, err := h.bot.PostMessage(
 			ev.Channel,
 			fmt.Sprintf(":inbox_tray: Downloading %d file(s)...", len(slackFiles)),
 			threadTS,
-		)
+		); err != nil {
+			logger.Error().Err(err).Msg("failed to post file download message")
+		}
 		for _, file := range slackFiles {
 			localPath, err := h.bot.files.DownloadToTask(file, taskPath)
 			if err != nil {
 				logger.Error().Err(err).Str("file_id", file.ID).Msg("failed to download file")
-				h.bot.PostMessage(
+				if _, postErr := h.bot.PostMessage(
 					ev.Channel,
 					fmt.Sprintf(":warning: Failed to download `%s`: %v", file.Name, err),
 					threadTS,
-				)
+				); postErr != nil {
+					logger.Error().Err(postErr).Msg("failed to post download error message")
+				}
 				continue
 			}
 			logger.Info().
@@ -345,11 +495,13 @@ func (h *Handler) handleNewTask(
 	}
 
 	// Post initial status
-	h.bot.PostMessage(
+	if _, err := h.bot.PostMessage(
 		ev.Channel,
 		fmt.Sprintf(":rocket: Starting a `%s` task...", parsed.TaskName),
 		threadTS,
-	)
+	); err != nil {
+		logger.Error().Err(err).Msg("failed to post task start message")
+	}
 
 	// Run clod
 	h.runClod(
@@ -375,7 +527,9 @@ func (h *Handler) handleContinuation(
 ) {
 	instructions := ParseContinuation(ev.Text)
 	if instructions == "" {
-		h.bot.PostMessage(ev.Channel, "Please provide instructions for the task.", threadTS)
+		if _, err := h.bot.PostMessage(ev.Channel, "Please provide instructions for the task.", threadTS); err != nil {
+			logger.Error().Err(err).Msg("failed to post empty instructions message")
+		}
 		return
 	}
 
@@ -388,11 +542,13 @@ func (h *Handler) handleContinuation(
 	logger.Info().Msg("continuing existing session")
 
 	// Post initial status
-	h.bot.PostMessage(
+	if _, err := h.bot.PostMessage(
 		ev.Channel,
 		fmt.Sprintf(":arrows_counterclockwise: Continuing task `%s`...", session.TaskName),
 		threadTS,
-	)
+	); err != nil {
+		logger.Error().Err(err).Msg("failed to post continue task message")
+	}
 
 	// Run clod with existing session
 	h.runClod(
@@ -424,7 +580,9 @@ func (h *Handler) runClod(
 	task, err := h.bot.runner.Start(ctx, taskPath, prompt, sessionID)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to start clod")
-		h.bot.PostMessage(channelID, fmt.Sprintf(":x: Failed to start task: %v", err), threadTS)
+		if _, postErr := h.bot.PostMessage(channelID, fmt.Sprintf(":x: Failed to start task: %v", err), threadTS); postErr != nil {
+			logger.Error().Err(postErr).Msg("failed to post task start error message")
+		}
 		return
 	}
 
@@ -563,7 +721,9 @@ func (h *Handler) runClod(
 					Msg("task completed successfully")
 				finalMsg = ":white_check_mark: Task completed!"
 			}
-			h.bot.PostMessage(channelID, finalMsg, threadTS)
+			if _, err := h.bot.PostMessage(channelID, finalMsg, threadTS); err != nil {
+				logger.Error().Err(err).Msg("failed to post final task message")
+			}
 
 			// Save session mapping
 			if result.SessionID != "" {
@@ -599,7 +759,9 @@ done:
 			Msg("task completed successfully")
 		finalMsg = ":white_check_mark: Task completed!"
 	}
-	h.bot.PostMessage(channelID, finalMsg, threadTS)
+	if _, err := h.bot.PostMessage(channelID, finalMsg, threadTS); err != nil {
+		logger.Error().Err(err).Msg("failed to post final task message")
+	}
 
 	// Save session mapping
 	if result.SessionID != "" {
@@ -838,8 +1000,10 @@ func (h *Handler) HandleBlockAction(
 	if !ok {
 		logger.Warn().Msg("no running task found for permission response")
 		// Update the message to show it's stale
-		h.bot.UpdateMessage(callback.Channel.ID, callback.Message.Timestamp,
-			":warning: This permission request is no longer active.")
+		if err := h.bot.UpdateMessage(callback.Channel.ID, callback.Message.Timestamp,
+			":warning: This permission request is no longer active."); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale permission message")
+		}
 		return
 	}
 
@@ -1143,14 +1307,20 @@ func formatBytes(bytes int) string {
 	}
 }
 
-// postToolSnippet posts a tool result as a summary line with attached collapsible snippet.
+// postToolSnippet posts a tool result as a summary line, optionally with attached collapsible snippet.
+// In quiet mode (default), verbose tools only show the summary line.
+// In verbose mode, the full content is uploaded as a collapsible Slack file snippet.
 func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, content string, logger zerolog.Logger) {
 	contentLen := len(content)
 	lineCount := strings.Count(content, "\n") + 1
 
+	// Check verbosity settings
+	isVerboseTool := h.verboseTools[toolName]
+	isVerboseMode := h.bot.sessions.IsVerbose(channelID, threadTS)
+
 	// Parse input JSON to extract tool-specific parameters.
 	var input map[string]any
-	json.Unmarshal([]byte(inputJSON), &input)
+	_ = json.Unmarshal([]byte(inputJSON), &input) // Best-effort parse, ignore errors
 
 	// Helper to get string from input.
 	getString := func(key string) string {
@@ -1236,6 +1406,17 @@ func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, cont
 	default:
 		summary = fmt.Sprintf(":gear: `%s` (%s)", toolName, formatBytes(contentLen))
 		snippetTitle = fmt.Sprintf("%s output", toolName)
+	}
+
+	// Decide output behavior based on tool type and verbosity mode.
+	// Verbose tools in quiet mode: summary only (no file upload).
+	// Verbose tools in verbose mode OR non-verbose tools: upload as collapsible snippet.
+	if isVerboseTool && !isVerboseMode {
+		// Quiet mode for verbose-controlled tools: summary only
+		if _, err := h.bot.PostMessage(channelID, summary, threadTS); err != nil {
+			logger.Error().Err(err).Str("tool", toolName).Msg("failed to post tool summary")
+		}
+		return
 	}
 
 	// Upload content as collapsible snippet with summary as the comment.

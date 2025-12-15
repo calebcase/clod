@@ -29,6 +29,8 @@ type Flags struct {
 
 	PermissionMode string `kong:"default='default',env='PERMISSION_MODE',help='Claude permission mode (default, acceptEdits, bypassPermissions)'"`
 
+	VerboseTools []string `kong:"default='Read,Glob,Grep,WebFetch,WebSearch',env='VERBOSE_TOOLS',sep=',',help='Tools affected by verbosity toggle'"`
+
 	GracefulShutdownTTL time.Duration `kong:"default='30s',env='GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
 }
 
@@ -38,15 +40,15 @@ type CLI struct {
 
 func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	logger.Info().
-		Str("agents_path", cli.Flags.AgentsPath).
-		Str("session_store", cli.Flags.SessionStorePath).
-		Int("allowed_users", len(cli.Flags.AllowedUsers)).
+		Str("agents_path", cli.AgentsPath).
+		Str("session_store", cli.SessionStorePath).
+		Int("allowed_users", len(cli.AllowedUsers)).
 		Msg("starting clod slack bot")
 
 	// Initialize components
-	auth := NewAuthorizer(cli.Flags.AllowedUsers)
+	auth := NewAuthorizer(cli.AllowedUsers)
 
-	tasks, err := NewTaskRegistry(cli.Flags.AgentsPath)
+	tasks, err := NewTaskRegistry(cli.AgentsPath)
 	if err != nil {
 		return err
 	}
@@ -54,25 +56,26 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	taskNames := tasks.List()
 	logger.Info().Strs("tasks", taskNames).Msg("discovered tasks")
 
-	sessions, err := NewSessionStore(cli.Flags.SessionStorePath)
+	sessions, err := NewSessionStore(cli.SessionStorePath)
 	if err != nil {
 		return err
 	}
 	logger.Info().
 		Int("session_count", sessions.Count()).
-		Str("path", cli.Flags.SessionStorePath).
+		Str("path", cli.SessionStorePath).
 		Msg("loaded sessions from storage")
 
-	runner := NewRunner(cli.Flags.ClodTimeout, cli.Flags.PermissionMode, logger)
+	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, logger)
 
 	// Create and start the bot
 	bot, err := NewBot(
-		cli.Flags.SlackBotToken,
-		cli.Flags.SlackAppToken,
+		cli.SlackBotToken,
+		cli.SlackAppToken,
 		auth,
 		tasks,
 		sessions,
 		runner,
+		cli.VerboseTools,
 		logger,
 	)
 	if err != nil {
@@ -93,7 +96,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	case <-signals:
 		start := time.Now()
 		logger.Warn().
-			Float64("ttl", cli.Flags.GracefulShutdownTTL.Seconds()).
+			Float64("ttl", cli.GracefulShutdownTTL.Seconds()).
 			Msg("shutting down gracefully (send again to force)")
 
 		bot.Shutdown()
@@ -105,7 +108,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 				Float64("elapsed", time.Since(start).Seconds()).
 				Msg("received second signal: forcing immediate exit")
 			os.Exit(1)
-		case <-time.After(cli.Flags.GracefulShutdownTTL):
+		case <-time.After(cli.GracefulShutdownTTL):
 			logger.Error().
 				Float64("elapsed", time.Since(start).Seconds()).
 				Msg("graceful shutdown timeout: forcing exit")

@@ -37,46 +37,46 @@ func (r *mrkdwnRenderer) RenderNode(w io.Writer, node ast.Node, entering bool) a
 		if !entering {
 			// Don't add newline if parent is a ListItem (it handles its own newlines).
 			if _, isListItem := n.Parent.(*ast.ListItem); !isListItem {
-				fmt.Fprint(w, "\n")
+				_, _ = fmt.Fprint(w, "\n")
 			}
 		}
 		return ast.GoToNext
 
 	case *ast.Text:
 		if entering {
-			fmt.Fprint(w, string(n.Literal))
+			_, _ = fmt.Fprint(w, string(n.Literal))
 		}
 		return ast.GoToNext
 
 	case *ast.Strong:
 		if entering {
-			fmt.Fprint(w, "*")
+			_, _ = fmt.Fprint(w, "*")
 		} else {
-			fmt.Fprint(w, "*")
+			_, _ = fmt.Fprint(w, "*")
 		}
 		return ast.GoToNext
 
 	case *ast.Emph:
 		if entering {
-			fmt.Fprint(w, "_")
+			_, _ = fmt.Fprint(w, "_")
 		} else {
-			fmt.Fprint(w, "_")
+			_, _ = fmt.Fprint(w, "_")
 		}
 		return ast.GoToNext
 
 	case *ast.Del:
 		if entering {
-			fmt.Fprint(w, "~")
+			_, _ = fmt.Fprint(w, "~")
 		} else {
-			fmt.Fprint(w, "~")
+			_, _ = fmt.Fprint(w, "~")
 		}
 		return ast.GoToNext
 
 	case *ast.Heading:
 		if entering {
-			fmt.Fprint(w, "\n*")
+			_, _ = fmt.Fprint(w, "\n*")
 		} else {
-			fmt.Fprint(w, "*\n")
+			_, _ = fmt.Fprint(w, "*\n")
 		}
 		return ast.GoToNext
 
@@ -89,27 +89,27 @@ func (r *mrkdwnRenderer) RenderNode(w io.Writer, node ast.Node, entering bool) a
 				textBuilder.Write(childData)
 			}
 			linkText := strings.TrimSpace(textBuilder.String())
-			fmt.Fprintf(w, "<%s|%s>", string(n.Destination), linkText)
+			_, _ = fmt.Fprintf(w, "<%s|%s>", string(n.Destination), linkText)
 			return ast.SkipChildren
 		}
 		return ast.GoToNext
 
 	case *ast.Code:
 		if entering {
-			fmt.Fprintf(w, "`%s`", string(n.Literal))
+			_, _ = fmt.Fprintf(w, "`%s`", string(n.Literal))
 		}
 		return ast.GoToNext
 
 	case *ast.CodeBlock:
 		if entering {
 			code := strings.TrimSuffix(string(n.Literal), "\n")
-			fmt.Fprintf(w, "```\n%s\n```\n", code)
+			_, _ = fmt.Fprintf(w, "```\n%s\n```\n", code)
 		}
 		return ast.GoToNext
 
 	case *ast.List:
 		if !entering {
-			fmt.Fprint(w, "\n")
+			_, _ = fmt.Fprint(w, "\n")
 		}
 		return ast.GoToNext
 
@@ -131,13 +131,13 @@ func (r *mrkdwnRenderer) RenderNode(w io.Writer, node ast.Node, entering bool) a
 					if start == 0 {
 						start = 1
 					}
-					fmt.Fprintf(w, "%d. ", idx+start-1)
+					_, _ = fmt.Fprintf(w, "%d. ", idx+start-1)
 				} else {
-					fmt.Fprint(w, "• ")
+					_, _ = fmt.Fprint(w, "• ")
 				}
 			}
 		} else {
-			fmt.Fprint(w, "\n")
+			_, _ = fmt.Fprint(w, "\n")
 		}
 		return ast.GoToNext
 
@@ -152,7 +152,7 @@ func (r *mrkdwnRenderer) RenderNode(w io.Writer, node ast.Node, entering bool) a
 			content := strings.TrimSpace(contentBuilder.String())
 			lines := strings.Split(content, "\n")
 			for _, line := range lines {
-				fmt.Fprintf(w, "> %s\n", line)
+				_, _ = fmt.Fprintf(w, "> %s\n", line)
 			}
 			return ast.SkipChildren
 		}
@@ -160,33 +160,33 @@ func (r *mrkdwnRenderer) RenderNode(w io.Writer, node ast.Node, entering bool) a
 
 	case *ast.HorizontalRule:
 		if entering {
-			fmt.Fprint(w, "\n---\n")
+			_, _ = fmt.Fprint(w, "\n---\n")
 		}
 		return ast.GoToNext
 
 	case *ast.Softbreak:
 		if entering {
-			fmt.Fprint(w, "\n")
+			_, _ = fmt.Fprint(w, "\n")
 		}
 		return ast.GoToNext
 
 	case *ast.Hardbreak:
 		if entering {
-			fmt.Fprint(w, "\n")
+			_, _ = fmt.Fprint(w, "\n")
 		}
 		return ast.GoToNext
 
 	case *ast.HTMLSpan:
 		// Pass through HTML spans as-is.
 		if entering {
-			fmt.Fprint(w, string(n.Literal))
+			_, _ = fmt.Fprint(w, string(n.Literal))
 		}
 		return ast.GoToNext
 
 	case *ast.HTMLBlock:
 		// Pass through HTML blocks as-is.
 		if entering {
-			fmt.Fprint(w, string(n.Literal))
+			_, _ = fmt.Fprint(w, string(n.Literal))
 		}
 		return ast.GoToNext
 

@@ -423,7 +423,7 @@ func (r *Runner) Start(
 	go func() {
 		defer close(task.output)
 		defer close(task.done)
-		defer ptmx.Close()
+		defer func() { _ = ptmx.Close() }()
 		defer permFIFO.Close()
 
 		var outputBuilder strings.Builder

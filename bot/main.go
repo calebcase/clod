@@ -22,11 +22,11 @@ func Run() (err error) {
 		kong.Bind(&cli.Flags),
 	)
 
-	zerolog.SetGlobalLevel(cli.Flags.Log.Level)
+	zerolog.SetGlobalLevel(cli.Log.Level)
 
 	var output io.Writer = os.Stderr
 
-	switch cli.Flags.Log.Format {
+	switch cli.Log.Format {
 	case "json":
 		// Default JSON output
 	case "console":

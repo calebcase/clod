@@ -18,6 +18,7 @@ type SessionMapping struct {
 	TaskPath  string    `json:"task_path"`
 	SessionID string    `json:"session_id"`
 	UserID    string    `json:"user_id"`
+	Verbose   bool      `json:"verbose"` // Per-thread verbosity setting
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -72,6 +73,40 @@ func (s *SessionStore) Set(mapping *SessionMapping) {
 	s.sessions[key(mapping.ChannelID, mapping.ThreadTS)] = mapping
 }
 
+// SetVerbose updates the verbose setting for a thread.
+// If no session exists, it creates a minimal one to store the setting.
+func (s *SessionStore) SetVerbose(channelID, threadTS string, verbose bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := key(channelID, threadTS)
+	session := s.sessions[k]
+	if session == nil {
+		// Create minimal session to track verbosity for threads without tasks yet
+		session = &SessionMapping{
+			ChannelID: channelID,
+			ThreadTS:  threadTS,
+			CreatedAt: time.Now(),
+		}
+		s.sessions[k] = session
+	}
+	session.Verbose = verbose
+	session.UpdatedAt = time.Now()
+}
+
+// IsVerbose returns the verbosity setting for a thread.
+// Returns false (quiet mode) if no session exists.
+func (s *SessionStore) IsVerbose(channelID, threadTS string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	session := s.sessions[key(channelID, threadTS)]
+	if session == nil {
+		return false
+	}
+	return session.Verbose
+}
+
 // Load reads sessions from the JSON file.
 // Returns nil if the file doesn't exist (fresh start).
 func (s *SessionStore) Load() error {
@@ -123,18 +158,18 @@ func (s *SessionStore) Save() error {
 	tmpPath := tmpFile.Name()
 
 	if _, err := tmpFile.Write(data); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
 		return oops.Trace(err)
 	}
 
 	if err := tmpFile.Close(); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return oops.Trace(err)
 	}
 
 	if err := os.Rename(tmpPath, s.path); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return oops.Trace(err)
 	}
 

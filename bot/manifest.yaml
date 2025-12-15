@@ -26,6 +26,7 @@ oauth_config:
       - groups:read
       - files:read
       - files:write
+      - reactions:read
       - remote_files:read
       - remote_files:write
 
@@ -35,6 +36,8 @@ settings:
       - app_mention
       - message.channels
       - message.groups
+      - reaction_added
+      - reaction_removed
   interactivity:
     is_enabled: true
   org_deploy_enabled: false

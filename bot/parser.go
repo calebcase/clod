@@ -21,7 +21,7 @@ var mentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+(\S+?):\s*(.+)`)
 // Returns nil if the message doesn't match the expected format.
 func ParseMention(text string) *ParsedMention {
 	matches := mentionPattern.FindStringSubmatch(text)
-	if matches == nil || len(matches) < 3 {
+	if len(matches) < 3 {
 		return nil
 	}
 
@@ -37,7 +37,7 @@ var continuationPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s*(.*)`)
 
 func ParseContinuation(text string) string {
 	matches := continuationPattern.FindStringSubmatch(text)
-	if matches == nil || len(matches) < 2 {
+	if len(matches) < 2 {
 		return strings.TrimSpace(text)
 	}
 	return strings.TrimSpace(matches[1])
