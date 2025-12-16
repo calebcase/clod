@@ -2,7 +2,9 @@
 
 ## Overview
 
-Clod is a security-focused wrapper for Claude Code that provides safe execution through Docker containerization, with optional Slack bot integration for remote task execution.
+Clod is a security-focused wrapper for Claude Code that provides safe execution
+through Docker containerization, with optional Slack bot integration for remote
+task execution.
 
 ---
 
@@ -43,6 +45,7 @@ Clod is a security-focused wrapper for Claude Code that provides safe execution 
 │  │  │  - Dockerfile_base        │  │     │  │  - Event routing            │ ││
 │  │  │  - Dockerfile_project     │  │     │  └─────────────┬───────────────┘ ││
 │  │  │  - Dockerfile_wrapper     │  │     │                │                 ││
+│  │  │  - Dockerfile_user        │  │     │                │                 ││
 │  │  └─────────────┬─────────────┘  │     │  ┌─────────────▼───────────────┐ ││
 │  │                │                │     │  │  Handler (handlers.go)      │ ││
 │  │  ┌─────────────▼─────────────┐  │     │  │  - app_mention              │ ││
@@ -145,13 +148,14 @@ agent_directory/
 ├── .clod/                              # Docker build configuration
 │   ├── system/                         # System-managed files (auto-generated)
 │   │   ├── Dockerfile_base             # Generated: Base image with npm
-│   │   ├── Dockerfile_wrapper          # Generated: User setup, Claude install
+│   │   ├── Dockerfile_wrapper          # Generated: User setup, Claude install, entrypoint
 │   │   ├── Dockerfile                  # Combined (auto-generated)
 │   │   ├── build                       # Script: Build Docker image
 │   │   ├── run                         # Script: Run Docker container
 │   │   ├── version                     # clod version
 │   │   └── hash                        # Change detection hash
 │   ├── Dockerfile_project              # User-editable: Custom dependencies
+│   ├── Dockerfile_user                 # User-editable: User-context resources (can override entrypoint)
 │   ├── id                              # Unique container ID
 │   ├── name                            # Container name
 │   ├── image                           # Base image selection
@@ -360,10 +364,7 @@ Claude (in container)
          │
          │  {allowed: true/false}
          ▼
-      Claude
-   (Continues or
-    tries different
-     approach)
+      Claude (Continues or tries different approach)
 ```
 
 ### 4. Session Continuation Flow
@@ -399,10 +400,9 @@ Slack User
 │  - Has full conversation history        │
 │  - Continues from context               │
 └─────────────────┬───────────────────────┘
-              │
-              ▼
-        (Output stream
-         as normal)
+                  │
+                  ▼
+      (Output stream as normal)
 ```
 
 ---
@@ -412,7 +412,9 @@ Slack User
 ### 1. clod CLI (bin/clod)
 
 **Language**: Bash
+
 **Responsibilities**:
+
 - Initialize .clod directory structure
 - Generate layered Dockerfiles
 - Build Docker images with Claude Code
@@ -420,6 +422,7 @@ Slack User
 - Manage configuration and versioning
 
 **Key Functions**:
+
 - `clod_init()`: First-time setup
 - `clod_build()`: Docker image creation
 - `clod_run()`: Container execution
@@ -427,6 +430,7 @@ Slack User
 ### 2. Bot Server (bot/main.go)
 
 **Language**: Go
+
 **Entry Point**: `main.go`
 
 **Component Breakdown**:
@@ -437,6 +441,7 @@ Slack User
 - Start bot server
 
 **Configuration**:
+
 ```go
 type CLI struct {
     SlackBotToken   string
@@ -450,35 +455,41 @@ type CLI struct {
 ```
 
 #### Bot Core (bot.go)
+
 - Slack client initialization
 - Socket mode event handling
 - Event routing to handlers
 
 **Event Handlers**:
+
 - `app_mention`: Initial task requests
 - `message`: Thread continuations
 - `interactive`: Permission buttons
 - Connection lifecycle events
 
 #### Handler Layer (handlers.go)
+
 - Message parsing (parser.go)
 - Task execution coordination
 - Output streaming
 - File management
 
 **Key Methods**:
+
 - `HandleAppMention()`: New task requests
 - `HandleMessage()`: Thread replies
 - `HandleBlockAction()`: Button clicks
 - `runClod()`: Orchestrate task execution
 
 #### Runner (runner.go)
+
 - Task lifecycle management
 - PTY for bidirectional I/O
 - Stream-json parsing
 - Permission FIFO management
 
 **RunningTask Interface**:
+
 ```go
 type RunningTask interface {
     Output() <-chan OutputMessage
@@ -489,11 +500,13 @@ type RunningTask interface {
 ```
 
 #### Task Registry (tasks.go)
+
 - Discover agent directories
 - Validate .clod presence
 - Map task names to paths
 
 **Discovery Logic**:
+
 ```go
 // Scans AGENTS_PATH for:
 // - Directories with .clod/ subdirectory
@@ -502,11 +515,13 @@ type RunningTask interface {
 ```
 
 #### Session Store (session.go)
+
 - Thread-to-session mapping
 - JSON persistence
 - Atomic file writes
 
 **Session Mapping**:
+
 ```go
 type SessionMapping struct {
     ChannelID string
@@ -521,29 +536,34 @@ type SessionMapping struct {
 ```
 
 #### File Handler (files.go)
+
 - Download Slack attachments
 - Upload task outputs
 - Watch for new files
 
 **Capabilities**:
+
 - Download message attachments → task directory
 - Upload task outputs → Slack thread
 - Auto-detect new files in task directory
 - Format tool results as collapsible snippets
 
 #### Authorizer (auth.go)
+
 - User ID validation
 - Allowlist checking
 
 ### 3. Permission System
 
 **Components**:
+
 1. **MCP Server** (permission_mcp.py): Python script implementing MCP protocol
 2. **FIFO Pipes**: Named pipes for IPC
 3. **Pattern Matching** (permission.go): Rule evaluation
 4. **Persistence**: Save rules to claude.json
 
 **Permission Patterns**:
+
 ```
 ToolName                    # Allow all uses
 ToolName(pattern:*)         # Pattern-based matching
@@ -553,6 +573,7 @@ ToolName(pattern:*)         # Pattern-based matching
 ```
 
 **Saved Rules Location**:
+
 ```json
 {
   "allowedTools": [
@@ -642,6 +663,7 @@ Tool Execution (if approved)
 ### Environment Variables
 
 **Bot Configuration**:
+
 ```bash
 # Required
 SLACK_BOT_TOKEN=xoxb-...
@@ -662,6 +684,7 @@ LOG_FORMAT=console                # json|console
 **Location**: `.clod/claude/claude.json`
 
 **Structure**:
+
 ```json
 {
   "apiKey": "sk-ant-...",
@@ -682,9 +705,11 @@ LOG_FORMAT=console                # json|console
 ### MCP Configuration (mcp_config.json)
 
 **Location**: `.clod-runtime/mcp_config.json`
+
 **Generated by**: Runner at task start
 
 **Structure**:
+
 ```json
 {
   "mcpServers": {
@@ -709,6 +734,7 @@ LOG_FORMAT=console                # json|console
 **File**: `.clod/Dockerfile_project`
 
 Users can add custom packages:
+
 ```dockerfile
 # Example: Add Python and tools
 RUN apt-get update && apt-get install -y \
@@ -722,6 +748,7 @@ RUN pip3 install pandas numpy
 ### 2. Additional MCP Servers
 
 Add to `mcp_config.json` template in runner:
+
 ```json
 {
   "mcpServers": {
@@ -737,6 +764,7 @@ Add to `mcp_config.json` template in runner:
 ### 3. Custom Permission Patterns
 
 Implement new pattern types in `permission.go`:
+
 ```go
 // Add new pattern matching logic
 func MatchPattern(pattern, value string) bool {
@@ -747,6 +775,7 @@ func MatchPattern(pattern, value string) bool {
 ### 4. Output Formatters
 
 Add custom formatters in `handlers.go`:
+
 ```go
 // Handle new tool output types
 func formatToolOutput(tool string, output interface{}) string {
@@ -764,12 +793,14 @@ func formatToolOutput(tool string, output interface{}) string {
 ## Technology Stack
 
 ### CLI Component
+
 - **Language**: Bash 4.0+
 - **Runtime**: Docker
 - **Container Base**: Ubuntu/Debian (configurable)
 - **Claude Runtime**: Node.js (npm)
 
 ### Bot Component
+
 - **Language**: Go 1.23.2+
 - **Core Libraries**:
   - `slack-go/slack`: Slack API + Socket Mode
@@ -782,6 +813,7 @@ func formatToolOutput(tool string, output interface{}) string {
 - **Persistence**: JSON files
 
 ### Integration Layer
+
 - **Claude Code**: `@anthropic-ai/claude-code` (npm package)
 - **I/O Format**: stream-json (proprietary format)
 - **Permission Protocol**: MCP (Model Context Protocol)
@@ -794,6 +826,7 @@ func formatToolOutput(tool string, output interface{}) string {
 ### First-Time Setup
 
 **CLI**:
+
 ```bash
 cd /path/to/project
 clod                # Initializes .clod/
@@ -802,6 +835,7 @@ clod                # Builds image and runs
 ```
 
 **Bot**:
+
 ```bash
 export SLACK_BOT_TOKEN=xoxb-...
 export SLACK_APP_TOKEN=xapp-...
@@ -818,6 +852,7 @@ go run . server     # Start bot
 ### Daily Usage
 
 **CLI**:
+
 ```bash
 cd /path/to/project
 clod "Add user authentication"
@@ -826,6 +861,7 @@ clod --session-id abc123 "Continue with tests"
 ```
 
 **Bot** (in Slack):
+
 ```
 @bot my_task: Implement feature X
 # Upload files if needed
@@ -837,17 +873,20 @@ Now add tests for that
 ### Permission Management
 
 **Approve Pattern**:
+
 1. Bot posts permission request with buttons
 2. User clicks "Allow Similar"
 3. Pattern saved to `.clod/claude/claude.json`
 4. Future matching requests auto-approved
 
 **View Saved Patterns**:
+
 ```bash
 cat .clod/claude/claude.json | jq .allowedTools
 ```
 
 **Share Patterns**:
+
 ```bash
 # Commit claude.json to git (without API key)
 git add .clod/claude/claude.json
@@ -861,15 +900,18 @@ git commit -m "Add approved tool patterns"
 ### Bot Performance
 
 **Concurrent Operations**:
+
 - Multiple tasks can run simultaneously (separate goroutines)
 - Each task has dedicated PTY and output stream
 - Permission handling is per-task
 
 **Resource Limits**:
+
 - Docker container resources (CPU, memory)
 - Configurable via Docker run flags in `.clod/system/run`
 
 **Slack Rate Limits**:
+
 - Message updates batched (2-second intervals)
 - File uploads throttled
 - API calls respect Slack limits
@@ -888,6 +930,7 @@ git commit -m "Add approved tool patterns"
 ### Common Issues
 
 **CLI**:
+
 ```bash
 # Container won't start
 docker ps -a                    # Check container status
@@ -903,6 +946,7 @@ clod                            # Reinitialize
 ```
 
 **Bot**:
+
 ```bash
 # Bot not responding
 # Check logs for connection errors
@@ -922,6 +966,7 @@ cat sessions.json | jq          # Check mapping exists
 ### Debug Logging
 
 **Bot**:
+
 ```bash
 LOG_LEVEL=debug go run . server
 # or
@@ -929,6 +974,7 @@ LOG_LEVEL=trace LOG_FORMAT=json go run . server > bot.log
 ```
 
 **CLI**:
+
 ```bash
 # Add to .clod/system/run
 docker run ... --env DEBUG=1 ...
@@ -947,9 +993,12 @@ Clod provides a comprehensive solution for safe Claude Code execution through:
 5. **File Management**: Seamless file transfer between Slack and tasks
 6. **Extensibility**: Custom dependencies, MCP servers, and patterns
 
-The architecture balances **security** (isolation, permissions, authorization) with **usability** (sessions, continuations, file support), making it suitable for team environments where Claude needs controlled access to codebases.
+The architecture balances **security** (isolation, permissions, authorization)
+with **usability** (sessions, continuations, file support), making it suitable
+for team environments where Claude needs controlled access to codebases.
 
 Key design principles:
+
 - **Defense in depth**: Multiple security layers
 - **Principle of least privilege**: Minimal access by default
 - **User control**: Interactive approval for sensitive operations

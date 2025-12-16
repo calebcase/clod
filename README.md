@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] in a modestly more secure way.
 
-**Version 0.4.11**
+**Version 0.5.0**
 
 ## Features
 
@@ -16,23 +16,9 @@ on your main system they can do *a lot* of damage.
 
 Use `clod` and save a ~~kitten~~ home directory today.
 
-### What's New in v0.4
+## What's New
 
-- **Agent prompt support** - Automatically copies a prompt file (default: `README.md`) to the runtime directory and instructs Claude to read it as part of its system prompt. Configure with `AGENTS_PROMPT_PATH` environment variable.
-- **Improved tool summaries** - Bot now shows contextual summaries for `Write`, `Edit`, `TodoWrite`, and `EnterPlanMode` tools with file paths and task details.
-- **Better Bash command display** - Multi-line commands (like heredocs) now show only the first line in summaries.
-- **Duplicate file handling** - When downloading multiple Slack attachments with the same filename, auto-incrementing numbers are added (e.g., `image.png`, `image-1.png`, `image-2.png`).
-- **Docker environment fixes** - Added `HOME` and `USER` environment variables to container for better compatibility.
-
-### What's New in v0.2
-
-- **Three-layer Dockerfile architecture** - Separates base image, project dependencies, and wrapper
-- **Automatic version tracking** - Detects and upgrades when clod version changes
-- **Change detection** - SHA256 hashing triggers rebuild when `.clod/` files are modified
-- **Project dependencies preserved** - Your `Dockerfile_project` customizations survive upgrades
-- **SSH credential forwarding** - Forward SSH agent or specific keys into containers (v0.2.9)
-- **GPU support** - Auto-detect and forward NVIDIA GPUs for AI/ML workloads (v0.2.9)
-- **Slack bot integration** - Run agents remotely via Socket Mode bot (see [bot/](./bot/))
+See [CHANGELOG.md](CHANGELOG.md) for detailed release notes and version history.
 
 ## Install
 
@@ -118,9 +104,9 @@ New directories initialized with clod will use this config as the base.
 
 ## Architecture
 
-### Three-Layer Dockerfile Design
+### Four-Layer Dockerfile Design
 
-Clod v0.2 uses a layered approach to separate concerns and enable upgrades
+Clod uses a layered approach to separate concerns and enable upgrades
 without losing customizations:
 
 #### 1. Dockerfile_base (auto-generated)
@@ -159,13 +145,31 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
 RUN ln -s /usr/bin/python3 /usr/bin/python
 ```
 
-#### 3. Dockerfile_wrapper (auto-generated)
+#### 3. Dockerfile_user (user-editable)
+
+- **Your user-specific customizations**
+- Runs in user context (after USER switch)
+- Add user-local tools, dotfiles, or scripts
+- **Preserved across clod upgrades**
+
+Example customization:
+
+```dockerfile
+# .clod/Dockerfile_user
+FROM wrapper AS user
+
+# Install uv and uvx to user's ~/.local/bin
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="$PATH:$USER_HOME/.local/bin"
+```
+
+#### 4. Dockerfile_wrapper (auto-generated)
 
 - User/group mapping for file permissions
 - Claude Code installation via npm
-- Entrypoint configuration
+- Sets default entrypoint (can be overridden in Dockerfile_user)
 
-The final `Dockerfile` is created by concatenating these during build.
+The final `Dockerfile` is created by concatenating these four layers during build.
 
 ### Directory Structure
 
@@ -182,6 +186,7 @@ After initialization, the `.clod/` directory contains:
 │   ├── version               # Clod version (0.3.0)
 │   └── hash                  # SHA256 hash for change detection
 ├── Dockerfile_project        # Your customizations (edit this!)
+├── Dockerfile_user           # Your user customizations (edit this!)
 ├── id                        # Unique 8-char container ID
 ├── name                      # Directory name
 ├── image                     # Base image (ubuntu:24.04 or golang:latest)
