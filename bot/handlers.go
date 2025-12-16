@@ -1369,8 +1369,12 @@ func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, cont
 	case "Bash":
 		command := getString("command")
 		if command != "" {
-			// Truncate long commands.
+			// For multi-line commands (e.g., heredocs), show only the first line.
 			shortCmd := command
+			if idx := strings.Index(shortCmd, "\n"); idx != -1 {
+				shortCmd = shortCmd[:idx] + "..."
+			}
+			// Truncate long commands.
 			if len(shortCmd) > 60 {
 				shortCmd = shortCmd[:57] + "..."
 			}
@@ -1403,6 +1407,54 @@ func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, cont
 			summary = fmt.Sprintf(":inbox_tray: `%s` (%s)", toolName, formatBytes(contentLen))
 			snippetTitle = "WebFetch output"
 		}
+	case "Write":
+		filePath := getString("file_path")
+		if filePath != "" {
+			// Shorten path for display.
+			shortPath := filePath
+			if len(shortPath) > 50 {
+				shortPath = "..." + shortPath[len(shortPath)-47:]
+			}
+			summary = fmt.Sprintf(":pencil2: `%s` `%s` (%s)", toolName, shortPath, formatBytes(contentLen))
+			snippetTitle = filepath.Base(filePath)
+		} else {
+			summary = fmt.Sprintf(":pencil2: `%s` (%s)", toolName, formatBytes(contentLen))
+			snippetTitle = "Write output"
+		}
+	case "Edit":
+		filePath := getString("file_path")
+		if filePath != "" {
+			// Shorten path for display.
+			shortPath := filePath
+			if len(shortPath) > 50 {
+				shortPath = "..." + shortPath[len(shortPath)-47:]
+			}
+			summary = fmt.Sprintf(":pencil: `%s` `%s` (%s)", toolName, shortPath, formatBytes(contentLen))
+			snippetTitle = filepath.Base(filePath)
+		} else {
+			summary = fmt.Sprintf(":pencil: `%s` (%s)", toolName, formatBytes(contentLen))
+			snippetTitle = "Edit output"
+		}
+	case "TodoWrite":
+		// Extract first todo item for context.
+		var firstTask string
+		if todos, ok := input["todos"].([]any); ok && len(todos) > 0 {
+			if todo, ok := todos[0].(map[string]any); ok {
+				if content, ok := todo["content"].(string); ok {
+					firstTask = content
+					if len(firstTask) > 40 {
+						firstTask = firstTask[:37] + "..."
+					}
+				}
+			}
+			summary = fmt.Sprintf(":clipboard: `%s` `%s` (%d items)", toolName, firstTask, len(todos))
+		} else {
+			summary = fmt.Sprintf(":clipboard: `%s`", toolName)
+		}
+		snippetTitle = "TodoWrite output"
+	case "EnterPlanMode":
+		summary = fmt.Sprintf(":memo: `%s`", toolName)
+		snippetTitle = "EnterPlanMode output"
 	default:
 		summary = fmt.Sprintf(":gear: `%s` (%s)", toolName, formatBytes(contentLen))
 		snippetTitle = fmt.Sprintf("%s output", toolName)

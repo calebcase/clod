@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] in a modestly more secure way.
 
-**Version 0.3.0**
+**Version 0.4.11**
 
 ## Features
 
@@ -15,6 +15,14 @@ These bots are imperfect. They do unexpected things. If they are running as you
 on your main system they can do *a lot* of damage.
 
 Use `clod` and save a ~~kitten~~ home directory today.
+
+### What's New in v0.4
+
+- **Agent prompt support** - Automatically copies a prompt file (default: `README.md`) to the runtime directory and instructs Claude to read it as part of its system prompt. Configure with `AGENTS_PROMPT_PATH` environment variable.
+- **Improved tool summaries** - Bot now shows contextual summaries for `Write`, `Edit`, `TodoWrite`, and `EnterPlanMode` tools with file paths and task details.
+- **Better Bash command display** - Multi-line commands (like heredocs) now show only the first line in summaries.
+- **Duplicate file handling** - When downloading multiple Slack attachments with the same filename, auto-incrementing numbers are added (e.g., `image.png`, `image-1.png`, `image-2.png`).
+- **Docker environment fixes** - Added `HOME` and `USER` environment variables to container for better compatibility.
 
 ### What's New in v0.2
 
@@ -651,6 +659,10 @@ contains no credentials or hard-coded paths.
 - `CLOD_SSH` - SSH credential forwarding: `true`, `false`, or path to key file (overrides `.clod/ssh` file)
 - `CLOD_GPUS` - GPU support: `all`, specific GPU IDs, or empty to disable (overrides `.clod/gpus` file)
 - `MCP_TOOL_TIMEOUT` - Permission prompt timeout (optional)
+
+### Bot Configuration
+
+- `AGENTS_PROMPT_PATH` - Path to agent prompt file relative to task directory (default: `README.md`). The file is copied to the runtime directory and Claude is instructed to read it. Set to empty string to disable.
 
 ### Example: Force Reinit
 

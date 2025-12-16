@@ -62,7 +62,8 @@ type PermissionFIFO struct {
 // Docker container where .clod/runtime is mounted read-write.
 // If runtimeSuffix is provided, it will be used to create a unique runtime directory.
 // If empty, generates a random suffix for concurrent instances.
-func NewPermissionFIFO(taskPath string, runtimeSuffix string, logger zerolog.Logger) (*PermissionFIFO, error) {
+// If agentsPromptPath is provided and not empty, the file will be copied to AGENT.md in the runtime directory.
+func NewPermissionFIFO(taskPath string, runtimeSuffix string, agentsPromptPath string, logger zerolog.Logger) (*PermissionFIFO, error) {
 	// Generate random suffix if not provided (for concurrent mode)
 	if runtimeSuffix == "" {
 		// Generate 6 random hex characters
@@ -79,6 +80,32 @@ func NewPermissionFIFO(taskPath string, runtimeSuffix string, logger zerolog.Log
 	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
 		return nil, oops.Trace(err)
 	}
+
+	// Copy the agent prompt file to the runtime directory if configured.
+	if agentsPromptPath != "" {
+		var srcPath string
+		if filepath.IsAbs(agentsPromptPath) {
+			srcPath = agentsPromptPath
+		} else {
+			srcPath = filepath.Join(taskPath, agentsPromptPath)
+		}
+
+		promptContent, err := os.ReadFile(srcPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				logger.Warn().Str("path", srcPath).Msg("agent prompt file not found, skipping")
+			} else {
+				return nil, oops.Trace(err)
+			}
+		} else if len(promptContent) > 0 {
+			agentMDPath := filepath.Join(runtimeDir, "AGENT.md")
+			if err := os.WriteFile(agentMDPath, promptContent, 0644); err != nil {
+				return nil, oops.Trace(err)
+			}
+			logger.Debug().Str("src", srcPath).Str("dst", agentMDPath).Msg("copied agent prompt file")
+		}
+	}
+
 	requestPath := filepath.Join(runtimeDir, FIFORequestName)
 	responsePath := filepath.Join(runtimeDir, FIFOResponseName)
 
@@ -264,6 +291,15 @@ func (p *PermissionFIFO) ResponsePath() string {
 // RuntimeSuffix returns the runtime directory suffix for this FIFO.
 func (p *PermissionFIFO) RuntimeSuffix() string {
 	return p.runtimeSuffix
+}
+
+// AgentPromptPath returns the path to AGENT.md if it exists, empty string otherwise.
+func (p *PermissionFIFO) AgentPromptPath() string {
+	agentPath := filepath.Join(filepath.Dir(p.requestPath), "AGENT.md")
+	if _, err := os.Stat(agentPath); err == nil {
+		return agentPath
+	}
+	return ""
 }
 
 // MCPScriptPath returns the path to the MCP server script.

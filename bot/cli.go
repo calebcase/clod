@@ -25,11 +25,13 @@ type Flags struct {
 
 	AgentsPath string `kong:"default='.',env='AGENTS_PATH',help='Base path to search for agent directories'"`
 
+	AgentsPromptPath string `kong:"default='README.md',env='AGENTS_PROMPT_PATH',help='Path to agent prompt file (relative to task dir or absolute). Empty disables.'"`
+
 	ClodTimeout time.Duration `kong:"default='30m',env='CLOD_TIMEOUT',help='Timeout for clod execution'"`
 
 	PermissionMode string `kong:"default='default',env='PERMISSION_MODE',help='Claude permission mode (default, acceptEdits, bypassPermissions)'"`
 
-	VerboseTools []string `kong:"default='Read,Glob,Grep,WebFetch,WebSearch',env='VERBOSE_TOOLS',sep=',',help='Tools affected by verbosity toggle'"`
+	VerboseTools []string `kong:"default='Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode',env='VERBOSE_TOOLS',sep=',',help='Tools affected by verbosity toggle'"`
 
 	GracefulShutdownTTL time.Duration `kong:"default='30s',env='GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
 }
@@ -65,7 +67,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		Str("path", cli.SessionStorePath).
 		Msg("loaded sessions from storage")
 
-	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, logger)
+	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, cli.AgentsPromptPath, logger)
 
 	// Create and start the bot
 	bot, err := NewBot(

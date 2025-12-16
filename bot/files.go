@@ -85,6 +85,8 @@ func (f *FileHandler) DownloadToMemory(file slack.File) (*DownloadedFile, error)
 
 // DownloadToTask downloads a Slack file to the task directory.
 // Returns the local file path where the file was saved.
+// If a file with the same name already exists, an auto-incrementing number is added
+// (e.g., image.png, image-1.png, image-2.png).
 func (f *FileHandler) DownloadToTask(file slack.File, taskPath string) (localPath string, err error) {
 	// Determine the filename (use Slack's filename, sanitize if needed).
 	filename := file.Name
@@ -92,6 +94,20 @@ func (f *FileHandler) DownloadToTask(file slack.File, taskPath string) (localPat
 		filename = file.ID
 	}
 	localPath = filepath.Join(taskPath, filename)
+
+	// If file already exists, add auto-incrementing number before extension.
+	if _, err := os.Stat(localPath); err == nil {
+		ext := filepath.Ext(filename)
+		base := filename[:len(filename)-len(ext)]
+		for i := 1; ; i++ {
+			newFilename := fmt.Sprintf("%s-%d%s", base, i, ext)
+			localPath = filepath.Join(taskPath, newFilename)
+			if _, err := os.Stat(localPath); os.IsNotExist(err) {
+				filename = newFilename
+				break
+			}
+		}
+	}
 
 	f.logger.Info().
 		Str("file_id", file.ID).

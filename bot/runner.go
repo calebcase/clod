@@ -20,17 +20,24 @@ import (
 
 // Runner executes clod processes.
 type Runner struct {
-	timeout        time.Duration
-	permissionMode string
-	logger         zerolog.Logger
+	timeout          time.Duration
+	permissionMode   string
+	agentsPromptPath string
+	logger           zerolog.Logger
 }
 
 // NewRunner creates a new Runner.
-func NewRunner(timeout time.Duration, permissionMode string, logger zerolog.Logger) *Runner {
+func NewRunner(
+	timeout time.Duration,
+	permissionMode string,
+	agentsPromptPath string,
+	logger zerolog.Logger,
+) *Runner {
 	return &Runner{
-		timeout:        timeout,
-		permissionMode: permissionMode,
-		logger:         logger.With().Str("component", "runner").Logger(),
+		timeout:          timeout,
+		permissionMode:   permissionMode,
+		agentsPromptPath: agentsPromptPath,
+		logger:           logger.With().Str("component", "runner").Logger(),
 	}
 }
 
@@ -73,9 +80,9 @@ type StreamContentBlock struct {
 	Name  string         `json:"name,omitempty"` // Tool name (Bash, Read, etc.).
 	Input map[string]any `json:"input,omitempty"`
 	// For tool_result blocks.
-	ToolUseID  string          `json:"tool_use_id,omitempty"`
-	Content    json.RawMessage `json:"content,omitempty"` // Can be string or []ContentBlock.
-	IsError    bool            `json:"is_error,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"` // Can be string or []ContentBlock.
+	IsError   bool            `json:"is_error,omitempty"`
 }
 
 // ToolResultContentBlock represents a content block inside a tool_result.
@@ -311,7 +318,7 @@ func (r *Runner) Start(
 
 	// Create permission FIFO for MCP communication (must be done before building args).
 	// Pass empty string to generate a unique runtime suffix for concurrent instances.
-	permFIFO, err := NewPermissionFIFO(taskPath, "", r.logger)
+	permFIFO, err := NewPermissionFIFO(taskPath, "", r.agentsPromptPath, r.logger)
 	if err != nil {
 		cancel()
 		return nil, oops.Trace(err)
@@ -341,6 +348,19 @@ func (r *Runner) Start(
 		mcpConfigPath,
 		"--permission-prompt-tool",
 		permToolName,
+	}
+
+	// Add the agent system prompt flag if AGENT.md was copied to the runtime directory.
+	if agentPromptPath := permFIFO.AgentPromptPath(); agentPromptPath != "" {
+		runtimeDirName := filepath.Join(".clod", "runtime-"+permFIFO.RuntimeSuffix())
+		args = append(
+			args,
+			"--append-system-prompt",
+			fmt.Sprintf(
+				"You are an agent as described in %s/AGENT.md; Read that document as soon as possible and treat it as part of your system prompt.",
+				runtimeDirName,
+			),
+		)
 	}
 
 	// Pass any saved allowed tools so they're respected immediately.
@@ -572,8 +592,13 @@ func (r *Runner) Start(
 				}
 				// Send stats as JSON for special formatting by handler.
 				// Use __STATS__ prefix so handler can detect and format with blocks.
-				statsJSON := fmt.Sprintf("__STATS__{\"is_error\":%t,\"duration_ms\":%d,\"num_turns\":%d,\"cost_usd\":%.6f}",
-					msg.IsError, msg.DurationMS, msg.NumTurns, msg.TotalCostUSD)
+				statsJSON := fmt.Sprintf(
+					"__STATS__{\"is_error\":%t,\"duration_ms\":%d,\"num_turns\":%d,\"cost_usd\":%.6f}",
+					msg.IsError,
+					msg.DurationMS,
+					msg.NumTurns,
+					msg.TotalCostUSD,
+				)
 				select {
 				case task.output <- statsJSON:
 				default:
