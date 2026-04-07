@@ -38,13 +38,21 @@ type Handler struct {
 
 	// Tools affected by verbosity toggle (controlled by VERBOSE_TOOLS env var)
 	verboseTools map[string]bool
+
+	// lastVerboseToolMsg tracks the most recent verbose tool summary message per thread
+	// so consecutive summaries can be edited in-place rather than posted as new messages.
+	lastVerboseToolMsg sync.Map // key -> string (messageTS)
+
+	defaultVerbosityLevel int
 }
 
-// Emoji used to toggle verbosity in a thread
-const verbosityEmoji = "speech_balloon"
+const (
+	verbosityEmoji = "speech_balloon" // 💬 level 1 (full)
+	seeNoEvilEmoji = "see_no_evil"    // 🙈 level -1 (silent)
+)
 
 // NewHandler creates a new Handler.
-func NewHandler(bot *Bot, verboseTools []string) *Handler {
+func NewHandler(bot *Bot, verboseTools []string, defaultVerbosityLevel int) *Handler {
 	// Build map for O(1) lookup
 	verboseToolsMap := make(map[string]bool, len(verboseTools))
 	for _, tool := range verboseTools {
@@ -52,9 +60,10 @@ func NewHandler(bot *Bot, verboseTools []string) *Handler {
 	}
 
 	return &Handler{
-		bot:          bot,
-		logger:       bot.logger.With().Str("component", "handler").Logger(),
-		verboseTools: verboseToolsMap,
+		bot:                   bot,
+		logger:                bot.logger.With().Str("component", "handler").Logger(),
+		verboseTools:          verboseToolsMap,
+		defaultVerbosityLevel: defaultVerbosityLevel,
 	}
 }
 
@@ -189,15 +198,8 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 	// No running task, so check if there's a saved session to resume.
 	session := h.bot.sessions.Get(ev.Channel, threadTS)
 	if session == nil {
-		// No session for this thread. Let the user know.
-		logger.Debug().Msg("no running task or saved session for thread")
-		if _, err := h.bot.PostMessage(
-			ev.Channel,
-			":question: I don't have a saved session for this thread. Use `@bot task_name: your instructions` to start a new task.",
-			threadTS,
-		); err != nil {
-			logger.Error().Err(err).Msg("failed to post no session message")
-		}
+		// No session for this thread - stay silent (don't interrupt unrelated conversations)
+		logger.Debug().Msg("no running task or saved session for thread, ignoring")
 		return
 	}
 
@@ -287,8 +289,16 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 
 // HandleReactionAdded processes reaction_added events.
 func (h *Handler) HandleReactionAdded(ctx context.Context, ev *slackevents.ReactionAddedEvent) {
-	// Only handle the verbosity toggle emoji
-	if ev.Reaction != verbosityEmoji {
+	var level int
+	var message string
+	switch ev.Reaction {
+	case verbosityEmoji:
+		level = 1
+		message = ":speech_balloon: Verbose mode enabled - tool outputs will include full content."
+	case seeNoEvilEmoji:
+		level = -1
+		message = ":see_no_evil: Silent mode enabled - verbose tool outputs will be hidden."
+	default:
 		return
 	}
 
@@ -297,9 +307,10 @@ func (h *Handler) HandleReactionAdded(ctx context.Context, ev *slackevents.React
 		Str("item_ts", ev.Item.Timestamp).
 		Str("user", ev.User).
 		Str("reaction", ev.Reaction).
+		Int("level", level).
 		Logger()
 
-	// Determine thread TS - the reacted item could be the thread root or a reply
+	// Determine thread TS - the reacted item could be the thread root or a reply.
 	threadTS, err := h.getThreadTS(ev.Item.Channel, ev.Item.Timestamp)
 	if err != nil {
 		logger.Debug().Err(err).Msg("failed to get thread TS for reaction")
@@ -307,30 +318,39 @@ func (h *Handler) HandleReactionAdded(ctx context.Context, ev *slackevents.React
 	}
 
 	logger = logger.With().Str("thread_ts", threadTS).Logger()
-	logger.Info().Msg("enabling verbose mode for thread")
 
-	// Enable verbose mode for this thread
-	h.bot.sessions.SetVerbose(ev.Item.Channel, threadTS, true)
+	// A non-empty SessionID means the bot was explicitly invoked in this thread.
+	session := h.bot.sessions.Get(ev.Item.Channel, threadTS)
+	hasActiveTask := session != nil && session.SessionID != ""
 
-	// Save to persist the change
+	if hasActiveTask {
+		logger.Info().Msg("setting verbosity level for active thread")
+	} else {
+		logger.Debug().Msg("setting verbosity level for inactive thread (no confirmation will be posted)")
+	}
+
+	h.bot.sessions.SetVerbosityLevel(ev.Item.Channel, threadTS, level)
+
 	if err := h.bot.sessions.Save(); err != nil {
 		logger.Error().Err(err).Msg("failed to save session after verbosity change")
 	}
 
-	// Post confirmation message to the thread
-	if _, err := h.bot.PostMessage(
-		ev.Item.Channel,
-		":speech_balloon: Verbose mode enabled - tool outputs will include full content.",
-		threadTS,
-	); err != nil {
-		logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
+	// Don't post a confirmation in threads that haven't explicitly invoked the bot.
+	if hasActiveTask {
+		if _, err := h.bot.PostMessage(
+			ev.Item.Channel,
+			message,
+			threadTS,
+		); err != nil {
+			logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
+		}
 	}
 }
 
 // HandleReactionRemoved processes reaction_removed events.
 func (h *Handler) HandleReactionRemoved(ctx context.Context, ev *slackevents.ReactionRemovedEvent) {
-	// Only handle the verbosity toggle emoji
-	if ev.Reaction != verbosityEmoji {
+	// Only handle verbosity-related emojis.
+	if ev.Reaction != verbosityEmoji && ev.Reaction != seeNoEvilEmoji {
 		return
 	}
 
@@ -341,7 +361,7 @@ func (h *Handler) HandleReactionRemoved(ctx context.Context, ev *slackevents.Rea
 		Str("reaction", ev.Reaction).
 		Logger()
 
-	// Determine thread TS
+	// Determine thread TS.
 	threadTS, err := h.getThreadTS(ev.Item.Channel, ev.Item.Timestamp)
 	if err != nil {
 		logger.Debug().Err(err).Msg("failed to get thread TS for reaction")
@@ -349,23 +369,45 @@ func (h *Handler) HandleReactionRemoved(ctx context.Context, ev *slackevents.Rea
 	}
 
 	logger = logger.With().Str("thread_ts", threadTS).Logger()
-	logger.Info().Msg("disabling verbose mode for thread")
 
-	// Disable verbose mode for this thread
-	h.bot.sessions.SetVerbose(ev.Item.Channel, threadTS, false)
+	// Check if this thread has an active task session before posting messages.
+	// A session with a SessionID means the bot was explicitly invoked.
+	session := h.bot.sessions.Get(ev.Item.Channel, threadTS)
+	hasActiveTask := session != nil && session.SessionID != ""
 
-	// Save to persist the change
+	level := h.getThreadVerbosityFromReactions(ev.Item.Channel, threadTS, logger)
+
+	if hasActiveTask {
+		logger.Info().Int("level", level).Msg("updating verbosity level for active thread after reaction removal")
+	} else {
+		logger.Debug().Int("level", level).Msg("updating verbosity level for inactive thread (no confirmation will be posted)")
+	}
+
+	h.bot.sessions.SetVerbosityLevel(ev.Item.Channel, threadTS, level)
+
 	if err := h.bot.sessions.Save(); err != nil {
 		logger.Error().Err(err).Msg("failed to save session after verbosity change")
 	}
 
-	// Post confirmation message to the thread
-	if _, err := h.bot.PostMessage(
-		ev.Item.Channel,
-		":mute: Verbose mode disabled - tool outputs will show summaries only.",
-		threadTS,
-	); err != nil {
-		logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
+	// Don't post a confirmation in threads that haven't explicitly invoked the bot.
+	if hasActiveTask {
+		var message string
+		switch level {
+		case -1:
+			message = ":see_no_evil: Silent mode - verbose tool outputs hidden."
+		case 0:
+			message = ":mute: Summary mode - tool outputs show summaries only."
+		case 1:
+			message = ":speech_balloon: Verbose mode - tool outputs include full content."
+		}
+
+		if _, err := h.bot.PostMessage(
+			ev.Item.Channel,
+			message,
+			threadTS,
+		); err != nil {
+			logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
+		}
 	}
 }
 
@@ -402,6 +444,44 @@ func (h *Handler) getThreadTS(channelID, messageTS string) (string, error) {
 	return messageTS, nil
 }
 
+// getThreadVerbosityFromReactions returns the least verbose verbosity level
+// found across all reactions in the thread, or the store default if none are found.
+func (h *Handler) getThreadVerbosityFromReactions(channelID, threadTS string, logger zerolog.Logger) int {
+	params := &slack.GetConversationRepliesParameters{
+		ChannelID: channelID,
+		Timestamp: threadTS,
+		Limit:     1000,
+	}
+
+	msgs, _, _, err := h.bot.client.GetConversationReplies(params)
+	if err != nil {
+		logger.Debug().Err(err).Msg("failed to get thread replies for reaction check")
+		return h.defaultVerbosityLevel
+	}
+
+	leastVerbose := h.defaultVerbosityLevel
+	hasVerbosityReaction := false
+
+	for _, msg := range msgs {
+		for _, reaction := range msg.Reactions {
+			switch reaction.Name {
+			case seeNoEvilEmoji:
+				return -1
+			case verbosityEmoji:
+				hasVerbosityReaction = true
+				if leastVerbose < 1 {
+					leastVerbose = 1
+				}
+			}
+		}
+	}
+
+	if hasVerbosityReaction {
+		return leastVerbose
+	}
+	return h.defaultVerbosityLevel
+}
+
 // handleNewTask processes a new task request.
 func (h *Handler) handleNewTask(
 	ctx context.Context,
@@ -409,16 +489,9 @@ func (h *Handler) handleNewTask(
 	threadTS string,
 	logger zerolog.Logger,
 ) {
-	// Parse the mention
 	parsed := ParseMention(ev.Text)
 	if parsed == nil {
-		msg := fmt.Sprintf(
-			"I didn't understand that. Please use the format: `@bot task_name: your instructions`\n\n%s",
-			h.bot.tasks.ListFormatted(),
-		)
-		if _, err := h.bot.PostMessage(ev.Channel, msg, threadTS); err != nil {
-			logger.Error().Err(err).Msg("failed to post parse error message")
-		}
+		logger.Debug().Msg("no valid command format in message, ignoring")
 		return
 	}
 
@@ -485,8 +558,14 @@ func (h *Handler) handleNewTask(
 		}
 	}
 
-	// Build the prompt, appending file paths if any were downloaded.
-	prompt := parsed.Instructions
+	// Gather prior thread messages as context for new sessions.
+	threadContext := h.gatherThreadContext(ev.Channel, threadTS, ev.TimeStamp, logger)
+
+	prompt := ""
+	if threadContext != "" {
+		prompt = threadContext
+	}
+	prompt += parsed.Instructions
 	if len(downloadedFiles) > 0 {
 		prompt += "\n\nAttached files have been saved to:\n"
 		for _, path := range downloadedFiles {
@@ -614,6 +693,9 @@ func (h *Handler) runClod(
 				msg = ConvertMarkdownToMrkdwn(msg)
 				if _, err := h.bot.PostMessage(channelID, msg, threadTS); err != nil {
 					logger.Debug().Err(err).Msg("failed to post output message")
+				} else {
+					// Clear last verbose tool message since we posted non-verbose content.
+					h.lastVerboseToolMsg.Delete(key(channelID, threadTS))
 				}
 			}
 			outputBuffer.Reset()
@@ -1307,22 +1389,18 @@ func formatBytes(bytes int) string {
 	}
 }
 
-// postToolSnippet posts a tool result as a summary line, optionally with attached collapsible snippet.
-// In quiet mode (default), verbose tools only show the summary line.
-// In verbose mode, the full content is uploaded as a collapsible Slack file snippet.
+// postToolSnippet posts a tool result summary, optionally uploading the full
+// content as a collapsible snippet based on verbosity level and tool type.
 func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, content string, logger zerolog.Logger) {
 	contentLen := len(content)
 	lineCount := strings.Count(content, "\n") + 1
 
-	// Check verbosity settings
 	isVerboseTool := h.verboseTools[toolName]
-	isVerboseMode := h.bot.sessions.IsVerbose(channelID, threadTS)
+	verbosityLevel := h.bot.sessions.GetVerbosityLevel(channelID, threadTS)
 
-	// Parse input JSON to extract tool-specific parameters.
 	var input map[string]any
 	_ = json.Unmarshal([]byte(inputJSON), &input) // Best-effort parse, ignore errors
 
-	// Helper to get string from input.
 	getString := func(key string) string {
 		if v, ok := input[key].(string); ok {
 			return v
@@ -1330,7 +1408,6 @@ func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, cont
 		return ""
 	}
 
-	// Build summary line with tool-specific context.
 	var summary string
 	var snippetTitle string
 	switch toolName {
@@ -1460,20 +1537,126 @@ func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, cont
 		snippetTitle = fmt.Sprintf("%s output", toolName)
 	}
 
-	// Decide output behavior based on tool type and verbosity mode.
-	// Verbose tools in quiet mode: summary only (no file upload).
-	// Verbose tools in verbose mode OR non-verbose tools: upload as collapsible snippet.
-	if isVerboseTool && !isVerboseMode {
-		// Quiet mode for verbose-controlled tools: summary only
-		if _, err := h.bot.PostMessage(channelID, summary, threadTS); err != nil {
-			logger.Error().Err(err).Str("tool", toolName).Msg("failed to post tool summary")
+	// Verbose tools respect verbosity settings:
+	//   -1 (silent): No output at all
+	//    0 (summary): Summary only, no file upload
+	//    1 (full): Upload as collapsible snippet
+	// Non-verbose tools always upload snippets regardless of verbosity level.
+	if isVerboseTool {
+		switch verbosityLevel {
+		case -1:
+			logger.Debug().Str("tool", toolName).Msg("skipping tool output (silent mode)")
+			return
+
+		case 0:
+			// If the previous message in this thread was also a verbose tool summary,
+			// edit it in-place instead of posting a new one to reduce notification noise.
+			threadKey := key(channelID, threadTS)
+
+			if lastMsgTS, ok := h.lastVerboseToolMsg.Load(threadKey); ok {
+				if err := h.bot.UpdateMessage(channelID, lastMsgTS.(string), summary); err != nil {
+					logger.Error().Err(err).Str("tool", toolName).Msg("failed to update tool summary, posting new message")
+					// Fallback to posting a new message.
+					if msgTS, err := h.bot.PostMessage(channelID, summary, threadTS); err != nil {
+						logger.Error().Err(err).Str("tool", toolName).Msg("failed to post tool summary")
+					} else {
+						h.lastVerboseToolMsg.Store(threadKey, msgTS)
+					}
+				}
+			} else {
+				if msgTS, err := h.bot.PostMessage(channelID, summary, threadTS); err != nil {
+					logger.Error().Err(err).Str("tool", toolName).Msg("failed to post tool summary")
+				} else {
+					h.lastVerboseToolMsg.Store(threadKey, msgTS)
+				}
+			}
+			return
+
+		case 1:
+			// Full verbose mode: fall through to upload snippet.
 		}
-		return
 	}
 
 	// Upload content as collapsible snippet with summary as the comment.
 	// This keeps the summary and expandable content together in one message.
 	if _, err := h.bot.files.UploadSnippet(content, snippetTitle, summary, channelID, threadTS); err != nil {
 		logger.Error().Err(err).Str("tool", toolName).Msg("failed to upload tool snippet")
+	} else {
+		// Clear last verbose tool message since we posted a snippet (non-verbose content).
+		h.lastVerboseToolMsg.Delete(key(channelID, threadTS))
 	}
+}
+
+// gatherThreadContext collects prior messages in a thread as context, returning
+// an empty string if the thread was started by a bot mention or has no prior messages.
+func (h *Handler) gatherThreadContext(channelID, threadTS, currentMessageTS string, logger zerolog.Logger) string {
+	// If this is the thread root (threadTS == currentMessageTS), no prior context exists.
+	if threadTS == currentMessageTS {
+		return ""
+	}
+
+	params := &slack.GetConversationRepliesParameters{
+		ChannelID: channelID,
+		Timestamp: threadTS,
+		Limit:     1000,
+	}
+
+	msgs, _, _, err := h.bot.client.GetConversationReplies(params)
+	if err != nil {
+		logger.Warn().Err(err).Msg("failed to get thread replies for context")
+		return ""
+	}
+
+	if len(msgs) == 0 {
+		return ""
+	}
+
+	// Check if the thread root (first message) is a bot mention.
+	rootMsg := msgs[0]
+	if mentionPattern.MatchString(rootMsg.Text) {
+		logger.Debug().Msg("thread was started by bot mention, skipping context gather")
+		return ""
+	}
+
+	var contextMessages []string
+	for _, msg := range msgs {
+		// Stop when we reach the current message (the @bot mention).
+		if msg.Timestamp == currentMessageTS {
+			break
+		}
+
+		var userName string
+		if msg.User != "" {
+			// Try to get user info for a friendly name.
+			user, err := h.bot.client.GetUserInfo(msg.User)
+			if err == nil && user != nil {
+				userName = user.RealName
+				if userName == "" {
+					userName = user.Name
+				}
+			} else {
+				userName = msg.User
+			}
+		} else if msg.BotID != "" {
+			userName = "Bot"
+		} else {
+			userName = "Unknown"
+		}
+
+		contextMessages = append(contextMessages, fmt.Sprintf("%s: %s", userName, msg.Text))
+	}
+
+	if len(contextMessages) == 0 {
+		return ""
+	}
+
+	context := "Previous conversation in this thread:\n\n"
+	context += strings.Join(contextMessages, "\n") + "\n\n"
+	context += "---\n\nThe user is now asking you to help with the following:\n\n"
+
+	logger.Info().
+		Int("message_count", len(contextMessages)).
+		Msg("gathered thread context from existing conversation")
+
+	return context
 }

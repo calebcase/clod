@@ -31,7 +31,11 @@ type Flags struct {
 
 	PermissionMode string `kong:"default='default',env='CLOD_BOT_PERMISSION_MODE',help='Claude permission mode (default, acceptEdits, bypassPermissions)'"`
 
+	ClodConcurrent bool `kong:"default='false',env='CLOD_CONCURRENT',help='Run clod in concurrent mode (creates unique runtime dirs per execution)'"`
+
 	VerboseTools []string `kong:"default='Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode',env='CLOD_BOT_VERBOSE_TOOLS',sep=',',help='Tools affected by verbosity toggle'"`
+
+	VerbosityLevel int `kong:"default='0',env='CLOD_BOT_VERBOSITY_LEVEL',help='Default verbosity level: -1 (silent), 0 (summary), 1 (full)'"`
 
 	GracefulShutdownTTL time.Duration `kong:"default='30s',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
 }
@@ -58,7 +62,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	taskNames := tasks.List()
 	logger.Info().Strs("tasks", taskNames).Msg("discovered tasks")
 
-	sessions, err := NewSessionStore(cli.SessionStorePath)
+	sessions, err := NewSessionStore(cli.SessionStorePath, cli.VerbosityLevel)
 	if err != nil {
 		return err
 	}
@@ -67,7 +71,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		Str("path", cli.SessionStorePath).
 		Msg("loaded sessions from storage")
 
-	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, cli.AgentsPromptPath, logger)
+	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, cli.AgentsPromptPath, cli.ClodConcurrent, logger)
 
 	// Create and start the bot
 	bot, err := NewBot(
@@ -78,6 +82,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		sessions,
 		runner,
 		cli.VerboseTools,
+		cli.VerbosityLevel,
 		logger,
 	)
 	if err != nil {

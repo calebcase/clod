@@ -508,7 +508,7 @@ type RunningTask interface {
 **Discovery Logic**:
 
 ```go
-// Scans CLOD_BOT_AGENTS_PATH for:
+// Scans AGENTS_PATH for:
 // - Directories with .clod/ subdirectory
 // - Containing executable .clod/system/run script
 // Maps: lowercase(dirname) → absolute path
@@ -530,8 +530,9 @@ type SessionMapping struct {
     TaskPath  string
     SessionID string
     UserID    string
-    CreatedAt time.Time
-    UpdatedAt time.Time
+    VerbosityLevel int       // Per-thread verbosity: -1 (silent), 0 (summary), 1 (full)
+    CreatedAt      time.Time
+    UpdatedAt      time.Time
 }
 ```
 
@@ -670,13 +671,18 @@ SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 CLOD_BOT_ALLOWED_USERS=U123,U456,U789
 
-# Optional
-CLOD_BOT_AGENTS_PATH=/path/to/agents       # Default: ./agents
+# Optional - Bot Configuration (CLOD_BOT_* prefix)
+CLOD_BOT_AGENTS_PATH=/path/to/agents       # Default: .
 CLOD_BOT_SESSION_STORE_PATH=./sessions.json
 CLOD_BOT_PERMISSION_MODE=default           # default|acceptEdits|bypassPermissions
 CLOD_BOT_TIMEOUT=30m                       # Default: 30 minutes
 CLOD_BOT_LOG_LEVEL=info                    # trace|debug|info|warn|error
 CLOD_BOT_LOG_FORMAT=console                # json|console
+CLOD_BOT_VERBOSE_TOOLS=Read,Glob,...       # Tools affected by verbosity
+CLOD_BOT_GRACEFUL_SHUTDOWN_TTL=30s         # Graceful shutdown timeout
+
+# Optional - CLI Configuration (CLOD_* prefix)
+CLOD_CONCURRENT=false                      # Enable concurrent clod instances (default: false)
 ```
 
 ### Claude Configuration (claude.json)

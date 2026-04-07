@@ -37,6 +37,7 @@ func NewBot(
 	sessions *SessionStore,
 	runner *Runner,
 	verboseTools []string,
+	verbosityLevel int,
 	logger zerolog.Logger,
 ) (*Bot, error) {
 	client := slack.New(
@@ -64,7 +65,7 @@ func NewBot(
 		logger:        logger.With().Str("component", "bot").Logger(),
 	}
 
-	bot.handler = NewHandler(bot, verboseTools)
+	bot.handler = NewHandler(bot, verboseTools, verbosityLevel)
 
 	// Register event handlers using the socketmode handler pattern
 	bot.registerEventHandlers()
