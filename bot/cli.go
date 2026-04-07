@@ -12,28 +12,28 @@ import (
 
 type Flags struct {
 	Log struct {
-		Level  zerolog.Level `kong:"default='info',enum='trace,debug,info,warn,error,fatal,panic',env='LOG_LEVEL'"`
-		Format string        `kong:"default='json',enum='json,console',env='LOG_FORMAT'"`
+		Level  zerolog.Level `kong:"default='info',enum='trace,debug,info,warn,error,fatal,panic',env='CLOD_BOT_LOG_LEVEL'"`
+		Format string        `kong:"default='json',enum='json,console',env='CLOD_BOT_LOG_FORMAT'"`
 	} `kong:"embed,prefix='log.'"`
 
 	SlackBotToken string `kong:"required,env='SLACK_BOT_TOKEN',help='Slack bot token (xoxb-...)'"`
 	SlackAppToken string `kong:"required,env='SLACK_APP_TOKEN',help='Slack app token for Socket Mode (xapp-...)'"`
 
-	AllowedUsers []string `kong:"env='ALLOWED_USERS',sep=',',help='Comma-separated list of allowed Slack user IDs'"`
+	AllowedUsers []string `kong:"env='CLOD_BOT_ALLOWED_USERS',sep=',',help='Comma-separated list of allowed Slack user IDs'"`
 
-	SessionStorePath string `kong:"default='sessions.json',env='SESSION_STORE_PATH',help='Path to session store JSON file'"`
+	SessionStorePath string `kong:"default='sessions.json',env='CLOD_BOT_SESSION_STORE_PATH',help='Path to session store JSON file'"`
 
-	AgentsPath string `kong:"default='.',env='AGENTS_PATH',help='Base path to search for agent directories'"`
+	AgentsPath string `kong:"default='.',env='CLOD_BOT_AGENTS_PATH',help='Base path to search for agent directories'"`
 
-	AgentsPromptPath string `kong:"default='README.md',env='AGENTS_PROMPT_PATH',help='Path to agent prompt file (relative to task dir or absolute). Empty disables.'"`
+	AgentsPromptPath string `kong:"default='README.md',env='CLOD_BOT_AGENTS_PROMPT_PATH',help='Path to agent prompt file (relative to task dir or absolute). Empty disables.'"`
 
-	ClodTimeout time.Duration `kong:"default='30m',env='CLOD_TIMEOUT',help='Timeout for clod execution'"`
+	ClodTimeout time.Duration `kong:"default='30m',env='CLOD_BOT_TIMEOUT',help='Timeout for clod execution'"`
 
-	PermissionMode string `kong:"default='default',env='PERMISSION_MODE',help='Claude permission mode (default, acceptEdits, bypassPermissions)'"`
+	PermissionMode string `kong:"default='default',env='CLOD_BOT_PERMISSION_MODE',help='Claude permission mode (default, acceptEdits, bypassPermissions)'"`
 
-	VerboseTools []string `kong:"default='Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode',env='VERBOSE_TOOLS',sep=',',help='Tools affected by verbosity toggle'"`
+	VerboseTools []string `kong:"default='Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode',env='CLOD_BOT_VERBOSE_TOOLS',sep=',',help='Tools affected by verbosity toggle'"`
 
-	GracefulShutdownTTL time.Duration `kong:"default='30s',env='GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
+	GracefulShutdownTTL time.Duration `kong:"default='30s',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
 }
 
 type CLI struct {

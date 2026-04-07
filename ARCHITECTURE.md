@@ -508,7 +508,7 @@ type RunningTask interface {
 **Discovery Logic**:
 
 ```go
-// Scans AGENTS_PATH for:
+// Scans CLOD_BOT_AGENTS_PATH for:
 // - Directories with .clod/ subdirectory
 // - Containing executable .clod/system/run script
 // Maps: lowercase(dirname) → absolute path
@@ -668,15 +668,15 @@ Tool Execution (if approved)
 # Required
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
-ALLOWED_USERS=U123,U456,U789
+CLOD_BOT_ALLOWED_USERS=U123,U456,U789
 
 # Optional
-AGENTS_PATH=/path/to/agents       # Default: ./agents
-SESSION_STORE_PATH=./sessions.json
-PERMISSION_MODE=default           # default|acceptEdits|bypassPermissions
-CLOD_TIMEOUT=30m                  # Default: 30 minutes
-LOG_LEVEL=info                    # trace|debug|info|warn|error
-LOG_FORMAT=console                # json|console
+CLOD_BOT_AGENTS_PATH=/path/to/agents       # Default: ./agents
+CLOD_BOT_SESSION_STORE_PATH=./sessions.json
+CLOD_BOT_PERMISSION_MODE=default           # default|acceptEdits|bypassPermissions
+CLOD_BOT_TIMEOUT=30m                       # Default: 30 minutes
+CLOD_BOT_LOG_LEVEL=info                    # trace|debug|info|warn|error
+CLOD_BOT_LOG_FORMAT=console                # json|console
 ```
 
 ### Claude Configuration (claude.json)
@@ -839,8 +839,8 @@ clod                # Builds image and runs
 ```bash
 export SLACK_BOT_TOKEN=xoxb-...
 export SLACK_APP_TOKEN=xapp-...
-export ALLOWED_USERS=U123,U456
-export AGENTS_PATH=/path/to/agents
+export CLOD_BOT_ALLOWED_USERS=U123,U456
+export CLOD_BOT_AGENTS_PATH=/path/to/agents
 
 cd /path/to/agents/my_task
 clod                # Initialize task
@@ -968,9 +968,9 @@ cat sessions.json | jq          # Check mapping exists
 **Bot**:
 
 ```bash
-LOG_LEVEL=debug go run . server
+CLOD_BOT_LOG_LEVEL=debug go run . server
 # or
-LOG_LEVEL=trace LOG_FORMAT=json go run . server > bot.log
+CLOD_BOT_LOG_LEVEL=trace CLOD_BOT_LOG_FORMAT=json go run . server > bot.log
 ```
 
 **CLI**:
