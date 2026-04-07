@@ -570,7 +570,7 @@ session persistence and permission management.
    - Select **Profile**
    - Click the **⋯ More** menu
    - Select **Copy member ID**
-   - This is your User ID (starts with `U`) - you'll need this for `ALLOWED_USERS`
+   - This is your User ID (starts with `U`) - you'll need this for `CLOD_BOT_ALLOWED_USERS`
 
 6. **Configure Bot**
 
@@ -579,8 +579,8 @@ session persistence and permission management.
    ```bash
    export SLACK_BOT_TOKEN="xoxb-your-bot-token-here"
    export SLACK_APP_TOKEN="xapp-your-app-token-here"
-   export ALLOWED_USERS="U12345678,U87654321"  # Comma-separated User IDs
-   export AGENTS_PATH="/path/to/your/agents"   # Directory containing agent folders
+   export CLOD_BOT_ALLOWED_USERS="U12345678,U87654321"  # Comma-separated User IDs
+   export CLOD_BOT_AGENTS_PATH="/path/to/your/agents"   # Directory containing agent folders
    ```
 
 7. **Run Bot**
@@ -667,7 +667,7 @@ contains no credentials or hard-coded paths.
 
 ### Bot Configuration
 
-- `AGENTS_PROMPT_PATH` - Path to agent prompt file relative to task directory (default: `README.md`). The file is copied to the runtime directory and Claude is instructed to read it. Set to empty string to disable.
+- `CLOD_BOT_AGENTS_PROMPT_PATH` - Path to agent prompt file relative to task directory (default: `README.md`). The file is copied to the runtime directory and Claude is instructed to read it. Set to empty string to disable.
 
 ### Example: Force Reinit
 
