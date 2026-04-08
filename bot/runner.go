@@ -23,6 +23,7 @@ type Runner struct {
 	timeout          time.Duration
 	permissionMode   string
 	agentsPromptPath string
+	concurrent       bool
 	logger           zerolog.Logger
 }
 
@@ -31,12 +32,14 @@ func NewRunner(
 	timeout time.Duration,
 	permissionMode string,
 	agentsPromptPath string,
+	concurrent bool,
 	logger zerolog.Logger,
 ) *Runner {
 	return &Runner{
 		timeout:          timeout,
 		permissionMode:   permissionMode,
 		agentsPromptPath: agentsPromptPath,
+		concurrent:       concurrent,
 		logger:           logger.With().Str("component", "runner").Logger(),
 	}
 }
@@ -394,21 +397,29 @@ func (r *Runner) Start(
 	cmd := exec.CommandContext(runCtx, "clod", args...)
 	cmd.Dir = taskPath
 
-	// Set MCP tool timeout to allow time for user to respond to permission prompts
-	// Default is too short (causes "technical issues" when user doesn't respond quickly)
-	// 5 minutes = 300000ms should be plenty for interactive approval
-	cmd.Env = append(os.Environ(),
+	// Set MCP tool timeout to allow time for user to respond to permission prompts.
+	// Default is too short (causes "technical issues" when user doesn't respond quickly).
+	// 5 minutes = 300000ms should be plenty for interactive approval.
+	runtimeDir := filepath.Join(".clod", "runtime-"+permFIFO.RuntimeSuffix())
+	env := []string{
 		"MCP_TOOL_TIMEOUT=300000",
-		"CLOD_RUNTIME_SUFFIX="+permFIFO.RuntimeSuffix(),
-		"CLOD_CONCURRENT=true",
+		"CLOD_RUNTIME_DIR=" + runtimeDir,
+		"CLOD_RUNTIME_SUFFIX=" + permFIFO.RuntimeSuffix(),
 		"CLOD_NONINTERACTIVE=true",
-	)
+	}
+
+	if r.concurrent {
+		env = append(env, "CLOD_CONCURRENT=true")
+	}
+
+	cmd.Env = append(os.Environ(), env...)
 
 	r.logger.Debug().
 		Str("MCP_TOOL_TIMEOUT", "300000").
+		Str("CLOD_RUNTIME_DIR", runtimeDir).
 		Str("CLOD_RUNTIME_SUFFIX", permFIFO.RuntimeSuffix()).
 		Bool("CLOD_NONINTERACTIVE", true).
-		Bool("CLOD_CONCURRENT", true).
+		Bool("CLOD_CONCURRENT", r.concurrent).
 		Msg("setting environment variables for clod run")
 
 	// Set up process group for clean termination

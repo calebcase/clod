@@ -12,22 +12,23 @@ import (
 
 // SessionMapping represents a Slack thread to clod session mapping.
 type SessionMapping struct {
-	ChannelID string    `json:"channel_id"`
-	ThreadTS  string    `json:"thread_ts"`
-	TaskName  string    `json:"task_name"`
-	TaskPath  string    `json:"task_path"`
-	SessionID string    `json:"session_id"`
-	UserID    string    `json:"user_id"`
-	Verbose   bool      `json:"verbose"` // Per-thread verbosity setting
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ChannelID      string    `json:"channel_id"`
+	ThreadTS       string    `json:"thread_ts"`
+	TaskName       string    `json:"task_name"`
+	TaskPath       string    `json:"task_path"`
+	SessionID      string    `json:"session_id"`
+	UserID         string    `json:"user_id"`
+	VerbosityLevel int       `json:"verbosity_level"` // Per-thread verbosity: -1 (silent), 0 (summary), 1 (full)
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // SessionStore manages thread-to-session mappings with JSON persistence.
 type SessionStore struct {
-	path     string
-	sessions map[string]*SessionMapping // key: "channelID:threadTS"
-	mu       sync.RWMutex
+	path                  string
+	sessions              map[string]*SessionMapping // key: "channelID:threadTS"
+	mu                    sync.RWMutex
+	defaultVerbosityLevel int
 }
 
 // Count returns the number of stored sessions.
@@ -38,10 +39,11 @@ func (s *SessionStore) Count() int {
 }
 
 // NewSessionStore creates a new SessionStore and loads existing sessions.
-func NewSessionStore(path string) (*SessionStore, error) {
+func NewSessionStore(path string, defaultVerbosityLevel int) (*SessionStore, error) {
 	s := &SessionStore{
-		path:     path,
-		sessions: make(map[string]*SessionMapping),
+		path:                  path,
+		sessions:              make(map[string]*SessionMapping),
+		defaultVerbosityLevel: defaultVerbosityLevel,
 	}
 
 	if err := s.Load(); err != nil && !os.IsNotExist(err) {
@@ -73,16 +75,17 @@ func (s *SessionStore) Set(mapping *SessionMapping) {
 	s.sessions[key(mapping.ChannelID, mapping.ThreadTS)] = mapping
 }
 
-// SetVerbose updates the verbose setting for a thread.
-// If no session exists, it creates a minimal one to store the setting.
-func (s *SessionStore) SetVerbose(channelID, threadTS string, verbose bool) {
+// SetVerbosityLevel sets the verbosity level for a thread, creating a minimal
+// session entry if none exists yet.
+func (s *SessionStore) SetVerbosityLevel(channelID, threadTS string, level int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	k := key(channelID, threadTS)
 	session := s.sessions[k]
 	if session == nil {
-		// Create minimal session to track verbosity for threads without tasks yet
+		// Create a minimal session entry to hold the verbosity setting for threads
+		// that haven't started a task yet.
 		session = &SessionMapping{
 			ChannelID: channelID,
 			ThreadTS:  threadTS,
@@ -90,21 +93,20 @@ func (s *SessionStore) SetVerbose(channelID, threadTS string, verbose bool) {
 		}
 		s.sessions[k] = session
 	}
-	session.Verbose = verbose
+	session.VerbosityLevel = level
 	session.UpdatedAt = time.Now()
 }
 
-// IsVerbose returns the verbosity setting for a thread.
-// Returns false (quiet mode) if no session exists.
-func (s *SessionStore) IsVerbose(channelID, threadTS string) bool {
+// GetVerbosityLevel returns the thread's verbosity level, or the store default if no session exists.
+func (s *SessionStore) GetVerbosityLevel(channelID, threadTS string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	session := s.sessions[key(channelID, threadTS)]
 	if session == nil {
-		return false
+		return s.defaultVerbosityLevel
 	}
-	return session.Verbose
+	return session.VerbosityLevel
 }
 
 // Load reads sessions from the JSON file.

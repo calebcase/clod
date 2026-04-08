@@ -157,7 +157,7 @@ WORKDIR $USER_HOME
 
 RUN mkdir -p ~/.npm \
  && npm config set prefix ~/.npm \
- && npm install -g @anthropic-ai/claude-code
+ && npm install -g @anthropic-ai/claude-code@2.0.76
 ENV HOME="$USER_HOME"
 ENV USER="$USER_NAME"
 ENV PATH="$PATH:$USER_HOME/bin:$USER_HOME/.npm/bin"
@@ -454,6 +454,11 @@ fi
 needs_init=false
 needs_upgrade=false
 
+# Read installed version first (if it exists) so we can display it in upgrade messages.
+if [[ -f .clod/system/version ]]; then
+  installed_version=$(<.clod/system/version)
+fi
+
 if [[ ! -d .clod ]]; then
   needs_init=true
 elif [[ $reinit == 'true' ]]; then
@@ -463,11 +468,8 @@ elif changes_detected; then
   needs_upgrade=true
 elif [[ ! -f .clod/system/version ]]; then
   needs_upgrade=true
-else
-  installed_version=$(<.clod/system/version)
-  if version_gt "$CLOD_VERSION" "$installed_version"; then
-    needs_upgrade=true
-  fi
+elif version_gt "$CLOD_VERSION" "$installed_version"; then
+  needs_upgrade=true
 fi
 
 if [[ $needs_init == 'true' ]]; then

@@ -528,7 +528,6 @@ session persistence and permission management.
 - **Permission prompts** - Interactive buttons for tool approvals
 - **File uploads** - Attach files as context for agents
 - **Task discovery** - Automatically finds agents with `.clod/` directories
-
 ### Quick Start
 
 1. **Create Slack App**
@@ -614,6 +613,10 @@ Reply in threads to continue sessions:
 Find the users that will be impacted by the deprecations.
 ```
 
+**Joining existing conversations**: When you use a proper bot command (`@bot task_name: instructions`) in an existing thread that wasn't started by a bot mention, the bot will automatically gather all previous messages in the thread and use them as context. This allows you to bring the bot into ongoing discussions seamlessly.
+
+**Note**: The bot only responds to the proper command format (`@bot task_name: instructions`). Casual mentions without the command format in new threads will be ignored to avoid interrupting unrelated conversations.
+
 ## Sharing Configurations
 
 Clod configuration is "relocatable" (with care) - you can check in parts of
@@ -667,7 +670,18 @@ contains no credentials or hard-coded paths.
 
 ### Bot Configuration
 
+All bot-specific configuration uses the `CLOD_BOT_` prefix:
+
+- `CLOD_BOT_AGENTS_PATH` - Base path to search for agent directories (default: `.`)
 - `CLOD_BOT_AGENTS_PROMPT_PATH` - Path to agent prompt file relative to task directory (default: `README.md`). The file is copied to the runtime directory and Claude is instructed to read it. Set to empty string to disable.
+- `CLOD_BOT_ALLOWED_USERS` - Comma-separated list of allowed Slack user IDs
+- `CLOD_BOT_SESSION_STORE_PATH` - Path to session store JSON file (default: `sessions.json`)
+- `CLOD_BOT_TIMEOUT` - Timeout for clod execution (default: `30m`)
+- `CLOD_BOT_PERMISSION_MODE` - Claude permission mode: `default`, `acceptEdits`, or `bypassPermissions` (default: `default`)
+- `CLOD_BOT_VERBOSE_TOOLS` - Comma-separated list of tools affected by verbosity toggle (default: `Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode`)
+- `CLOD_BOT_GRACEFUL_SHUTDOWN_TTL` - Time to wait for graceful shutdown (default: `30s`)
+- `CLOD_BOT_LOG_LEVEL` - Logging level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
+- `CLOD_BOT_LOG_FORMAT` - Log format: `json` or `console` (default: `json`)
 
 ### Example: Force Reinit
 

@@ -5,6 +5,57 @@ All notable changes to clod will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2025-12-17
+
+### Added
+- **Three-level verbosity system** - Fine-grained control over tool output verbosity
+  - Level -1 (🙈 see_no_evil): Silent mode - no verbose tool output at all
+  - Level 0 (default): Summary mode - show only tool summaries
+  - Level 1 (💬 speech_balloon): Full mode - show complete tool output with snippets
+  - Configure default level via `CLOD_BOT_VERBOSITY_LEVEL` environment variable
+  - React with 🙈 emoji to enable silent mode on a thread
+  - React with 💬 emoji to enable full verbose mode on a thread
+  - If multiple verbosity reactions exist, bot uses the least verbose setting
+  - Verbosity settings are tracked even before bot is invoked (ready when needed)
+  - Bot only posts confirmation messages in threads with active sessions
+  - Verbose tools (Read, Glob, Grep, etc.) respect verbosity level
+  - Non-verbose tools always show full output regardless of verbosity setting
+- **Configurable CLOD_CONCURRENT mode** - Made concurrent clod execution optional
+  - Now disabled by default (was always enabled in bot)
+  - Configure via `CLOD_CONCURRENT` environment variable
+  - Creates unique runtime directories when enabled for parallel execution
+- **Thread context gathering** - Bot automatically gathers previous conversation when joining existing threads
+  - When bot receives a proper command (`@bot task_name: instructions`) in a thread not started by a bot mention, all prior messages are gathered as context
+  - Context includes user names and message content formatted for Claude
+  - Only applies to new sessions (threads without existing bot sessions)
+  - Bot ignores casual mentions without proper command format in new threads to avoid interrupting unrelated conversations
+  - Allows bot to participate naturally in ongoing discussions when explicitly invoked with proper format
+
+### Changed
+- **Reduced notification noise** - Bot now consolidates consecutive verbose tool messages
+  - When posting verbose tool output, bot edits the previous verbose message instead of creating a new one
+  - Significantly reduces Slack notifications during long-running tasks with many tool calls
+  - Verbose message tracking is cleared when non-verbose content is posted
+  - Only applies to verbose tools in quiet mode (when verbosity toggle is off)
+- Runner now accepts `concurrent` parameter and conditionally enables CLOD_CONCURRENT mode
+- CLI passes `ClodConcurrent` flag to Runner from configuration
+- SessionStore tracks `VerbosityLevel` (int) per thread instead of `Verbose` (bool)
+
+### Fixed
+- **Version display in upgrade messages** - Upgrade messages now show actual previous version instead of "vunknown"
+  - Read `installed_version` from `.clod/system/version` before checking for changes
+  - Previously only read version in some code paths, causing "vunknown" to display
+  - Now consistently shows "Upgrading clod from v0.5.0 to v0.6.0" format
+- **Permission system not available error** - Fixed missing `CLOD_RUNTIME_DIR` environment variable
+  - Runner now sets `CLOD_RUNTIME_DIR` environment variable pointing to `.clod/runtime-{suffix}`
+  - Permission MCP script can now find FIFOs for permission requests/responses
+  - Previously only set `CLOD_RUNTIME_SUFFIX`, causing "Permission system not available" errors
+- **Bot no longer interrupts unrelated threads** - HandleMessage now stays silent for threads without sessions
+  - Previously posted error message for any thread reply without a bot session
+  - Now only responds to threads with active sessions or proper `@bot task_name: instructions` commands
+  - Prevents bot from interrupting team conversations where it wasn't explicitly invoked
+- Fixed redundant condition in handlers.go message filtering
+
 ## [0.5.0] - 2025-12-16
 
 ### Added
@@ -141,6 +192,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Limited filesystem access to working directory only
 - User ID preservation for file ownership
 
+[0.6.0]: https://github.com/calebcase/clod/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/calebcase/clod/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/calebcase/clod/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/calebcase/clod/compare/v0.2.9...v0.3.0
