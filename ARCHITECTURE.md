@@ -160,7 +160,7 @@ agent_directory/
 │   ├── name                            # Container name
 │   ├── image                           # Base image selection
 │   ├── concurrent                      # Optional: concurrency setting
-│   ├── ssh                             # Optional: SSH forwarding config
+│   ├── ssh                             # Optional: SSH forwarding config (auto/true/false/key path)
 │   ├── gpus                            # Optional: GPU config
 │   ├── claude-default-flags            # Optional: default flags
 │   ├── claude/                         # Claude configuration (gitignored)
