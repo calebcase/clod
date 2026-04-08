@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] in a modestly more secure way.
 
-**Version 0.6.0**
+**Version 0.6.1**
 
 ## Features
 
@@ -252,29 +252,42 @@ SSH forwarding can be configured via:
 
 1. **Configuration file** (per-directory default):
    ```bash
-   echo "true" > .clod/ssh
+   echo "auto" > .clod/ssh
    ```
 
 2. **Environment variable** (overrides file):
    ```bash
-   export CLOD_SSH="true"
+   export CLOD_SSH="auto"
    ```
 
 ### SSH Modes
 
-#### Mode 1: Use Existing SSH Agent (Recommended)
+#### Mode 1: Auto-detect or Start Agent (Recommended)
+
+```bash
+echo "auto" > .clod/ssh
+```
+
+Uses an existing SSH agent if one is running, otherwise starts a dedicated agent
+and loads your default keys. Clod auto-detects the SSH socket path:
+- **macOS with Docker Desktop**: Uses `/run/host-services/ssh-auth.sock`
+- **Linux or macOS with SSH_AUTH_SOCK**: Uses your `$SSH_AUTH_SOCK`
+- **No agent running**: Starts a new agent and runs `ssh-add` to load default keys
+
+This mode is ideal for most setups — it just works whether or not you have an
+agent running.
+
+#### Mode 2: Require Existing SSH Agent
 
 ```bash
 echo "true" > .clod/ssh
 ```
 
-Forwards your existing SSH agent into the container. Clod auto-detects the SSH socket path:
-- **macOS with Docker Desktop**: Uses `/run/host-services/ssh-auth.sock`
-- **Linux or macOS with SSH_AUTH_SOCK**: Uses your `$SSH_AUTH_SOCK`
+Requires a running SSH agent. Clod will error if no agent is found. This is
+useful when you want to ensure an agent is already configured and don't want
+clod to start one automatically.
 
-This mode is ideal when you already have `ssh-add` loaded with your keys.
-
-#### Mode 2: Use Specific SSH Key
+#### Mode 3: Use Specific SSH Key
 
 ```bash
 echo "~/.ssh/id_ed25519" > .clod/ssh
@@ -283,17 +296,18 @@ export CLOD_SSH="~/.ssh/id_rsa"
 ```
 
 Starts a dedicated SSH agent with only the specified key. Clod will:
-1. Create an isolated SSH agent for this session
-2. Add the specified key (prompting for passphrase if needed)
-3. Forward the agent into the container
-4. Automatically clean up the agent on exit
+1. Verify the key file exists (errors if not found)
+2. Create an isolated SSH agent for this session
+3. Add the specified key (prompting for passphrase if needed)
+4. Forward the agent into the container
+5. Automatically clean up the agent on exit
 
 This mode is useful for:
 - Specific per-project keys
 - Keys with different passphrases
 - Temporary key access without affecting your main agent
 
-#### Mode 3: Disable SSH Forwarding
+#### Mode 4: Disable SSH Forwarding
 
 ```bash
 echo "false" > .clod/ssh
@@ -305,14 +319,23 @@ Explicitly disables SSH forwarding (default behavior).
 
 ### Usage Examples
 
-**Clone private repository inside container:**
+**Auto-detect or start an agent:**
 
 ```bash
+echo "auto" > .clod/ssh
+clod "Clone the backend repo from git@github.com:company/backend.git"
+```
+
+**Require an existing agent:**
+
+```bash
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519
 echo "true" > .clod/ssh
 clod "Clone the backend repo from git@github.com:company/backend.git"
 ```
 
-**Deploy to remote server:**
+**Deploy with a specific key:**
 
 ```bash
 export CLOD_SSH="~/.ssh/deploy_key"
@@ -329,7 +352,7 @@ clod "Run the deployment script"
 ### Security Notes
 
 - SSH agent sockets are mounted read-only into containers
-- Dedicated agents (key file mode) are isolated and cleaned up automatically
+- Dedicated agents (auto and key file modes) are isolated and cleaned up automatically
 - Keys are never copied into the container - only the agent socket is forwarded
 - The `.clod/ssh` file should be added to `.gitignore` if it contains key paths
 
