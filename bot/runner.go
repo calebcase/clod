@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -18,12 +19,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// rerunPattern matches Claude Code's [rerun: ...] control messages that shouldn't be shown to users.
+// Matches both "[rerun: b1]" (with space) and "[rerun:b1]" (without space).
+var rerunPattern = regexp.MustCompile(`\[rerun:\s*[^\]]+\]\s*`)
+
 // Runner executes clod processes.
 type Runner struct {
 	timeout          time.Duration
 	permissionMode   string
 	agentsPromptPath string
-	concurrent       bool
 	logger           zerolog.Logger
 }
 
@@ -32,14 +36,12 @@ func NewRunner(
 	timeout time.Duration,
 	permissionMode string,
 	agentsPromptPath string,
-	concurrent bool,
 	logger zerolog.Logger,
 ) *Runner {
 	return &Runner{
 		timeout:          timeout,
 		permissionMode:   permissionMode,
 		agentsPromptPath: agentsPromptPath,
-		concurrent:       concurrent,
 		logger:           logger.With().Str("component", "runner").Logger(),
 	}
 }
@@ -65,8 +67,11 @@ type StreamMessage struct {
 	DurationMS   int     `json:"duration_ms,omitempty"`
 	NumTurns     int     `json:"num_turns,omitempty"`
 	IsError      bool    `json:"is_error,omitempty"`
-	// For content_block_delta messages (partial streaming).
-	ContentBlockDelta *ContentBlockDelta `json:"content_block_delta,omitempty"`
+	// For content_block_delta messages - these are TOP-LEVEL fields in the JSON.
+	Index int        `json:"index,omitempty"` // Content block index.
+	Delta *TextDelta `json:"delta,omitempty"` // The actual delta content.
+	// For content_block_start messages (may contain initial text).
+	ContentBlock *StreamContentBlock `json:"content_block,omitempty"`
 }
 
 // StreamMsgBody represents the message body in stream-json output.
@@ -78,6 +83,9 @@ type StreamMsgBody struct {
 type StreamContentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
+	// For thinking blocks (extended thinking feature).
+	Thinking  string `json:"thinking,omitempty"`  // Thinking content.
+	Signature string `json:"signature,omitempty"` // Encrypted thinking signature for multi-turn.
 	// For tool_use blocks.
 	ID    string         `json:"id,omitempty"`   // Tool use ID.
 	Name  string         `json:"name,omitempty"` // Tool name (Bash, Read, etc.).
@@ -129,22 +137,52 @@ type ContentBlockDelta struct {
 }
 
 // TextDelta represents the actual text content in a streaming delta.
+// Can also contain thinking content or tool input JSON.
 type TextDelta struct {
-	Type string `json:"type"` // Usually "text_delta".
-	Text string `json:"text,omitempty"`
+	Type        string `json:"type"` // "text_delta", "thinking_delta", "input_json_delta", "signature_delta"
+	Text        string `json:"text,omitempty"`         // For text_delta
+	Thinking    string `json:"thinking,omitempty"`     // For thinking_delta (extended thinking)
+	PartialJSON string `json:"partial_json,omitempty"` // For input_json_delta (tool input)
+	Signature   string `json:"signature,omitempty"`    // For signature_delta (thinking signature)
+}
+
+// StreamEventWrapper wraps events in newer Claude Code versions.
+type StreamEventWrapper struct {
+	Type  string          `json:"type"`  // "stream_event"
+	Event json.RawMessage `json:"event"` // Inner event to unwrap.
+}
+
+// ControlRequest represents a permission request via control messages.
+type ControlRequest struct {
+	Type      string         `json:"type"`    // "control_request"
+	Subtype   string         `json:"subtype"` // "can_use_tool"
+	RequestID string         `json:"request_id,omitempty"`
+	ToolName  string         `json:"tool_name,omitempty"`
+	ToolInput map[string]any `json:"tool_input,omitempty"`
+	ToolUseID string         `json:"tool_use_id,omitempty"`
+}
+
+// ControlResponse is sent back to allow/deny a control request.
+type ControlResponse struct {
+	Type      string `json:"type"`      // "control_response"
+	RequestID string `json:"request_id"`
+	Behavior  string `json:"behavior"` // "allow" or "deny"
+	Message   string `json:"message,omitempty"`
 }
 
 // RunningTask represents a clod task that is currently executing.
 type RunningTask struct {
-	cmd            *exec.Cmd
-	pty            *os.File
-	output         chan string
-	done           chan *Result
-	cancel         context.CancelFunc
-	sessionID      string
-	taskPath       string // The path to the task directory.
-	logger         zerolog.Logger
-	permissionFIFO *PermissionFIFO
+	cmd                       *exec.Cmd
+	pty                       *os.File
+	output                    chan string
+	done                      chan *Result
+	cancel                    context.CancelFunc
+	sessionID                 string
+	taskPath                  string // The path to the task directory.
+	logger                    zerolog.Logger
+	permissionFIFO            *PermissionFIFO
+	controlPermissionRequests chan PermissionRequest
+	pendingControlRequestID   string
 }
 
 // InputMessage represents a user input message in stream-json format.
@@ -253,6 +291,39 @@ func (t *RunningTask) SendPermissionResponse(resp PermissionResponse) {
 	}
 }
 
+// ControlPermissionRequests returns the channel for receiving permission requests
+// via control messages (newer protocol).
+func (t *RunningTask) ControlPermissionRequests() <-chan PermissionRequest {
+	return t.controlPermissionRequests
+}
+
+// SendControlResponse sends a control_response for permission requests.
+func (t *RunningTask) SendControlResponse(requestID, behavior, message string) error {
+	if t.pty == nil {
+		return oops.New("pty is closed")
+	}
+
+	resp := ControlResponse{
+		Type:      "control_response",
+		RequestID: requestID,
+		Behavior:  behavior,
+		Message:   message,
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return oops.Trace(err)
+	}
+
+	t.logger.Debug().
+		Str("request_id", requestID).
+		Str("behavior", behavior).
+		Msg("sending control_response")
+
+	_, err = t.pty.Write(append(data, '\n'))
+	return oops.Trace(err)
+}
+
 // Done returns the channel that receives the final result.
 func (t *RunningTask) Done() <-chan *Result {
 	return t.done
@@ -271,42 +342,99 @@ func (t *RunningTask) GetSessionID() string {
 }
 
 // readAllowedTools reads the allowed tools from the task's claude.json config.
-func readAllowedTools(taskPath string) []string {
+// It also checks for a permissions.allow array in the project config (Claude's native format).
+func readAllowedTools(taskPath string, logger zerolog.Logger) []string {
 	configPath := filepath.Join(taskPath, ".clod", "claude", "claude.json")
+
+	logger.Info().
+		Str("task_path", taskPath).
+		Str("config_path", configPath).
+		Msg("reading allowed tools from claude.json")
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
+		logger.Warn().Err(err).Str("path", configPath).Msg("failed to read claude.json")
 		return nil
 	}
 
 	var config map[string]any
 	if err := json.Unmarshal(data, &config); err != nil {
+		logger.Warn().Err(err).Msg("failed to parse claude.json")
 		return nil
 	}
 
 	projects, ok := config["projects"].(map[string]any)
 	if !ok {
+		logger.Info().Msg("no projects key in claude.json")
 		return nil
 	}
+
+	// Log available project keys for debugging
+	var projectKeys []string
+	for k := range projects {
+		projectKeys = append(projectKeys, k)
+	}
+	logger.Info().
+		Str("task_path", taskPath).
+		Strs("project_keys", projectKeys).
+		Msg("looking for project in claude.json")
 
 	project, ok := projects[taskPath].(map[string]any)
 	if !ok {
-		return nil
-	}
-
-	allowedTools, ok := project["allowedTools"].([]any)
-	if !ok {
+		logger.Warn().
+			Str("task_path", taskPath).
+			Strs("available_keys", projectKeys).
+			Msg("project not found in claude.json - task_path doesn't match any project key")
 		return nil
 	}
 
 	var tools []string
-	for _, t := range allowedTools {
-		if s, ok := t.(string); ok {
-			tools = append(tools, s)
+
+	// Check for allowedTools (bot's format)
+	if allowedTools, ok := project["allowedTools"].([]any); ok {
+		logger.Info().Int("count", len(allowedTools)).Msg("found allowedTools array")
+		for _, t := range allowedTools {
+			if s, ok := t.(string); ok {
+				tools = append(tools, s)
+			}
+		}
+	} else {
+		logger.Info().Msg("no allowedTools array in project")
+	}
+
+	// Also check for permissions.allow (Claude's native format)
+	if permissions, ok := project["permissions"].(map[string]any); ok {
+		if allow, ok := permissions["allow"].([]any); ok {
+			logger.Info().Int("count", len(allow)).Msg("found permissions.allow array")
+			for _, t := range allow {
+				if s, ok := t.(string); ok {
+					tools = append(tools, s)
+				}
+			}
+		} else {
+			logger.Info().Msg("no permissions.allow array in project")
+		}
+	} else {
+		logger.Info().Msg("no permissions map in project")
+	}
+
+	// Deduplicate tools (since we read from both arrays)
+	seen := make(map[string]bool)
+	var uniqueTools []string
+	for _, t := range tools {
+		if !seen[t] {
+			seen[t] = true
+			uniqueTools = append(uniqueTools, t)
 		}
 	}
 
-	return tools
+	logger.Info().
+		Str("task_path", taskPath).
+		Strs("tools", uniqueTools).
+		Int("count", len(uniqueTools)).
+		Msg("read allowed tools from claude.json")
+
+	return uniqueTools
 }
 
 // Start begins executing clod in a task directory with the given prompt.
@@ -367,14 +495,16 @@ func (r *Runner) Start(
 	}
 
 	// Pass any saved allowed tools so they're respected immediately.
-	allowedTools := readAllowedTools(taskPath)
+	allowedTools := readAllowedTools(taskPath, r.logger)
 	for _, tool := range allowedTools {
 		args = append(args, "--allowedTools", tool)
 	}
 	if len(allowedTools) > 0 {
-		r.logger.Debug().
+		r.logger.Info().
 			Strs("allowed_tools", allowedTools).
 			Msg("passing saved allowed tools to claude")
+	} else {
+		r.logger.Info().Msg("no saved allowed tools found")
 	}
 
 	if r.permissionMode != "" && r.permissionMode != "default" {
@@ -400,26 +530,19 @@ func (r *Runner) Start(
 	// Set MCP tool timeout to allow time for user to respond to permission prompts.
 	// Default is too short (causes "technical issues" when user doesn't respond quickly).
 	// 5 minutes = 300000ms should be plenty for interactive approval.
-	runtimeDir := filepath.Join(".clod", "runtime-"+permFIFO.RuntimeSuffix())
-	env := []string{
+	// Note: CLOD_RUNTIME_DIR is constructed by the run script from CLOD_RUNTIME_SUFFIX.
+	cmd.Env = append(os.Environ(),
 		"MCP_TOOL_TIMEOUT=300000",
-		"CLOD_RUNTIME_DIR=" + runtimeDir,
-		"CLOD_RUNTIME_SUFFIX=" + permFIFO.RuntimeSuffix(),
+		"CLOD_RUNTIME_SUFFIX="+permFIFO.RuntimeSuffix(),
+		"CLOD_CONCURRENT=true",
 		"CLOD_NONINTERACTIVE=true",
-	}
-
-	if r.concurrent {
-		env = append(env, "CLOD_CONCURRENT=true")
-	}
-
-	cmd.Env = append(os.Environ(), env...)
+	)
 
 	r.logger.Debug().
 		Str("MCP_TOOL_TIMEOUT", "300000").
-		Str("CLOD_RUNTIME_DIR", runtimeDir).
 		Str("CLOD_RUNTIME_SUFFIX", permFIFO.RuntimeSuffix()).
+		Bool("CLOD_CONCURRENT", true).
 		Bool("CLOD_NONINTERACTIVE", true).
-		Bool("CLOD_CONCURRENT", r.concurrent).
 		Msg("setting environment variables for clod run")
 
 	// Set up process group for clean termination
@@ -436,15 +559,16 @@ func (r *Runner) Start(
 	}
 
 	task := &RunningTask{
-		cmd:            cmd,
-		pty:            ptmx,
-		output:         make(chan string, 100),
-		done:           make(chan *Result, 1),
-		cancel:         cancel,
-		sessionID:      sessionID,
-		taskPath:       taskPath,
-		logger:         r.logger,
-		permissionFIFO: permFIFO,
+		cmd:                       cmd,
+		pty:                       ptmx,
+		output:                    make(chan string, 100),
+		done:                      make(chan *Result, 1),
+		cancel:                    cancel,
+		sessionID:                 sessionID,
+		taskPath:                  taskPath,
+		logger:                    r.logger,
+		permissionFIFO:            permFIFO,
+		controlPermissionRequests: make(chan PermissionRequest, 10),
 	}
 
 	// Start permission FIFO listener
@@ -475,6 +599,15 @@ func (r *Runner) Start(
 				continue
 			}
 
+			// Check if this is a wrapped stream_event and unwrap it.
+			var wrapper StreamEventWrapper
+			if err := json.Unmarshal([]byte(line), &wrapper); err == nil && wrapper.Type == "stream_event" {
+				r.logger.Info().
+					Str("unwrapped_event_preview", string(wrapper.Event)[:min(150, len(wrapper.Event))]).
+					Msg("unwrapped stream_event wrapper")
+				line = string(wrapper.Event)
+			}
+
 			var msg StreamMessage
 			if err := json.Unmarshal([]byte(line), &msg); err != nil {
 				r.logger.Debug().
@@ -493,6 +626,11 @@ func (r *Runner) Start(
 			}
 
 			// Handle different message types.
+			r.logger.Info().
+				Str("type", msg.Type).
+				Str("subtype", msg.Subtype).
+				Msg("processing stream message")
+
 			switch msg.Type {
 			case "system":
 				// System messages include init with session_id.
@@ -504,17 +642,16 @@ func (r *Runner) Start(
 				}
 			case "assistant":
 				// Assistant messages contain text output and tool_use requests.
+				// Note: We don't send text to output here because content_block_delta
+				// already streams text as it arrives. Sending here would cause duplicates.
 				if msg.Message != nil {
 					for _, block := range msg.Message.Content {
 						switch block.Type {
 						case "text":
+							// Only add to outputBuilder for final result, but don't send to channel
+							// (content_block_delta already handles streaming output)
 							if block.Text != "" {
 								outputBuilder.WriteString(block.Text)
-								select {
-								case task.output <- block.Text:
-								default:
-									r.logger.Warn().Msg("output channel full, dropping message")
-								}
 							}
 						case "tool_use":
 							// Track tool ID → name and input for showing context in results.
@@ -556,6 +693,15 @@ func (r *Runner) Start(
 							const maxInlineLen = 500
 							trimmedContent := strings.TrimRight(contentText, " \t\n\r")
 
+							// Filter out [rerun: ...] control messages from tool output
+							trimmedContent = rerunPattern.ReplaceAllString(trimmedContent, "")
+							trimmedContent = strings.TrimRight(trimmedContent, " \t\n\r") // Re-trim after filtering
+
+							// Skip empty content (e.g., after filtering control messages)
+							if trimmedContent == "" {
+								continue
+							}
+
 							var outputMsg string
 							if info.Name == "Bash" && contentLen <= maxInlineLen {
 								// Short Bash output: inline code block.
@@ -576,17 +722,99 @@ func (r *Runner) Start(
 						}
 					}
 				}
+			case "content_block_start":
+				// Initial content block - may contain text/thinking for short responses.
+				r.logger.Info().
+					Bool("has_content_block", msg.ContentBlock != nil).
+					Msg("received content_block_start")
+				if msg.ContentBlock != nil {
+					r.logger.Info().
+						Str("block_type", msg.ContentBlock.Type).
+						Int("text_len", len(msg.ContentBlock.Text)).
+						Int("thinking_len", len(msg.ContentBlock.Thinking)).
+						Msg("content_block_start details")
+
+					var text string
+					var isThinking bool
+					switch msg.ContentBlock.Type {
+					case "text":
+						text = msg.ContentBlock.Text
+					case "thinking":
+						// Extended thinking content - prefix for verbosity filtering
+						text = msg.ContentBlock.Thinking
+						isThinking = true
+					}
+
+					if text != "" {
+						r.logger.Info().
+							Int("text_len", len(text)).
+							Str("text_preview", text[:min(50, len(text))]).
+							Msg("extracting text from content_block_start")
+						outputBuilder.WriteString(text)
+
+						// Filter out [rerun: ...] control messages from output
+						filtered := rerunPattern.ReplaceAllString(text, "")
+						if filtered != "" {
+							// Add __THINKING__ prefix for thinking blocks so handler can filter by verbosity
+							if isThinking {
+								filtered = "__THINKING__" + filtered
+							}
+							select {
+							case task.output <- filtered:
+							default:
+								r.logger.Warn().Msg("output channel full, dropping content_block_start text")
+							}
+						}
+					}
+				}
 			case "content_block_delta":
 				// Partial streaming output. Send immediately for responsive feedback.
-				if msg.ContentBlockDelta != nil &&
-					msg.ContentBlockDelta.Delta != nil &&
-					msg.ContentBlockDelta.Delta.Text != "" {
-					text := msg.ContentBlockDelta.Delta.Text
-					outputBuilder.WriteString(text)
-					select {
-					case task.output <- text:
-					default:
-						r.logger.Warn().Msg("output channel full, dropping delta")
+				// Note: delta is a TOP-LEVEL field in the message, not nested.
+				r.logger.Info().
+					Bool("has_delta", msg.Delta != nil).
+					Int("index", msg.Index).
+					Str("raw_line_preview", line[:min(200, len(line))]).
+					Msg("received content_block_delta")
+				if msg.Delta != nil {
+					delta := msg.Delta
+					r.logger.Info().
+						Str("delta_type", delta.Type).
+						Int("text_len", len(delta.Text)).
+						Int("thinking_len", len(delta.Thinking)).
+						Msg("content_block_delta details")
+					var text string
+
+					switch delta.Type {
+					case "text_delta":
+						text = delta.Text
+					case "thinking_delta":
+						// Extended thinking - prefix with __THINKING__ so handler can filter by verbosity
+						text = "__THINKING__" + delta.Thinking
+					case "input_json_delta":
+						// Tool input JSON - we don't need to display this
+						continue
+					case "signature_delta":
+						// Thinking signature - internal, don't display
+						continue
+					}
+
+					if text != "" {
+						r.logger.Info().
+							Int("text_len", len(text)).
+							Msg("sending text to output channel")
+						// Strip __THINKING__ prefix for outputBuilder (final result)
+						cleanText := strings.TrimPrefix(text, "__THINKING__")
+						outputBuilder.WriteString(cleanText)
+
+						// Filter out [rerun: ...] control messages from output
+						filtered := rerunPattern.ReplaceAllString(text, "")
+						if filtered != "" {
+							select {
+							case task.output <- filtered:
+							default:
+								r.logger.Warn().Msg("output channel full, dropping delta")
+							}
+						}
 					}
 				}
 			case "result":
@@ -614,6 +842,62 @@ func (r *Runner) Start(
 				case task.output <- statsJSON:
 				default:
 					r.logger.Warn().Msg("output channel full, dropping stats")
+				}
+			case "control_request":
+				// Handle permission requests via control messages (newer protocol).
+				var ctrlReq ControlRequest
+				if err := json.Unmarshal([]byte(line), &ctrlReq); err != nil {
+					r.logger.Error().Err(err).Str("line", line).Msg("failed to parse control_request")
+					continue
+				}
+
+				if ctrlReq.Subtype == "can_use_tool" {
+					r.logger.Info().
+						Str("tool_name", ctrlReq.ToolName).
+						Str("request_id", ctrlReq.RequestID).
+						Str("tool_use_id", ctrlReq.ToolUseID).
+						Msg("received control_request for tool permission")
+
+					// Convert to PermissionRequest format for existing handling.
+					permReq := PermissionRequest{
+						ToolName:  ctrlReq.ToolName,
+						ToolInput: ctrlReq.ToolInput,
+						ToolUseID: ctrlReq.ToolUseID,
+					}
+					// Store request_id for response.
+					task.pendingControlRequestID = ctrlReq.RequestID
+
+					select {
+					case task.controlPermissionRequests <- permReq:
+					default:
+						r.logger.Warn().Msg("control permission channel full, dropping request")
+					}
+				} else {
+					r.logger.Debug().
+						Str("subtype", ctrlReq.Subtype).
+						Msg("unhandled control_request subtype")
+				}
+			case "content_block_stop", "message_start", "message_delta", "message_stop", "ping":
+				// These are part of the streaming protocol but we don't need to act on them.
+				// content_block_stop: marks end of a content block
+				// message_start: marks beginning of assistant message
+				// message_delta: contains stop_reason and usage (we get this from result)
+				// message_stop: marks end of assistant message
+				// ping: keep-alive signal
+				r.logger.Debug().Str("type", msg.Type).Msg("received streaming marker")
+			case "error":
+				// Error event from Claude API
+				r.logger.Error().
+					Str("line", line).
+					Msg("received error event from Claude")
+			default:
+				// Log unknown message types for debugging.
+				if msg.Type != "" {
+					r.logger.Warn().
+						Str("type", msg.Type).
+						Str("subtype", msg.Subtype).
+						Int("line_len", len(line)).
+						Msg("unknown message type")
 				}
 			}
 		}

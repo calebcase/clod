@@ -103,7 +103,10 @@ func (r *mrkdwnRenderer) RenderNode(w io.Writer, node ast.Node, entering bool) a
 	case *ast.CodeBlock:
 		if entering {
 			code := strings.TrimSuffix(string(n.Literal), "\n")
-			_, _ = fmt.Fprintf(w, "```\n%s\n```\n", code)
+			// Skip empty code blocks
+			if code != "" {
+				_, _ = fmt.Fprintf(w, "```\n%s\n```\n", code)
+			}
 		}
 		return ast.GoToNext
 

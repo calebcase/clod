@@ -275,8 +275,15 @@ func (b *Bot) handleInteractiveCallback(ctx context.Context, callback slack.Inte
 
 // savePermissionRule saves a permission pattern to the task's claude.json file.
 // This allows the permission to be remembered for future requests.
+// It saves to both allowedTools (for bot reading) and permissions.allow (for Claude).
 func (b *Bot) savePermissionRule(taskPath, pattern string) error {
 	configPath := filepath.Join(taskPath, ".clod", "claude", "claude.json")
+
+	b.logger.Info().
+		Str("task_path", taskPath).
+		Str("config_path", configPath).
+		Str("pattern", pattern).
+		Msg("saving permission rule")
 
 	// Read existing config
 	data, err := os.ReadFile(configPath)
@@ -297,34 +304,54 @@ func (b *Bot) savePermissionRule(taskPath, pattern string) error {
 		config["projects"] = projects
 	}
 
+	// Log existing project keys
+	var projectKeys []string
+	for k := range projects {
+		projectKeys = append(projectKeys, k)
+	}
+	b.logger.Info().
+		Strs("existing_project_keys", projectKeys).
+		Msg("existing projects in claude.json")
+
 	// Get or create project entry for this task path
 	project, ok := projects[taskPath].(map[string]any)
 	if !ok {
-		project = map[string]any{
-			"allowedTools": []any{},
-		}
+		project = map[string]any{}
 		projects[taskPath] = project
 	}
 
-	// Get or create allowedTools array
+	// Get or create allowedTools array (for bot reading)
 	allowedTools, ok := project["allowedTools"].([]any)
 	if !ok {
 		allowedTools = []any{}
 	}
 
-	// Check if pattern already exists
+	// Get or create permissions.allow array (for Claude reading)
+	permissions, ok := project["permissions"].(map[string]any)
+	if !ok {
+		permissions = map[string]any{}
+		project["permissions"] = permissions
+	}
+	allowRules, ok := permissions["allow"].([]any)
+	if !ok {
+		allowRules = []any{}
+	}
+
+	// Check if pattern already exists in either array
 	for _, t := range allowedTools {
 		if t == pattern {
 			b.logger.Debug().
 				Str("pattern", pattern).
-				Msg("permission pattern already exists, skipping")
+				Msg("permission pattern already exists in allowedTools, skipping")
 			return nil
 		}
 	}
 
-	// Add the new pattern
+	// Add the new pattern to both arrays
 	allowedTools = append(allowedTools, pattern)
+	allowRules = append(allowRules, pattern)
 	project["allowedTools"] = allowedTools
+	permissions["allow"] = allowRules
 
 	// Write back to file with nice formatting
 	newData, err := json.MarshalIndent(config, "", "  ")
@@ -339,6 +366,7 @@ func (b *Bot) savePermissionRule(taskPath, pattern string) error {
 	b.logger.Info().
 		Str("pattern", pattern).
 		Str("config_path", configPath).
+		Str("task_path", taskPath).
 		Msg("saved permission rule to claude.json")
 
 	return nil
