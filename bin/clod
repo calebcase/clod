@@ -1,7 +1,7 @@
 #!/bin/env bash
 set -euo pipefail
 
-CLOD_VERSION="0.6.1"
+CLOD_VERSION="0.7.4"
 
 reinit=${CLOD_REINIT:-false}
 noninteractive=${CLOD_NONINTERACTIVE:-false}
@@ -99,7 +99,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \\
     --mount=type=cache,sharing=locked,target=/var/lib/apt \\
     apt-get update \\
- && apt-get install -qq -y npm
+ && apt-get install -qq -y curl ca-certificates
 EOF
 
   if [[ ! -f .clod/Dockerfile_project ]]; then
@@ -126,7 +126,9 @@ if [[ -f ~/.claude/claude.json ]]; then
   cp ~/.claude/claude.json ~/.claude.json
 fi
 
-trap 'cp ~/.claude.json ~/.claude/claude.json' EXIT
+# Note: We intentionally do NOT copy ~/.claude.json back on exit.
+# The bot saves permissions directly to ~/.claude/claude.json (via volume mount),
+# and copying back would overwrite those saves with the stale copy made at startup.
 
 # Read default flags from .clod/claude-default-flags if it exists.
 if [[ -f .clod/claude-default-flags ]]; then
@@ -155,12 +157,11 @@ ARG USER_HOME
 USER $USER_NAME
 WORKDIR $USER_HOME
 
-RUN mkdir -p ~/.npm \
- && npm config set prefix ~/.npm \
- && npm install -g @anthropic-ai/claude-code@2.0.76
+# Install Claude Code using native installer
+RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV HOME="$USER_HOME"
 ENV USER="$USER_NAME"
-ENV PATH="$PATH:$USER_HOME/bin:$USER_HOME/.npm/bin"
+ENV PATH="$PATH:$USER_HOME/bin:$USER_HOME/.local/bin"
 
 ENTRYPOINT ["claude-wrapper"]
 EOF

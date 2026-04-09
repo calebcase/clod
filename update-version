@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Update version number in README.md and bin/clod from VERSION file
+# Update version number in README.md, bin/clod, and bot/cli.go from VERSION file
 
 VERSION_FILE="./VERSION"
 README_FILE="./README.md"
 CLOD_SCRIPT="./bin/clod"
+BOT_CLI="./bot/cli.go"
 
 if [[ ! -f "$VERSION_FILE" ]]; then
     echo "Error: VERSION file not found: $VERSION_FILE" >&2
@@ -19,6 +20,11 @@ fi
 
 if [[ ! -f "$CLOD_SCRIPT" ]]; then
     echo "Error: clod script not found: $CLOD_SCRIPT" >&2
+    exit 1
+fi
+
+if [[ ! -f "$BOT_CLI" ]]; then
+    echo "Error: bot cli.go not found: $BOT_CLI" >&2
     exit 1
 fi
 
@@ -86,6 +92,34 @@ with open("$CLOD_SCRIPT", 'w') as f:
     f.write(new_content)
 
 print("✓ Successfully updated version in bin/clod")
+EOF
+
+# Update bot/cli.go Version constant
+echo "Updating $BOT_CLI..."
+python3 << EOF
+import re
+import sys
+
+with open("$BOT_CLI", 'r') as f:
+    content = f.read()
+
+# Pattern to match Version constant
+pattern = r'const Version = "[0-9]+\.[0-9]+\.[0-9]+"'
+replacement = 'const Version = "$VERSION"'
+
+# Check if pattern exists
+if not re.search(pattern, content):
+    print("Warning: Could not find Version constant in bot/cli.go", file=sys.stderr)
+    sys.exit(1)
+
+# Replace the pattern
+new_content = re.sub(pattern, replacement, content)
+
+# Write back to file
+with open("$BOT_CLI", 'w') as f:
+    f.write(new_content)
+
+print("✓ Successfully updated version in bot/cli.go")
 EOF
 
 echo ""

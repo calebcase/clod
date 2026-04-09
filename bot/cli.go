@@ -10,6 +10,9 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// Version is the bot version. Update this when releasing.
+const Version = "0.7.4"
+
 type Flags struct {
 	Log struct {
 		Level  zerolog.Level `kong:"default='info',enum='trace,debug,info,warn,error,fatal,panic',env='CLOD_BOT_LOG_LEVEL'"`
@@ -27,11 +30,9 @@ type Flags struct {
 
 	AgentsPromptPath string `kong:"default='README.md',env='CLOD_BOT_AGENTS_PROMPT_PATH',help='Path to agent prompt file (relative to task dir or absolute). Empty disables.'"`
 
-	ClodTimeout time.Duration `kong:"default='30m',env='CLOD_BOT_TIMEOUT',help='Timeout for clod execution'"`
+	ClodTimeout time.Duration `kong:"default='24h',env='CLOD_BOT_TIMEOUT',help='Timeout for clod execution'"`
 
 	PermissionMode string `kong:"default='default',env='CLOD_BOT_PERMISSION_MODE',help='Claude permission mode (default, acceptEdits, bypassPermissions)'"`
-
-	ClodConcurrent bool `kong:"default='false',env='CLOD_CONCURRENT',help='Run clod in concurrent mode (creates unique runtime dirs per execution)'"`
 
 	VerboseTools []string `kong:"default='Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode',env='CLOD_BOT_VERBOSE_TOOLS',sep=',',help='Tools affected by verbosity toggle'"`
 
@@ -46,6 +47,7 @@ type CLI struct {
 
 func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	logger.Info().
+		Str("version", Version).
 		Str("agents_path", cli.AgentsPath).
 		Str("session_store", cli.SessionStorePath).
 		Int("allowed_users", len(cli.AllowedUsers)).
@@ -71,7 +73,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		Str("path", cli.SessionStorePath).
 		Msg("loaded sessions from storage")
 
-	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, cli.AgentsPromptPath, cli.ClodConcurrent, logger)
+	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, cli.AgentsPromptPath, logger)
 
 	// Create and start the bot
 	bot, err := NewBot(

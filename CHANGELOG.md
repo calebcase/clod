@@ -5,6 +5,57 @@ All notable changes to clod will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-04-08
+
+### Changed
+- **Installation method** - Migrated from npm to native Claude Code installer
+  - Uses official `curl -fsSL https://claude.ai/install.sh | bash` installer
+  - Claude Code installed to `~/.local/bin/claude` instead of `~/.npm/bin`
+  - Removed npm dependency from base Docker image
+  - Faster container builds due to smaller base image
+
+### Added
+- **Line protocol updates** - Handle upstream Claude Code protocol changes
+  - Support for `stream_event` wrapper around streaming events
+  - Handle `control_request`/`control_response` permission flow (newer protocol)
+  - Support for `content_block_start` and `content_block_delta` streaming messages
+  - Handle `message_start`, `message_delta`, `message_stop`, `content_block_stop`, and `ping` events
+  - Logging for unknown message types to aid debugging
+- **Extended thinking support** - Handle Claude's extended thinking streaming messages
+  - Support for `thinking` content blocks and `thinking_delta` events
+  - Thinking output only shown at verbosity level 1 (full mode with 💬 reaction)
+  - Thinking content excluded from silent (-1) and summary (0) verbosity modes
+- **Dual permission system** - Support both MCP-based and control message permissions
+  - Maintains compatibility with existing MCP permission flow
+  - Adds support for newer `control_request`/`control_response` protocol
+  - Automatic detection of permission type and appropriate response method
+  - Permissions saved to both `allowedTools` and `permissions.allow` for Claude compatibility
+- **Rerun message filtering** - Filter out `[rerun: ...]` control messages from user-visible output
+  - Prevents internal Claude Code control messages from appearing in Slack
+- **Verbosity help on task start** - New tasks now show verbosity level instructions
+  - Users see emoji hints (🙈 for silent, 💬 for full including thinking) when task starts
+- **Output message consolidation** - Consecutive bot outputs are edited into a single message
+  - Reduces notification noise by updating existing messages instead of posting new ones
+  - Starts a new message after 1 minute of inactivity or when message exceeds ~3500 chars
+  - Chain breaks on: user input, permission prompts, stats messages, file snippets
+
+### Removed
+- **`CLOD_CONCURRENT` config flag** - Bot now always runs in concurrent mode
+  - Each execution creates a unique runtime directory for isolation
+  - Simplifies configuration and ensures permission system works correctly
+
+### Fixed
+- **Permission prompts not showing** - Fixed permission system reliability
+  - Always enable concurrent mode so runtime paths match between bot and container
+  - Added support for control message based permissions
+  - Better error handling and logging for permission communication
+- **Permissions not persisting between task resumes** - Fixed EXIT trap overwriting saved permissions
+  - Removed wrapper script EXIT trap that copied stale config back on container exit
+  - Bot-saved permissions now correctly persist in `.clod/claude/claude.json`
+- **Streaming text not appearing in Slack** - Fixed JSON schema mismatch for `content_block_delta`
+  - Updated struct to use top-level `index` and `delta` fields matching Anthropic API format
+  - Previously used nested `content_block_delta` field which didn't match actual JSON structure
+
 ## [0.6.0] - 2025-12-17
 
 ### Added
@@ -192,6 +243,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Limited filesystem access to working directory only
 - User ID preservation for file ownership
 
+[0.7.0]: https://github.com/calebcase/clod/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/calebcase/clod/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/calebcase/clod/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/calebcase/clod/compare/v0.3.0...v0.4.0

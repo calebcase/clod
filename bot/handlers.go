@@ -18,11 +18,13 @@ import (
 
 // PendingPermission tracks a permission request waiting for user response.
 type PendingPermission struct {
-	MessageTS string // Timestamp of the permission prompt message (for updating)
-	ChannelID string
-	ThreadTS  string
-	ToolName  string         // Tool that requested permission
-	ToolInput map[string]any // Tool input parameters (for display)
+	MessageTS          string // Timestamp of the permission prompt message (for updating)
+	ChannelID          string
+	ThreadTS           string
+	ToolName           string         // Tool that requested permission
+	ToolInput          map[string]any // Tool input parameters (for display)
+	ControlRequestID   string         // Request ID for control message permissions (empty for MCP)
+	IsControlPermission bool          // True if this is a control message permission
 }
 
 // Handler processes Slack events.
@@ -43,12 +45,27 @@ type Handler struct {
 	// so consecutive summaries can be edited in-place rather than posted as new messages.
 	lastVerboseToolMsg sync.Map // key -> string (messageTS)
 
+	// lastOutputMsg tracks the most recent output message per thread for consolidation.
+	// Consecutive outputs are edited into the same message to reduce notification noise.
+	lastOutputMsg sync.Map // key -> *LastOutputMsg
+
 	defaultVerbosityLevel int
+}
+
+// LastOutputMsg tracks the last output message for consolidation.
+type LastOutputMsg struct {
+	MessageTS string    // Slack message timestamp
+	Content   string    // Current message content
+	UpdatedAt time.Time // When the message was last updated
 }
 
 const (
 	verbosityEmoji = "speech_balloon" // 💬 level 1 (full)
 	seeNoEvilEmoji = "see_no_evil"    // 🙈 level -1 (silent)
+
+	// Message consolidation settings
+	maxConsolidationAge = 1 * time.Minute // Start new message after this duration
+	maxMessageLen       = 3500            // Slack truncates around 4000, leave buffer
 )
 
 // NewHandler creates a new Handler.
@@ -167,9 +184,18 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 			if resp := parsePermissionResponse(ev.Text); resp != nil {
 				logger.Info().
 					Str("behavior", resp.Behavior).
+					Bool("is_control", perm.IsControlPermission).
 					Msg("received permission response from user (text)")
 
-				task.SendPermissionResponse(*resp)
+				if perm.IsControlPermission && perm.ControlRequestID != "" {
+					// Send control_response for control message permissions.
+					if err := task.SendControlResponse(perm.ControlRequestID, resp.Behavior, resp.Message); err != nil {
+						logger.Error().Err(err).Msg("failed to send control response")
+					}
+				} else {
+					// Send via MCP FIFO for traditional permissions.
+					task.SendPermissionResponse(*resp)
+				}
 				h.pendingPermissions.Delete(progressKey)
 
 				// Update the permission message to show it was handled
@@ -189,6 +215,8 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 
 		// Send the message as input to Claude
 		logger.Debug().Str("input", ev.Text).Msg("sending thread reply to running task")
+		// Clear output message consolidation since user sent a message.
+		h.lastOutputMsg.Delete(key(ev.Channel, threadTS))
 		if err := task.SendInput(ev.Text); err != nil {
 			logger.Error().Err(err).Msg("failed to send input to task")
 		}
@@ -217,6 +245,9 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		Logger()
 
 	logger.Info().Msg("resuming session from thread reply")
+
+	// Clear output message consolidation since user sent a message.
+	h.lastOutputMsg.Delete(key(ev.Channel, threadTS))
 
 	// Check for files attached to the message and download them to .clod-runtime/inputs.
 	slackFiles, err := h.bot.files.GetThreadReplyFiles(ev.Channel, threadTS, ev.TimeStamp)
@@ -516,6 +547,9 @@ func (h *Handler) handleNewTask(
 
 	logger.Info().Str("task_path", taskPath).Msg("starting new task")
 
+	// Clear output message consolidation for this thread.
+	h.lastOutputMsg.Delete(key(ev.Channel, threadTS))
+
 	// Check for files attached to the message and download them to .clod-runtime/inputs.
 	logger.Debug().
 		Str("channel", ev.Channel).
@@ -573,10 +607,13 @@ func (h *Handler) handleNewTask(
 		}
 	}
 
-	// Post initial status
+	// Post initial status with verbosity info
+	startMsg := fmt.Sprintf(":rocket: Starting a `%s` task...\n\n"+
+		"_Verbosity: React with 🙈 for silent, 💬 for full output (including thinking)_",
+		parsed.TaskName)
 	if _, err := h.bot.PostMessage(
 		ev.Channel,
-		fmt.Sprintf(":rocket: Starting a `%s` task...", parsed.TaskName),
+		startMsg,
 		threadTS,
 	); err != nil {
 		logger.Error().Err(err).Msg("failed to post task start message")
@@ -684,26 +721,77 @@ func (h *Handler) runClod(
 	ticker := time.NewTicker(batchInterval)
 	defer ticker.Stop()
 
-	// Function to flush the buffer.
+	// Function to flush the buffer with message consolidation.
+	threadKey := key(channelID, threadTS)
 	flushBuffer := func() {
 		if outputBuffer.Len() > 0 {
 			// Convert GitHub-flavored markdown to Slack's mrkdwn format.
-			msg := strings.TrimSpace(outputBuffer.String())
-			if msg != "" {
-				msg = ConvertMarkdownToMrkdwn(msg)
-				if _, err := h.bot.PostMessage(channelID, msg, threadTS); err != nil {
-					logger.Debug().Err(err).Msg("failed to post output message")
-				} else {
-					// Clear last verbose tool message since we posted non-verbose content.
-					h.lastVerboseToolMsg.Delete(key(channelID, threadTS))
+			newContent := strings.TrimSpace(outputBuffer.String())
+			if newContent != "" {
+				newContent = ConvertMarkdownToMrkdwn(newContent)
+
+				// Check if we can consolidate with the previous message.
+				var posted bool
+				if lastVal, ok := h.lastOutputMsg.Load(threadKey); ok {
+					last := lastVal.(*LastOutputMsg)
+					age := time.Since(last.UpdatedAt)
+
+					// Smart join: don't add separator if content already has appropriate whitespace.
+					// This preserves intentional paragraph breaks while not breaking mid-sentence output.
+					var separator string
+					if last.Content != "" && newContent != "" {
+						prevEndsWithNewline := strings.HasSuffix(last.Content, "\n")
+						newStartsWithNewline := strings.HasPrefix(newContent, "\n")
+						if !prevEndsWithNewline && !newStartsWithNewline {
+							// Neither has newline at boundary - streaming text, concatenate directly
+							separator = ""
+						}
+						// Otherwise no separator needed (one side already has the newline)
+					}
+
+					combinedLen := len(last.Content) + len(separator) + len(newContent)
+
+					// Edit existing message if: recent enough AND combined size fits
+					if age < maxConsolidationAge && combinedLen <= maxMessageLen {
+						combined := last.Content + separator + newContent
+						if err := h.bot.UpdateMessage(channelID, last.MessageTS, combined); err != nil {
+							logger.Debug().Err(err).Msg("failed to update consolidated message, posting new")
+						} else {
+							// Update tracking with new content and time.
+							last.Content = combined
+							last.UpdatedAt = time.Now()
+							posted = true
+							logger.Debug().
+								Int("combined_len", len(combined)).
+								Dur("age", age).
+								Msg("consolidated output into existing message")
+						}
+					}
+				}
+
+				// Post new message if consolidation didn't happen.
+				if !posted {
+					if msgTS, err := h.bot.PostMessage(channelID, newContent, threadTS); err != nil {
+						logger.Debug().Err(err).Msg("failed to post output message")
+					} else {
+						// Track this as the new last message.
+						h.lastOutputMsg.Store(threadKey, &LastOutputMsg{
+							MessageTS: msgTS,
+							Content:   newContent,
+							UpdatedAt: time.Now(),
+						})
+						// Clear last verbose tool message since we posted non-verbose content.
+						h.lastVerboseToolMsg.Delete(threadKey)
+					}
 				}
 			}
 			outputBuffer.Reset()
 		}
 	}
 
-	// Get permission request channel (may be nil if FIFO not available)
+	// Get permission request channels (may be nil if not available)
 	permRequests := task.PermissionRequests()
+	ctrlPermRequests := task.ControlPermissionRequests()
 
 	// Process output and wait for completion
 	for {
@@ -719,6 +807,8 @@ func (h *Handler) runClod(
 			if strings.HasPrefix(content, "__STATS__") {
 				flushBuffer() // Flush any pending output first.
 				h.postStatsMessage(channelID, threadTS, content[9:]) // Skip "__STATS__" prefix.
+				// Clear consolidation since stats message breaks the chain.
+				h.lastOutputMsg.Delete(threadKey)
 				continue
 			}
 
@@ -734,7 +824,21 @@ func (h *Handler) runClod(
 					snippetContent := parts[2]
 					h.postToolSnippet(channelID, threadTS, toolName, inputJSON, snippetContent, logger)
 				}
+				// Clear consolidation since snippet breaks the chain.
+				h.lastOutputMsg.Delete(threadKey)
 				continue
+			}
+
+			// Check for thinking message (only show at verbosity level 1).
+			if strings.HasPrefix(content, "__THINKING__") {
+				verbosityLevel := h.bot.sessions.GetVerbosityLevel(channelID, threadTS)
+				if verbosityLevel < 1 {
+					// Skip thinking output at verbosity levels -1 (silent) and 0 (summary).
+					logger.Debug().Msg("skipping thinking output (verbosity < 1)")
+					continue
+				}
+				// Strip prefix and show thinking content.
+				content = strings.TrimPrefix(content, "__THINKING__")
 			}
 
 			outputBuffer.WriteString(content)
@@ -777,11 +881,63 @@ func (h *Handler) runClod(
 					ToolInput: req.ToolInput,
 				})
 
+				// Clear consolidation since permission prompt breaks the chain.
+				h.lastOutputMsg.Delete(threadKey)
+
 				logger.Info().
 					Str("tool_name", req.ToolName).
 					Str("tool_use_id", req.ToolUseID).
 					Str("message_ts", msgTS).
-					Msg("posted permission prompt to slack, waiting for response")
+					Msg("posted permission prompt to slack, waiting for response (MCP)")
+			}
+
+		case req, ok := <-ctrlPermRequests:
+			if ok {
+				// Handle permission requests from control messages (newer protocol).
+				// Check if this permission is already allowed by saved rules.
+				if h.isPermissionAllowed(task.taskPath, req.ToolName, req.ToolInput) {
+					logger.Info().
+						Str("tool_name", req.ToolName).
+						Msg("auto-allowing control permission based on saved rule")
+					if err := task.SendControlResponse(task.pendingControlRequestID, "allow", ""); err != nil {
+						logger.Error().Err(err).Msg("failed to send auto-allow control response")
+					}
+					continue
+				}
+
+				// Post formatted permission prompt with buttons to Slack.
+				flushBuffer() // Flush any pending output first.
+				blocks := h.buildPermissionBlocks(req, progressKey)
+				msgTS, err := h.bot.PostMessageBlocks(channelID, blocks, threadTS)
+				if err != nil {
+					logger.Error().Err(err).Msg("failed to post control permission prompt")
+					// Send deny on failure to post.
+					if err := task.SendControlResponse(task.pendingControlRequestID, "deny", "Failed to prompt user"); err != nil {
+						logger.Error().Err(err).Msg("failed to send deny control response")
+					}
+					continue
+				}
+
+				// Track the pending permission with its message timestamp, tool details, and control request ID.
+				h.pendingPermissions.Store(progressKey, &PendingPermission{
+					MessageTS:           msgTS,
+					ChannelID:           channelID,
+					ThreadTS:            threadTS,
+					ToolName:            req.ToolName,
+					ToolInput:           req.ToolInput,
+					ControlRequestID:    task.pendingControlRequestID,
+					IsControlPermission: true,
+				})
+
+				// Clear consolidation since permission prompt breaks the chain.
+				h.lastOutputMsg.Delete(threadKey)
+
+				logger.Info().
+					Str("tool_name", req.ToolName).
+					Str("tool_use_id", req.ToolUseID).
+					Str("request_id", task.pendingControlRequestID).
+					Str("message_ts", msgTS).
+					Msg("posted permission prompt to slack, waiting for response (control)")
 			}
 
 		case <-ticker.C:
@@ -1099,7 +1255,7 @@ func (h *Handler) HandleBlockAction(
 	}
 	pending := pendingVal.(*PendingPermission)
 
-	// Send the response to Claude via FIFO
+	// Send the response to Claude via FIFO or control message
 	resp := PermissionResponse{Behavior: actionValue.Behavior}
 	if actionValue.Behavior == "deny" {
 		resp.Message = fmt.Sprintf("User %s denied permission", callback.User.Name)
@@ -1107,9 +1263,21 @@ func (h *Handler) HandleBlockAction(
 
 	logger.Info().
 		Str("behavior", resp.Behavior).
+		Bool("is_control", pending.IsControlPermission).
 		Msg("sending permission response from button click")
-	task.SendPermissionResponse(resp)
-	logger.Info().Msg("permission response sent to FIFO")
+
+	if pending.IsControlPermission && pending.ControlRequestID != "" {
+		// Send control_response for control message permissions.
+		if err := task.SendControlResponse(pending.ControlRequestID, resp.Behavior, resp.Message); err != nil {
+			logger.Error().Err(err).Msg("failed to send control response")
+		} else {
+			logger.Info().Msg("permission response sent via control_response")
+		}
+	} else {
+		// Send via MCP FIFO for traditional permissions.
+		task.SendPermissionResponse(resp)
+		logger.Info().Msg("permission response sent to FIFO")
+	}
 
 	// Save the permission pattern if "remember" was selected
 	if actionValue.Remember != "" && actionValue.Behavior == "allow" {
