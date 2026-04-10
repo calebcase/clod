@@ -172,8 +172,17 @@ type ControlResponse struct {
 
 // RunningTask represents a clod task that is currently executing.
 type RunningTask struct {
-	cmd                       *exec.Cmd
-	pty                       *os.File
+	cmd *exec.Cmd
+	// pty is the master side of a PTY whose slave is wired to the child's
+	// stdout. We never write to it; stream-json output flows out of it.
+	pty *os.File
+	// stdin is a pipe whose reader end is the child's stdin. Writes on this
+	// pipe go straight through docker (-i, no -t) into claude's stream-json
+	// reader inside the container. We intentionally do NOT use the PTY for
+	// stdin because the kernel line discipline (canonical mode, echo, the
+	// MAX_CANON line length cap, ^C/^D interpretation) has no place in a
+	// stream-json transport.
+	stdin                     *os.File
 	output                    chan string
 	done                      chan *Result
 	cancel                    context.CancelFunc
@@ -183,6 +192,15 @@ type RunningTask struct {
 	permissionFIFO            *PermissionFIFO
 	controlPermissionRequests chan PermissionRequest
 	pendingControlRequestID   string
+}
+
+// closeStdin closes the bot's end of the child's stdin pipe. It's safe to
+// call multiple times.
+func (t *RunningTask) closeStdin() {
+	if t.stdin != nil {
+		_ = t.stdin.Close()
+		t.stdin = nil
+	}
 }
 
 // InputMessage represents a user input message in stream-json format.
@@ -223,10 +241,11 @@ type ImageData struct {
 	Data      []byte // Raw image bytes
 }
 
-// SendInputWithImages writes text and optional images to the running task's PTY.
+// SendInputWithImages writes a stream-json input message to the child's stdin
+// pipe.
 func (t *RunningTask) SendInputWithImages(text string, images []ImageData) error {
-	if t.pty == nil {
-		return oops.New("pty is closed")
+	if t.stdin == nil {
+		return oops.New("stdin is closed")
 	}
 
 	// Build content blocks - images first, then text.
@@ -263,9 +282,7 @@ func (t *RunningTask) SendInputWithImages(text string, images []ImageData) error
 		Int("json_len", len(data)).
 		Msg("sending input to claude")
 
-	// Write JSON line to PTY
-	_, err = t.pty.Write(append(data, '\n'))
-	if err != nil {
+	if _, err := t.stdin.Write(append(data, '\n')); err != nil {
 		return oops.Trace(err)
 	}
 	return nil
@@ -299,8 +316,8 @@ func (t *RunningTask) ControlPermissionRequests() <-chan PermissionRequest {
 
 // SendControlResponse sends a control_response for permission requests.
 func (t *RunningTask) SendControlResponse(requestID, behavior, message string) error {
-	if t.pty == nil {
-		return oops.New("pty is closed")
+	if t.stdin == nil {
+		return oops.New("stdin is closed")
 	}
 
 	resp := ControlResponse{
@@ -320,7 +337,7 @@ func (t *RunningTask) SendControlResponse(requestID, behavior, message string) e
 		Str("behavior", behavior).
 		Msg("sending control_response")
 
-	_, err = t.pty.Write(append(data, '\n'))
+	_, err = t.stdin.Write(append(data, '\n'))
 	return oops.Trace(err)
 }
 
@@ -465,8 +482,8 @@ func (r *Runner) Start(
 
 	// Build command arguments.
 	// Use stream-json for both input and output to enable bidirectional communication.
-	// Note: We don't pass the prompt as a CLI arg - instead we send it via stream-json
-	// input so we can include images inline.
+	// The initial prompt is sent via stream-json input after the process starts
+	// (not as a CLI arg) since --input-format stream-json requires stdin input.
 	args := []string{
 		"-p",
 		"--output-format",
@@ -513,9 +530,6 @@ func (r *Runner) Start(
 	if sessionID != "" {
 		args = append(args, "--resume", sessionID)
 	}
-	// Pass the text prompt as CLI argument.
-	// Images (if any) will be sent via stream-json as a follow-up message.
-	args = append(args, prompt)
 
 	r.logger.Debug().
 		Str("task_path", taskPath).
@@ -545,22 +559,106 @@ func (r *Runner) Start(
 		Bool("CLOD_NONINTERACTIVE", true).
 		Msg("setting environment variables for clod run")
 
-	// Set up process group for clean termination
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true,
-	}
-
-	// Start command with PTY
-	ptmx, err := pty.Start(cmd)
+	// Wire up the child's three standard streams with three different
+	// transports, each chosen for its role:
+	//
+	//   stdin  — plain pipe. The bot writes stream-json messages on this,
+	//            which flow through `docker run -i` straight into claude's
+	//            stream-json reader. A PTY is wrong here: its line discipline
+	//            would echo input, enforce MAX_CANON line length, and
+	//            interpret ^C/^D — none of that belongs in a JSON transport.
+	//
+	//   stdout — PTY slave. This is claude's stream-json output channel. A
+	//            TTY on stdout keeps any TTY-sniffing tooling inside the
+	//            wrapper (ssh-add, tput, etc.) happy AND keeps docker's
+	//            buildkit from flipping into some weird "I have no terminal"
+	//            fallback.
+	//
+	//   stderr — plain pipe. All wrapper chatter (upgrade banners, docker
+	//            build progress, [clod] SSH agent lifecycle) lands here and
+	//            gets logged at debug. Keeping it off the stdout PTY is what
+	//            lets stdout stay pure stream-json.
+	//
+	// pty.Start() would have bound stdin and stdout to the same PTY and
+	// assumed stderr too, so we do the setup manually.
+	ptmx, tty, err := pty.Open()
 	if err != nil {
 		cancel()
 		permFIFO.Close()
 		return nil, oops.Trace(err)
 	}
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		cancel()
+		_ = ptmx.Close()
+		_ = tty.Close()
+		permFIFO.Close()
+		return nil, oops.Trace(err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		cancel()
+		_ = ptmx.Close()
+		_ = tty.Close()
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		permFIFO.Close()
+		return nil, oops.Trace(err)
+	}
+
+	cmd.Stdin = stdinR
+	cmd.Stdout = tty
+	cmd.Stderr = stderrW
+	// Setsid puts the child in its own session (clean signal group).
+	// Setctty + Ctty=1 makes the stdout tty the child's controlling terminal
+	// — we can't use the default Ctty=0 because stdin is a pipe, not a TTY.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+		Ctty:    1,
+	}
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		_ = ptmx.Close()
+		_ = tty.Close()
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
+		permFIFO.Close()
+		return nil, oops.Trace(err)
+	}
+
+	// The child inherited its own copies of tty, stdinR, and stderrW. Close
+	// our copies so EOF propagates correctly when the child exits and so we
+	// don't leak fds.
+	_ = tty.Close()
+	_ = stdinR.Close()
+	_ = stderrW.Close()
+
+	// Drain stderr in the background. These lines are diagnostics from the
+	// wrapper — never stream-json — so we just log them.
+	go func() {
+		defer func() { _ = stderrR.Close() }()
+		scanner := bufio.NewScanner(stderrR)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			r.logger.Debug().
+				Str("stderr", line).
+				Msg("clod wrapper stderr")
+		}
+	}()
 
 	task := &RunningTask{
 		cmd:                       cmd,
 		pty:                       ptmx,
+		stdin:                     stdinW,
 		output:                    make(chan string, 100),
 		done:                      make(chan *Result, 1),
 		cancel:                    cancel,
@@ -574,11 +672,30 @@ func (r *Runner) Start(
 	// Start permission FIFO listener
 	permFIFO.Start(runCtx)
 
+	// Send the initial prompt now. It's safe to push it into the stdin pipe
+	// before claude exists — kernel pipe buffer holds up to 64KiB, and once
+	// `docker run -i` starts forwarding stdin into the container, claude
+	// drains it. Deferring until we see claude's system init would deadlock:
+	// in `-p --input-format stream-json` claude does NOT emit anything
+	// before it has read its first stream-json message, so bot-waits-for-init
+	// + claude-waits-for-input is a mutual stare-off.
+	if prompt != "" {
+		if err := task.SendInput(prompt); err != nil {
+			cancel()
+			_ = ptmx.Close()
+			_ = stdinW.Close()
+			_ = stderrR.Close()
+			permFIFO.Close()
+			return nil, oops.Trace(err)
+		}
+	}
+
 	// Read from PTY and parse stream-json in background
 	go func() {
 		defer close(task.output)
 		defer close(task.done)
 		defer func() { _ = ptmx.Close() }()
+		defer task.closeStdin()
 		defer permFIFO.Close()
 
 		var outputBuilder strings.Builder
@@ -592,6 +709,16 @@ func (r *Runner) Start(
 		// Increase buffer size for long lines
 		buf := make([]byte, 0, 64*1024)
 		scanner.Buffer(buf, 1024*1024)
+
+		// handshaken flips to true once we parse our first valid stream-json
+		// message (normally claude's system init). Before the handshake we
+		// silently tolerate non-JSON on stdout — the wrapper *shouldn't* be
+		// writing there anymore, but we stay permissive in case any stray
+		// bytes leak through (old .clod scripts on disk, PTY echo of our own
+		// input, etc.). After the handshake, stdout is supposed to be pure
+		// stream-json, so anything non-JSON is a real protocol violation and
+		// gets logged loudly.
+		handshaken := false
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -610,12 +737,20 @@ func (r *Runner) Start(
 
 			var msg StreamMessage
 			if err := json.Unmarshal([]byte(line), &msg); err != nil {
-				r.logger.Debug().
-					Str("line", line).
-					Err(err).
-					Msg("failed to parse stream-json line")
+				if handshaken {
+					r.logger.Warn().
+						Str("line", line).
+						Err(err).
+						Msg("non-JSON line on stdout after stream-json handshake (protocol violation)")
+				} else {
+					r.logger.Debug().
+						Str("line", line).
+						Err(err).
+						Msg("pre-handshake non-JSON line on stdout, skipping")
+				}
 				continue
 			}
+			handshaken = true
 
 			// Extract session ID if present
 			if msg.SessionID != "" && task.sessionID == "" {

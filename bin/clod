@@ -1,7 +1,7 @@
 #!/bin/env bash
 set -euo pipefail
 
-CLOD_VERSION="0.7.5"
+CLOD_VERSION="0.7.9"
 
 reinit=${CLOD_REINIT:-false}
 noninteractive=${CLOD_NONINTERACTIVE:-false}
@@ -213,7 +213,13 @@ fi
 
 cat .clod/system/Dockerfile_base .clod/Dockerfile_project .clod/system/Dockerfile_wrapper .clod/Dockerfile_user > .clod/system/Dockerfile
 
+# Everything below is build diagnostics — it must NEVER land on stdout,
+# because our caller (e.g. the Slack bot) uses stdout as a strict stream-json
+# channel for claude's output. We redirect docker's stdout to stderr, and use
+# --progress=plain so buildkit emits one line per step instead of ANSI cursor
+# repainting (which looks like garbled binary when captured line-by-line).
 exec docker build \
+  --progress=plain \
   --build-arg "USER_ID=$user_id" \
   --build-arg "USER_NAME=$user_name" \
   --build-arg "GROUP_ID=$group_id" \
@@ -221,7 +227,7 @@ exec docker build \
   --build-arg "USER_HOME=$user_home" \
   -t "clod-${name,,}-$id" \
   -f .clod/system/Dockerfile \
-  .
+  . >&2
 EOF
   chmod u+x .clod/system/build
 
@@ -246,7 +252,13 @@ if [[ -v CLOD_ENTRYPOINT ]]; then
   entrypoint="--entrypoint \$CLOD_ENTRYPOINT"
 fi
 
-if [[ -t 0 ]]; then
+# Always attach stdin (-i) so callers can pipe in stream-json input.
+# Only allocate a container TTY (-t) when actually running interactively;
+# noninteractive callers (e.g. the Slack bot using --input-format stream-json)
+# must NOT have a TTY on claude's stdin, or claude errors with
+# "Input must be provided either through stdin or as a prompt argument".
+tty_flag="-i"
+if [[ -t 0 ]] && [[ "\${CLOD_NONINTERACTIVE:-false}" != "true" ]]; then
   tty_flag="-it"
 fi
 
@@ -456,7 +468,7 @@ EOF
 migrate_to_system_dir() {
   # Check if migration needed (system dir doesn't exist)
   if [[ ! -d .clod/system ]]; then
-    printf 'Migrating .clod structure to v%s...\n' "$CLOD_VERSION"
+    printf 'Migrating .clod structure to v%s...\n' "$CLOD_VERSION" >&2
 
     # Create system directory
     mkdir -p .clod/system
@@ -471,7 +483,7 @@ migrate_to_system_dir() {
     [[ -f .clod/.hash ]] && mv .clod/.hash .clod/system/hash
     [[ -f .clod/hash ]] && mv .clod/hash .clod/system/
 
-    printf 'Migration complete.\n'
+    printf 'Migration complete.\n' >&2
   fi
 }
 
@@ -494,7 +506,7 @@ if [[ ! -d .clod ]]; then
 elif [[ $reinit == 'true' ]]; then
   needs_init=true
 elif changes_detected; then
-  printf 'Detected changes in .clod files, reinitializing...\n'
+  printf 'Detected changes in .clod files, reinitializing...\n' >&2
   needs_upgrade=true
 elif [[ ! -f .clod/system/version ]]; then
   needs_upgrade=true
@@ -510,7 +522,7 @@ if [[ $needs_init == 'true' ]]; then
   read -p "Initialize the .clod directory? [Y/n] " yn
   case $yn in
     [Yy]* | '')
-      printf 'Initializing clod v%s...\n' "$CLOD_VERSION"
+      printf 'Initializing clod v%s...\n' "$CLOD_VERSION" >&2
       initialize
       ;;
     *)
@@ -519,7 +531,7 @@ if [[ $needs_init == 'true' ]]; then
   esac
 elif [[ $needs_upgrade == 'true' ]]; then
   installed_version=${installed_version:-"unknown"}
-  printf 'Upgrading clod from v%s to v%s...\n' "$installed_version" "$CLOD_VERSION"
+  printf 'Upgrading clod from v%s to v%s...\n' "$installed_version" "$CLOD_VERSION" >&2
   initialize
 fi
 
