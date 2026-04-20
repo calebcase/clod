@@ -15,16 +15,26 @@ import (
 	"github.com/rs/zerolog"
 )
 
-//go:embed permission_mcp.py
-var permissionMCPScript []byte
+// permBridgeBinary is a statically-linked linux/amd64 build of
+// bot/permbridge that claude spawns inside the container for the
+// permission-prompt MCP server. Embedding it means we don't have to
+// require python3 (or any interpreter) in the user's chosen base image —
+// the bot writes the bytes into the per-task runtime dir at startup and
+// points claude's --permission-prompt-tool at that path. Rebuild via
+// bot/permbridge/build.sh whenever the bridge source changes.
+//
+//go:embed permbridge/permbridge.linux-amd64
+var permBridgeBinary []byte
 
 const (
 	// FIFORequestName is the name of the FIFO for permission requests (hook writes, bot reads)
 	FIFORequestName = "permission_request.fifo"
 	// FIFOResponseName is the name of the FIFO for permission responses (bot writes, hook reads)
 	FIFOResponseName = "permission_response.fifo"
-	// MCPScriptName is the name of the MCP server script
-	MCPScriptName = "permission_mcp.py"
+	// MCPBridgeName is the filename the embedded bridge binary is written as
+	// inside the runtime directory. The container sees it at the same path
+	// (the runtime dir is bind-mounted in with its host path).
+	MCPBridgeName = "permbridge"
 	// MCPConfigName is the name of the MCP config file
 	MCPConfigName = "mcp_config.json"
 )
@@ -113,9 +123,17 @@ func NewPermissionFIFO(taskPath string, runtimeSuffix string, agentsPromptPath s
 	_ = os.Remove(requestPath) // Ignore error if file doesn't exist
 	_ = os.Remove(responsePath) // Ignore error if file doesn't exist
 
-	// Write the MCP server script to the runtime directory
-	mcpPath := filepath.Join(runtimeDir, MCPScriptName)
-	if err := os.WriteFile(mcpPath, permissionMCPScript, 0755); err != nil {
+	// Write the MCP bridge binary to the runtime directory. The runtime
+	// dir is bind-mounted into the container at the same absolute path, so
+	// the container sees the binary at the path we write. The Python
+	// version of this bridge was embedded at install time; the Go
+	// replacement is a static linux/amd64 build so we can drop the python3
+	// dependency from the user's base image.
+	mcpPath := filepath.Join(runtimeDir, MCPBridgeName)
+	if len(permBridgeBinary) == 0 {
+		return nil, oops.New("embedded permbridge binary is empty; rebuild via bot/permbridge/build.sh")
+	}
+	if err := os.WriteFile(mcpPath, permBridgeBinary, 0o755); err != nil {
 		return nil, oops.Trace(err)
 	}
 
@@ -302,9 +320,11 @@ func (p *PermissionFIFO) AgentPromptPath() string {
 	return ""
 }
 
-// MCPScriptPath returns the path to the MCP server script.
+// MCPScriptPath returns the path to the in-container permission bridge
+// executable. (Name kept for historical reasons; the bridge is now a Go
+// binary written by NewPermissionFIFO.)
 func (p *PermissionFIFO) MCPScriptPath() string {
-	return filepath.Join(filepath.Dir(p.requestPath), MCPScriptName)
+	return filepath.Join(filepath.Dir(p.requestPath), MCPBridgeName)
 }
 
 // MCPConfigPath returns the path to the MCP config file.
@@ -318,12 +338,15 @@ func (p *PermissionFIFO) CreateMCPConfig() (configPath string, toolName string, 
 	configPath = p.MCPConfigPath()
 	mcpScript := p.MCPScriptPath()
 
-	// MCP server config
+	// MCP server config — claude spawns the bridge binary directly.
+	// Running the binary as `command` (no interpreter) is the whole
+	// point of replacing the Python version: no host/container package
+	// dependency, works on any linux base image that can exec an ELF.
 	config := map[string]interface{}{
 		"mcpServers": map[string]interface{}{
 			"permission": map[string]interface{}{
-				"command": "python3",
-				"args":    []string{mcpScript},
+				"command": mcpScript,
+				"args":    []string{},
 			},
 		},
 	}

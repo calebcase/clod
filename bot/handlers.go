@@ -48,6 +48,15 @@ type Handler struct {
 	// key (progressKey) -> *askUserQuestionState
 	askQuestionStates sync.Map
 
+	// Track in-flight init prompts (setup dialogs for tasks whose
+	// directory or .clod/ is missing). key (progressKey) -> *pendingInit
+	pendingInits sync.Map
+
+	// Track the per-thread rolling progress message used to surface docker
+	// build + SSH agent lines while clod boots. key (progressKey) ->
+	// *progressMsg.
+	progressMessages sync.Map
+
 	// Tools affected by verbosity toggle (controlled by VERBOSE_TOOLS env var)
 	verboseTools map[string]bool
 
@@ -72,6 +81,16 @@ type LastOutputMsg struct {
 	MessageTS string    // Slack message timestamp
 	Content   string    // Current message content
 	UpdatedAt time.Time // When the message was last updated
+}
+
+// progressMsg tracks a rolling "container is being prepared" message so
+// clod wrapper / docker build activity is visible during the minute+
+// silence between task start and the first claude output.
+type progressMsg struct {
+	MessageTS string
+	// Lines is the tail of recent progress lines. We keep only the last
+	// few so the message doesn't grow unbounded on long builds.
+	Lines []string
 }
 
 // pendingAmbiguous tracks an outstanding "ambiguous response" prompt — the
@@ -672,9 +691,14 @@ func (h *Handler) handleNewTask(
 		Str("instructions", parsed.Instructions).
 		Logger()
 
-	// Look up the task
+	// Look up the task. If discovery didn't find it, check whether the dir
+	// simply doesn't exist yet or exists but lacks `.clod/`; either case
+	// gets an interactive setup prompt rather than a "unknown task" error.
 	taskPath, err := h.bot.tasks.Get(parsed.TaskName)
 	if err != nil {
+		if h.maybePromptInit(ev, threadTS, parsed, logger) {
+			return
+		}
 		msg := fmt.Sprintf(
 			"Unknown task: `%s`\n\n%s",
 			parsed.TaskName,
@@ -804,6 +828,105 @@ func (h *Handler) handleNewTask(
 		threadTS,
 		logger,
 	)
+}
+
+// safeTaskNamePattern enforces a conservative set of characters for task
+// names we're willing to materialize on disk. Anything else is treated as
+// a malformed mention and falls through to the normal "unknown task" error.
+var safeTaskNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
+
+// maybePromptInit posts an interactive setup prompt when the user mentions a
+// task whose directory is missing or lacks `.clod/`. Returns true iff a
+// prompt was posted and the caller should stop processing. Returns false to
+// let the caller fall back to the stock "unknown task" error.
+func (h *Handler) maybePromptInit(
+	ev *slackevents.AppMentionEvent,
+	threadTS string,
+	parsed *ParsedMention,
+	logger zerolog.Logger,
+) bool {
+	if !safeTaskNamePattern.MatchString(parsed.TaskName) {
+		return false
+	}
+	base := h.bot.tasks.BasePath()
+	if base == "" {
+		return false
+	}
+
+	taskPath := filepath.Join(base, parsed.TaskName)
+
+	// Distinguish "dir doesn't exist" from "dir exists but uninitialized".
+	var createDir bool
+	info, err := os.Stat(taskPath)
+	switch {
+	case os.IsNotExist(err):
+		createDir = true
+	case err != nil:
+		logger.Warn().Err(err).Msg("stat of task path failed; not offering init")
+		return false
+	case !info.IsDir():
+		logger.Warn().Str("path", taskPath).Msg("task path exists but isn't a directory; not offering init")
+		return false
+	default:
+		// Directory exists. If `.clod/system/run` is present we should NOT
+		// be here (discovery would have registered the task) — defensive.
+		if _, err := os.Stat(filepath.Join(taskPath, ".clod", "system", "run")); err == nil {
+			return false
+		}
+		createDir = false
+	}
+
+	progressKey := key(ev.Channel, threadTS)
+	// If an init prompt is already pending for this thread, skip — don't
+	// stack prompts.
+	if _, already := h.pendingInits.Load(progressKey); already {
+		logger.Debug().Msg("init prompt already pending for this thread")
+		return true
+	}
+
+	packages := initPackageSuggestions(base, parsed.TaskName)
+	// Preselect the baseline defaults (by index) so one click gives a
+	// reasonable setup.
+	defaultsSet := map[string]bool{}
+	for _, p := range defaultAptPackages {
+		defaultsSet[p] = true
+	}
+	var selPkgs []string
+	for i, p := range packages {
+		if defaultsSet[p] {
+			selPkgs = append(selPkgs, fmt.Sprintf("%d", i))
+		}
+	}
+
+	pi := &pendingInit{
+		ChannelID:    ev.Channel,
+		ThreadTS:     threadTS,
+		TaskName:     parsed.TaskName,
+		TaskPath:     taskPath,
+		CreateDir:    createDir,
+		Instructions: parsed.Instructions,
+		UserID:       ev.User,
+		MentionTS:    ev.TimeStamp,
+		Packages:     packages,
+		SelImage:     initImageOptions[0].Value,
+		SelSSH:       initSSHOptions[0].Value,
+		SelPackages:  selPkgs,
+	}
+
+	blocks := buildInitPromptBlocks(pi, progressKey)
+	msgTS, err := h.bot.PostMessageBlocks(ev.Channel, blocks, threadTS)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to post init prompt")
+		return false
+	}
+	pi.MessageTS = msgTS
+	h.pendingInits.Store(progressKey, pi)
+	logger.Info().
+		Bool("create_dir", createDir).
+		Str("task_path", taskPath).
+		Str("message_ts", msgTS).
+		Msg("posted task init prompt")
+	return true
 }
 
 // handleContinuation processes a continuation in an existing thread.
@@ -1024,8 +1147,19 @@ func (h *Handler) runClod(
 				goto done
 			}
 
+			// Surface wrapper/docker progress while the container is
+			// being prepared. Update a single rolling message so the user
+			// sees build steps happening instead of ~90s of silence on a
+			// fresh task.
+			if strings.HasPrefix(content, "__PROGRESS__") {
+				line := strings.TrimPrefix(content, "__PROGRESS__")
+				h.updateProgressMessage(channelID, threadTS, line, logger)
+				continue
+			}
+
 			// Check for special stats message.
 			if strings.HasPrefix(content, "__STATS__") {
+				h.clearProgressMessage(channelID, threadTS, logger)
 				flushBuffer() // Flush any pending output first.
 				h.postStatsMessage(channelID, threadTS, content[9:]) // Skip "__STATS__" prefix.
 				// Clear consolidation since stats message breaks the chain.
@@ -1035,6 +1169,7 @@ func (h *Handler) runClod(
 
 			// Check for snippet message (tool output to upload as collapsible file).
 			if strings.HasPrefix(content, "__SNIPPET__") {
+				h.clearProgressMessage(channelID, threadTS, logger)
 				flushBuffer() // Flush any pending output first.
 				// Format: __SNIPPET__toolName\x00inputJSON\x00content
 				payload := content[11:] // Skip "__SNIPPET__" prefix.
@@ -1061,6 +1196,10 @@ func (h *Handler) runClod(
 				// Strip prefix and show thinking content.
 				content = strings.TrimPrefix(content, "__THINKING__")
 			}
+
+			// Real claude output arrived — the rolling "preparing
+			// environment" message has served its purpose; finalize it.
+			h.clearProgressMessage(channelID, threadTS, logger)
 
 			outputBuffer.WriteString(content)
 
@@ -1603,13 +1742,22 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "askq_checkbox"
 	isAskQuestionFinal := action.ActionID == "askq_submit" ||
 		action.ActionID == "askq_cancel"
-	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal {
+	isInitSelect := action.ActionID == "init_image" ||
+		action.ActionID == "init_ssh" ||
+		action.ActionID == "init_packages"
+	isInitFinal := action.ActionID == "init_create" ||
+		action.ActionID == "init_cancel"
+	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal {
 		logger.Debug().Msg("ignoring non-permission action")
 		return
 	}
 
 	if isAskQuestionSelect {
 		h.handleAskQuestionSelect(callback, action, logger)
+		return
+	}
+	if isInitSelect {
+		h.handleInitSelect(callback, action, logger)
 		return
 	}
 
@@ -1634,6 +1782,11 @@ func (h *Handler) HandleBlockAction(
 
 	if isAskQuestionFinal {
 		h.handleAskQuestionFinal(callback, action, actionValue, logger)
+		return
+	}
+
+	if isInitFinal {
+		h.handleInitFinal(ctx, callback, action, actionValue, logger)
 		return
 	}
 
@@ -1764,6 +1917,250 @@ func (h *Handler) handleAskQuestionSelect(
 		Int("q_idx", qIdx).
 		Strs("selections", state.Selections[qIdx]).
 		Msg("recorded askq selection")
+}
+
+// updateProgressMessage surfaces a wrapper/docker-build progress line to
+// Slack as a single rolling message in the thread. The message shows the
+// last few lines so the user can see progress without scroll noise. First
+// call posts the message; subsequent calls edit it in place.
+func (h *Handler) updateProgressMessage(channelID, threadTS, line string, logger zerolog.Logger) {
+	const maxLines = 6
+	k := key(channelID, threadTS)
+	val, _ := h.progressMessages.LoadOrStore(k, &progressMsg{})
+	pm := val.(*progressMsg)
+
+	// Trim long lines so a single docker step with a huge RUN doesn't
+	// blow past Slack's per-message limits.
+	const maxLineLen = 300
+	if len(line) > maxLineLen {
+		line = line[:maxLineLen-1] + "…"
+	}
+	pm.Lines = append(pm.Lines, line)
+	if len(pm.Lines) > maxLines {
+		pm.Lines = pm.Lines[len(pm.Lines)-maxLines:]
+	}
+
+	body := ":hourglass_flowing_sand: *Preparing environment*\n```\n" +
+		strings.Join(pm.Lines, "\n") + "\n```"
+
+	if pm.MessageTS == "" {
+		ts, err := h.bot.PostMessage(channelID, body, threadTS)
+		if err != nil {
+			logger.Debug().Err(err).Msg("failed to post progress message")
+			return
+		}
+		pm.MessageTS = ts
+		return
+	}
+	if err := h.bot.UpdateMessage(channelID, pm.MessageTS, body); err != nil {
+		logger.Debug().Err(err).Msg("failed to update progress message")
+	}
+}
+
+// clearProgressMessage finalizes the rolling progress message once real
+// claude output arrives, so the "Preparing environment" status stops
+// competing with streamed content. We leave the final line history in
+// place (with a ":white_check_mark:") as a breadcrumb rather than deleting
+// it.
+func (h *Handler) clearProgressMessage(channelID, threadTS string, logger zerolog.Logger) {
+	k := key(channelID, threadTS)
+	val, ok := h.progressMessages.LoadAndDelete(k)
+	if !ok {
+		return
+	}
+	pm := val.(*progressMsg)
+	if pm.MessageTS == "" {
+		return
+	}
+	body := ":white_check_mark: *Environment ready*\n```\n" +
+		strings.Join(pm.Lines, "\n") + "\n```"
+	if err := h.bot.UpdateMessage(channelID, pm.MessageTS, body); err != nil {
+		logger.Debug().Err(err).Msg("failed to finalize progress message")
+	}
+}
+
+// handleInitSelect records an image/ssh/packages change on an outstanding
+// init prompt. State is keyed by the prompt's Slack MessageTS; Slack doesn't
+// round-trip our thread key on radio/checkbox events the way it does with
+// button values.
+func (h *Handler) handleInitSelect(
+	callback *slack.InteractionCallback,
+	action *slack.BlockAction,
+	logger zerolog.Logger,
+) {
+	msgTS := callback.Container.MessageTs
+	var state *pendingInit
+	h.pendingInits.Range(func(k, v any) bool {
+		s := v.(*pendingInit)
+		if s.MessageTS == msgTS {
+			state = s
+			return false
+		}
+		return true
+	})
+	if state == nil {
+		logger.Debug().Str("message_ts", msgTS).Msg("no pending init for this message; prompt may be stale")
+		return
+	}
+
+	switch action.ActionID {
+	case "init_image":
+		if action.SelectedOption.Value != "" {
+			state.SelImage = action.SelectedOption.Value
+		}
+	case "init_ssh":
+		if action.SelectedOption.Value != "" {
+			state.SelSSH = action.SelectedOption.Value
+		}
+	case "init_packages":
+		picks := make([]string, 0, len(action.SelectedOptions))
+		for _, opt := range action.SelectedOptions {
+			picks = append(picks, opt.Value)
+		}
+		state.SelPackages = picks
+	}
+	logger.Debug().
+		Str("action_id", action.ActionID).
+		Str("image", state.SelImage).
+		Str("ssh", state.SelSSH).
+		Strs("packages", state.SelPackages).
+		Msg("recorded init selection")
+}
+
+// handleInitFinal handles Create/Cancel clicks on the init prompt. On Create
+// it materializes `.clod/` with the chosen config, refreshes the task
+// registry so the new task is discoverable, updates the prompt message, and
+// kicks off the originally-requested task.
+func (h *Handler) handleInitFinal(
+	ctx context.Context,
+	callback *slack.InteractionCallback,
+	action *slack.BlockAction,
+	actionValue PermissionActionValue,
+	logger zerolog.Logger,
+) {
+	stateVal, ok := h.pendingInits.LoadAndDelete(actionValue.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no pending init prompt found; button is stale")
+		if err := h.bot.UpdateMessage(
+			callback.Channel.ID, callback.Message.Timestamp,
+			":warning: This init prompt is no longer active.",
+		); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale init message")
+		}
+		return
+	}
+	state := stateVal.(*pendingInit)
+
+	if action.ActionID == "init_cancel" {
+		outcome := fmt.Sprintf(":x: Setup cancelled by <@%s>.", callback.User.ID)
+		if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+			logger.Error().Err(err).Msg("failed to update cancelled init message")
+		}
+		return
+	}
+
+	// Materialize the task.
+	var chosenPkgs []string
+	for _, idxStr := range state.SelPackages {
+		var i int
+		if _, err := fmt.Sscanf(idxStr, "%d", &i); err != nil {
+			continue
+		}
+		if i < 0 || i >= len(state.Packages) {
+			continue
+		}
+		chosenPkgs = append(chosenPkgs, state.Packages[i])
+	}
+
+	if err := writeInitFiles(state, state.SelImage, state.SelSSH, chosenPkgs); err != nil {
+		logger.Error().Err(err).Msg("failed to write init files")
+		msg := fmt.Sprintf(":x: Couldn't create the task setup: %v", err)
+		if updErr := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, msg); updErr != nil {
+			logger.Error().Err(updErr).Msg("failed to update init prompt after write error")
+		}
+		return
+	}
+
+	// Refresh the registry so the new task is visible for subsequent
+	// discovery. Registry.Refresh requires `.clod/system/run` to exist,
+	// which it doesn't yet — clod generates that on first invocation. We
+	// bypass discovery for this one call by manually constructing the
+	// task path and invoking runClod directly.
+	if err := h.bot.tasks.Refresh(); err != nil {
+		logger.Warn().Err(err).Msg("failed to refresh task registry after init")
+	}
+
+	// Update the prompt with the outcome.
+	var pkgLine string
+	if len(chosenPkgs) > 0 {
+		pkgLine = fmt.Sprintf("\n• Packages: `%s`", strings.Join(chosenPkgs, ", "))
+	}
+	outcome := fmt.Sprintf(
+		":white_check_mark: *Task `%s` initialized* by <@%s>\n• Image: `%s`\n• SSH: `%s`%s\n_Starting the task now…_",
+		state.TaskName, callback.User.ID, state.SelImage, state.SelSSH, pkgLine,
+	)
+	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+		logger.Error().Err(err).Msg("failed to update init prompt after success")
+	}
+
+	// Kick off the originally-requested task.
+	h.startTaskAfterInit(ctx, state, logger)
+}
+
+// startTaskAfterInit posts the normal "Starting a task" message, anchors the
+// model reaction on the user's mention, and runs clod with the instructions
+// the user originally sent. Mirrors the tail of handleNewTask (post-registry
+// lookup).
+func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger zerolog.Logger) {
+	startMsg := fmt.Sprintf(":rocket: Starting a `%s` task...\n\n"+
+		"_Verbosity: React with 🙈 for silent, 💬 for full output (including thinking)_\n"+
+		"_Model: 🎼 Opus / 📜 Sonnet / 🌸 Haiku_",
+		p.TaskName)
+	if _, err := h.bot.PostMessage(p.ChannelID, startMsg, p.ThreadTS); err != nil {
+		logger.Error().Err(err).Msg("failed to post task start message after init")
+	}
+
+	initialModel := h.bot.sessions.GetModel(p.ChannelID, p.ThreadTS)
+	if initialModel == "" {
+		initialModel = h.defaultModel
+	}
+	if initialModel == "" {
+		initialModel = fallbackModel
+	}
+	session := h.bot.sessions.Get(p.ChannelID, p.ThreadTS)
+	if session == nil {
+		session = &SessionMapping{
+			ChannelID: p.ChannelID,
+			ThreadTS:  p.ThreadTS,
+			TaskName:  p.TaskName,
+			TaskPath:  p.TaskPath,
+			UserID:    p.UserID,
+			CreatedAt: time.Now(),
+		}
+	}
+	session.ReactionAnchorTS = p.MentionTS
+	session.Model = initialModel
+	session.TaskPath = p.TaskPath
+	session.TaskName = p.TaskName
+	h.bot.sessions.Set(session)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Error().Err(err).Msg("failed to save session after init")
+	}
+	if err := h.bot.AddReaction(p.ChannelID, p.MentionTS, emojiForModel(initialModel)); err != nil {
+		logger.Debug().Err(err).Msg("failed to add model reaction after init")
+	}
+
+	h.runClod(
+		ctx,
+		p.ChannelID,
+		p.UserID,
+		p.TaskPath,
+		p.TaskName,
+		p.Instructions,
+		"",
+		p.ThreadTS,
+		logger,
+	)
 }
 
 // handleAskQuestionFinal resolves an AskUserQuestion prompt on Submit or

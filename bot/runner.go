@@ -24,6 +24,17 @@ import (
 // Matches both "[rerun: b1]" (with space) and "[rerun:b1]" (without space).
 var rerunPattern = regexp.MustCompile(`\[rerun:\s*[^\]]+\]\s*`)
 
+// progressStderrPattern matches stderr lines worth surfacing to the user as
+// "something is happening" progress updates while the container/image is
+// being prepared. Matches:
+//   - lines prefixed with "[clod]" (wrapper lifecycle: SSH agent, errors)
+//   - docker buildkit step markers like "#12 [wrapper 5/5] RUN ..." or
+//     "#12 DONE 0.1s"
+//
+// Cache-hit lines ("#N CACHED") and low-signal exporter chatter are skipped
+// to keep the progress post readable.
+var progressStderrPattern = regexp.MustCompile(`^(\[clod\]|#\d+ (\[|DONE))`)
+
 // Runner executes clod processes.
 type Runner struct {
 	timeout          time.Duration
@@ -680,6 +691,15 @@ func (r *Runner) Start(
 	var stderrMu sync.Mutex
 	const maxStderrTailLines = 40
 	stderrTail := make([]string, 0, maxStderrTailLines)
+	// taskForProgress is captured below once RunningTask is built. We can't
+	// reference it here directly because it's constructed after the drain
+	// goroutine starts; a pointer-to-pointer lets the goroutine read the
+	// task once it's available.
+	var taskPtr **RunningTask
+	{
+		var t *RunningTask
+		taskPtr = &t
+	}
 	go func() {
 		defer func() { _ = stderrR.Close() }()
 		scanner := bufio.NewScanner(stderrR)
@@ -699,6 +719,20 @@ func (r *Runner) Start(
 			r.logger.Debug().
 				Str("stderr", line).
 				Msg("clod wrapper stderr")
+
+			// Forward selected lines as progress so the user can see
+			// the container is being prepared (docker build + SSH agent
+			// setup can take 1–3 minutes before claude is ready).
+			if progressStderrPattern.MatchString(line) {
+				if t := *taskPtr; t != nil {
+					select {
+					case t.output <- "__PROGRESS__" + line:
+					default:
+						// Output channel full; drop rather than block
+						// the stderr drain.
+					}
+				}
+			}
 		}
 	}()
 	snapshotStderrTail := func() string {
@@ -721,6 +755,8 @@ func (r *Runner) Start(
 		controlPermissionRequests: make(chan PermissionRequest, 10),
 		sessionIDCaptured:         make(chan string, 1),
 	}
+	// Publish the task so the stderr drain can forward progress lines.
+	*taskPtr = task
 	// When resuming an existing session, the caller already has the mapping,
 	// but fire the notification anyway so the save-on-first-observation path
 	// is uniform and idempotent.
