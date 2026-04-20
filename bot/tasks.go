@@ -69,13 +69,34 @@ func (r *TaskRegistry) Discover() error {
 	return nil
 }
 
-// Get returns the absolute path for a task by name.
+// Get returns the absolute path for a task by name. Revalidates the cached
+// entry against the filesystem so a task whose directory was removed since
+// discovery gets evicted and treated as unknown — otherwise the caller would
+// run clod against a non-existent path instead of triggering the init
+// prompt flow.
 func (r *TaskRegistry) Get(name string) (string, error) {
-	path, ok := r.tasks[strings.ToLower(name)]
+	key := strings.ToLower(name)
+	path, ok := r.tasks[key]
 	if !ok {
 		return "", oops.New("unknown task: %q", name)
 	}
+	if _, err := os.Stat(filepath.Join(path, ".clod", "system", "run")); err != nil {
+		delete(r.tasks, key)
+		return "", oops.New("unknown task: %q", name)
+	}
 	return path, nil
+}
+
+// BasePath returns the absolute path the registry was configured to search.
+func (r *TaskRegistry) BasePath() string {
+	return r.basePath
+}
+
+// Refresh re-runs task discovery so newly-initialized tasks become visible
+// without restarting the bot.
+func (r *TaskRegistry) Refresh() error {
+	r.tasks = make(map[string]string)
+	return r.Discover()
 }
 
 // List returns all registered task names.

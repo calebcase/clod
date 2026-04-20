@@ -11,7 +11,7 @@ import (
 )
 
 // Version is the bot version. Update this when releasing.
-const Version = "0.7.9"
+const Version = "0.8.0"
 
 type Flags struct {
 	Log struct {
