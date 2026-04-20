@@ -27,6 +27,7 @@ oauth_config:
       - files:read
       - files:write
       - reactions:read
+      - reactions:write
       - remote_files:read
       - remote_files:write
 

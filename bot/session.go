@@ -19,8 +19,18 @@ type SessionMapping struct {
 	SessionID      string    `json:"session_id"`
 	UserID         string    `json:"user_id"`
 	VerbosityLevel int       `json:"verbosity_level"` // Per-thread verbosity: -1 (silent), 0 (summary), 1 (full)
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	// Model is the Claude model to use for this thread. Empty means "bot
+	// default" (whatever the bot was configured with via the CLI flag).
+	// Valid values: "opus", "sonnet", "claude-haiku-4-5" (and any other
+	// string claude --model accepts).
+	Model string `json:"model,omitempty"`
+	// ReactionAnchorTS is the Slack TS of the user's @-mention that kicked
+	// off this task. It's the anchor the bot uses for the model-indicator
+	// reaction so the indicator sits on the message that started the thread
+	// (not on the bot's own "Starting..." status post).
+	ReactionAnchorTS string    `json:"reaction_anchor_ts,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // SessionStore manages thread-to-session mappings with JSON persistence.
@@ -95,6 +105,39 @@ func (s *SessionStore) SetVerbosityLevel(channelID, threadTS string, level int) 
 	}
 	session.VerbosityLevel = level
 	session.UpdatedAt = time.Now()
+}
+
+// SetModel stores the per-thread Claude model preference. Creates a minimal
+// session entry if the thread hasn't started a task yet. Empty string means
+// "use bot default".
+func (s *SessionStore) SetModel(channelID, threadTS, model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := key(channelID, threadTS)
+	session := s.sessions[k]
+	if session == nil {
+		session = &SessionMapping{
+			ChannelID: channelID,
+			ThreadTS:  threadTS,
+			CreatedAt: time.Now(),
+		}
+		s.sessions[k] = session
+	}
+	session.Model = model
+	session.UpdatedAt = time.Now()
+}
+
+// GetModel returns the thread's model preference, or empty string if unset.
+func (s *SessionStore) GetModel(channelID, threadTS string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	session := s.sessions[key(channelID, threadTS)]
+	if session == nil {
+		return ""
+	}
+	return session.Model
 }
 
 // GetVerbosityLevel returns the thread's verbosity level, or the store default if no session exists.

@@ -38,6 +38,8 @@ type Flags struct {
 
 	VerbosityLevel int `kong:"default='0',env='CLOD_BOT_VERBOSITY_LEVEL',help='Default verbosity level: -1 (silent), 0 (summary), 1 (full)'"`
 
+	DefaultModel string `kong:"default='',env='CLOD_BOT_DEFAULT_MODEL',help='Default claude --model to use (e.g. opus, sonnet, claude-haiku-4-5). Empty defers to claude default.'"`
+
 	GracefulShutdownTTL time.Duration `kong:"default='30s',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
 }
 
@@ -85,6 +87,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		runner,
 		cli.VerboseTools,
 		cli.VerbosityLevel,
+		cli.DefaultModel,
 		logger,
 	)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,15 @@ type Handler struct {
 	// Track threads waiting for permission responses
 	pendingPermissions sync.Map // key -> *PendingPermission
 
+	// Track ambiguous-response prompts posted in place of the text reminder.
+	// key -> *pendingAmbiguous (the user's original text + Slack message TS
+	// of the prompt itself, so we can update it after a button click).
+	pendingAmbiguous sync.Map
+
+	// Track in-flight AskUserQuestion prompts awaiting Submit.
+	// key (progressKey) -> *askUserQuestionState
+	askQuestionStates sync.Map
+
 	// Tools affected by verbosity toggle (controlled by VERBOSE_TOOLS env var)
 	verboseTools map[string]bool
 
@@ -50,6 +60,11 @@ type Handler struct {
 	lastOutputMsg sync.Map // key -> *LastOutputMsg
 
 	defaultVerbosityLevel int
+
+	// defaultModel is the fallback model passed to `claude --model` when a
+	// thread has no stored preference. Empty string lets claude use its own
+	// built-in default.
+	defaultModel string
 }
 
 // LastOutputMsg tracks the last output message for consolidation.
@@ -59,17 +74,66 @@ type LastOutputMsg struct {
 	UpdatedAt time.Time // When the message was last updated
 }
 
+// pendingAmbiguous tracks an outstanding "ambiguous response" prompt — the
+// block message we post when the user types something during a pending
+// permission that doesn't parse as yes/no. Storing the Text server-side
+// avoids the 2000-char limit on Slack button action values, and MessageTS
+// lets us rewrite the prompt with the outcome after a button click.
+type pendingAmbiguous struct {
+	Text      string
+	MessageTS string
+	ChannelID string
+	ThreadTS  string
+	UserID    string
+}
+
 const (
 	verbosityEmoji = "speech_balloon" // 💬 level 1 (full)
 	seeNoEvilEmoji = "see_no_evil"    // 🙈 level -1 (silent)
+
+	// Model-indicator emojis. Bot adds its own reaction to the task's
+	// status message to show which model is active; a user reacting with a
+	// different model emoji switches the active model for the thread.
+	opusEmoji   = "musical_score" // 🎼 Opus
+	sonnetEmoji = "scroll"        // 📜 Sonnet
+	haikuEmoji  = "cherry_blossom" // 🌸 Haiku
+
+	// Default model string when no thread preference exists and no bot
+	// default is set. Matches a common --model alias.
+	fallbackModel = "sonnet"
 
 	// Message consolidation settings
 	maxConsolidationAge = 1 * time.Minute // Start new message after this duration
 	maxMessageLen       = 3500            // Slack truncates around 4000, leave buffer
 )
 
+// modelEmojis maps model strings (as accepted by `claude --model`) to the
+// Slack emoji used for their reaction indicator.
+var modelEmojis = map[string]string{
+	"opus":               opusEmoji,
+	"sonnet":             sonnetEmoji,
+	"claude-haiku-4-5":   haikuEmoji,
+}
+
+// emojiToModel is the reverse mapping of modelEmojis for reaction handling.
+var emojiToModel = map[string]string{
+	opusEmoji:   "opus",
+	sonnetEmoji: "sonnet",
+	haikuEmoji:  "claude-haiku-4-5",
+}
+
+// emojiForModel returns the indicator emoji for a model string, falling back
+// to the Sonnet emoji for anything we don't recognize (including empty
+// "use default").
+func emojiForModel(model string) string {
+	if e, ok := modelEmojis[model]; ok {
+		return e
+	}
+	return sonnetEmoji
+}
+
 // NewHandler creates a new Handler.
-func NewHandler(bot *Bot, verboseTools []string, defaultVerbosityLevel int) *Handler {
+func NewHandler(bot *Bot, verboseTools []string, defaultVerbosityLevel int, defaultModel string) *Handler {
 	// Build map for O(1) lookup
 	verboseToolsMap := make(map[string]bool, len(verboseTools))
 	for _, tool := range verboseTools {
@@ -81,6 +145,7 @@ func NewHandler(bot *Bot, verboseTools []string, defaultVerbosityLevel int) *Han
 		logger:                bot.logger.With().Str("component", "handler").Logger(),
 		verboseTools:          verboseToolsMap,
 		defaultVerbosityLevel: defaultVerbosityLevel,
+		defaultModel:          defaultModel,
 	}
 }
 
@@ -202,14 +267,14 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 				h.updatePermissionMessage(perm, resp.Behavior, ev.User, "")
 				return
 			}
-			// Not a clear yes/no, remind them to use buttons
-			if _, err := h.bot.PostMessage(
-				ev.Channel,
-				"_Please use the buttons above to respond, or type_ `yes` _or_ `no`_._",
-				threadTS,
-			); err != nil {
-				logger.Error().Err(err).Msg("failed to post permission reminder message")
-			}
+			// Not a clear yes/no. Instead of a plaintext reminder, post a
+			// permission-style block message that quotes the user's text and
+			// offers buttons to route the intent — approve the pending
+			// permission, deny it, or cancel it and redirect the agent with
+			// the typed text as new instructions. This matches the style of
+			// the original permission prompt and handles the common case
+			// (user wants to redirect mid-task, not respond yes/no).
+			h.postAmbiguousResponsePrompt(ev.Channel, threadTS, ev.User, ev.Text, progressKey, logger)
 			return
 		}
 
@@ -320,6 +385,13 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 
 // HandleReactionAdded processes reaction_added events.
 func (h *Handler) HandleReactionAdded(ctx context.Context, ev *slackevents.ReactionAddedEvent) {
+	// Model-switch reactions fall through to a dedicated handler since they
+	// don't fit the verbosity level/message shape.
+	if _, ok := emojiToModel[ev.Reaction]; ok {
+		h.handleModelReaction(ctx, ev)
+		return
+	}
+
 	var level int
 	var message string
 	switch ev.Reaction {
@@ -375,6 +447,75 @@ func (h *Handler) HandleReactionAdded(ctx context.Context, ev *slackevents.React
 		); err != nil {
 			logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
 		}
+	}
+}
+
+// handleModelReaction updates the per-thread model preference when a user
+// reacts with one of the model-indicator emojis. It moves the bot's own
+// reaction on the status message so "active model" stays accurate. The new
+// model applies on the next invocation of clod in this thread (claude can't
+// change models mid-session in stream-json mode).
+func (h *Handler) handleModelReaction(ctx context.Context, ev *slackevents.ReactionAddedEvent) {
+	newModel, ok := emojiToModel[ev.Reaction]
+	if !ok {
+		return
+	}
+
+	logger := h.logger.With().
+		Str("channel", ev.Item.Channel).
+		Str("item_ts", ev.Item.Timestamp).
+		Str("user", ev.User).
+		Str("reaction", ev.Reaction).
+		Str("new_model", newModel).
+		Logger()
+
+	threadTS, err := h.getThreadTS(ev.Item.Channel, ev.Item.Timestamp)
+	if err != nil {
+		logger.Debug().Err(err).Msg("failed to get thread TS for model reaction")
+		return
+	}
+	logger = logger.With().Str("thread_ts", threadTS).Logger()
+
+	session := h.bot.sessions.Get(ev.Item.Channel, threadTS)
+	// Only react inside threads the bot has been invoked in. A model emoji
+	// in an unrelated thread is noise.
+	if session == nil || session.TaskName == "" {
+		logger.Debug().Msg("ignoring model reaction outside a bot-initiated thread")
+		return
+	}
+
+	oldModel := session.Model
+	if oldModel == newModel {
+		logger.Debug().Msg("model reaction matches current model; nothing to do")
+		return
+	}
+
+	h.bot.sessions.SetModel(ev.Item.Channel, threadTS, newModel)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Error().Err(err).Msg("failed to save session after model change")
+	}
+
+	// Move the bot's own indicator reaction on the task's anchor message
+	// (the user's @-mention that kicked off the task).
+	if session.ReactionAnchorTS != "" {
+		if oldModel != "" && oldModel != newModel {
+			if err := h.bot.RemoveReaction(session.ChannelID, session.ReactionAnchorTS, emojiForModel(oldModel)); err != nil {
+				logger.Debug().Err(err).Msg("failed to remove old model reaction")
+			}
+		}
+		if err := h.bot.AddReaction(session.ChannelID, session.ReactionAnchorTS, emojiForModel(newModel)); err != nil {
+			logger.Debug().Err(err).Msg("failed to add new model reaction")
+		}
+	}
+
+	logger.Info().Str("old_model", oldModel).Msg("switched thread model")
+
+	// Post a confirmation so the user sees the switch landed. Next-turn
+	// semantics are important context.
+	msg := fmt.Sprintf(":%s: Model set to `%s` — takes effect on the next message you send in this thread.",
+		ev.Reaction, newModel)
+	if _, err := h.bot.PostMessage(session.ChannelID, msg, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post model switch confirmation")
 	}
 }
 
@@ -607,9 +748,10 @@ func (h *Handler) handleNewTask(
 		}
 	}
 
-	// Post initial status with verbosity info
+	// Post initial status with verbosity + model info
 	startMsg := fmt.Sprintf(":rocket: Starting a `%s` task...\n\n"+
-		"_Verbosity: React with 🙈 for silent, 💬 for full output (including thinking)_",
+		"_Verbosity: React with 🙈 for silent, 💬 for full output (including thinking)_\n"+
+		"_Model: 🎼 Opus / 📜 Sonnet / 🌸 Haiku_",
 		parsed.TaskName)
 	if _, err := h.bot.PostMessage(
 		ev.Channel,
@@ -617,6 +759,37 @@ func (h *Handler) handleNewTask(
 		threadTS,
 	); err != nil {
 		logger.Error().Err(err).Msg("failed to post task start message")
+	}
+
+	// Anchor the model-indicator reaction on the user's @-mention — that's
+	// the message that actually kicked off the task — rather than on the
+	// bot's "Starting..." status post.
+	initialModel := h.bot.sessions.GetModel(ev.Channel, threadTS)
+	if initialModel == "" {
+		initialModel = h.defaultModel
+	}
+	if initialModel == "" {
+		initialModel = fallbackModel
+	}
+	session := h.bot.sessions.Get(ev.Channel, threadTS)
+	if session == nil {
+		session = &SessionMapping{
+			ChannelID: ev.Channel,
+			ThreadTS:  threadTS,
+			TaskName:  parsed.TaskName,
+			TaskPath:  taskPath,
+			UserID:    ev.User,
+			CreatedAt: time.Now(),
+		}
+	}
+	session.ReactionAnchorTS = ev.TimeStamp
+	session.Model = initialModel
+	h.bot.sessions.Set(session)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Error().Err(err).Msg("failed to save session after status post")
+	}
+	if err := h.bot.AddReaction(ev.Channel, ev.TimeStamp, emojiForModel(initialModel)); err != nil {
+		logger.Debug().Err(err).Msg("failed to add model reaction")
 	}
 
 	// Run clod
@@ -692,8 +865,14 @@ func (h *Handler) runClod(
 	threadTS string,
 	logger zerolog.Logger,
 ) {
+	// Honor any per-thread model preference saved via reaction.
+	model := h.bot.sessions.GetModel(channelID, threadTS)
+	if model == "" {
+		model = h.defaultModel
+	}
+
 	// Start the task
-	task, err := h.bot.runner.Start(ctx, taskPath, prompt, sessionID)
+	task, err := h.bot.runner.Start(ctx, taskPath, prompt, sessionID, model)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to start clod")
 		if _, postErr := h.bot.PostMessage(channelID, fmt.Sprintf(":x: Failed to start task: %v", err), threadTS); postErr != nil {
@@ -742,7 +921,20 @@ func (h *Handler) runClod(
 					if last.Content != "" && newContent != "" {
 						prevEndsWithNewline := strings.HasSuffix(last.Content, "\n")
 						newStartsWithNewline := strings.HasPrefix(newContent, "\n")
-						if !prevEndsWithNewline && !newStartsWithNewline {
+						// Fence boundary: TrimSpace in flushBuffer strips the
+						// blank-line padding the mrkdwn renderer emits, so a
+						// chunk that ended with a closing ``` loses the newline
+						// that was supposed to separate it from the next chunk.
+						// Consolidating without a blank-line separator produces
+						// "``````" (six literal backticks) on Slack when both
+						// sides are fences, or a closing fence glued to plain
+						// text (never terminates) when one side is text.
+						prevEndsWithFence := strings.HasSuffix(last.Content, "```")
+						newStartsWithFence := strings.HasPrefix(newContent, "```")
+						switch {
+						case prevEndsWithFence || newStartsWithFence:
+							separator = "\n\n"
+						case !prevEndsWithNewline && !newStartsWithNewline:
 							// Neither has newline at boundary - streaming text, concatenate directly
 							separator = ""
 						}
@@ -792,10 +984,39 @@ func (h *Handler) runClod(
 	// Get permission request channels (may be nil if not available)
 	permRequests := task.PermissionRequests()
 	ctrlPermRequests := task.ControlPermissionRequests()
+	sessionCaptured := task.SessionIDCaptured()
 
 	// Process output and wait for completion
 	for {
 		select {
+		case sid, ok := <-sessionCaptured:
+			if ok && sid != "" {
+				// Persist the thread → session mapping immediately instead of
+				// waiting for task completion. Long-running tasks used to
+				// leave the thread orphaned if the bot restarted mid-task
+				// (sessions.json only got written on task.Done()).
+				session := &SessionMapping{
+					ChannelID: channelID,
+					ThreadTS:  threadTS,
+					TaskName:  taskName,
+					TaskPath:  taskPath,
+					SessionID: sid,
+					UserID:    userID,
+					CreatedAt: time.Now(),
+				}
+				h.bot.sessions.Set(session)
+				if err := h.bot.sessions.Save(); err != nil {
+					logger.Error().Err(err).Msg("failed to save session on capture")
+				} else {
+					logger.Info().
+						Str("session_id", sid).
+						Msg("persisted session mapping on capture")
+				}
+			}
+			// Set to nil so this select case stops firing; notifySessionID
+			// is one-shot but the channel stays open for the task lifetime.
+			sessionCaptured = nil
+
 		case content, ok := <-task.Output():
 			if !ok {
 				// Channel closed, task is done.
@@ -861,15 +1082,22 @@ func (h *Handler) runClod(
 
 				// Post formatted permission prompt with buttons to Slack.
 				flushBuffer() // Flush any pending output first.
-				blocks := h.buildPermissionBlocks(req, progressKey)
-				msgTS, err := h.bot.PostMessageBlocks(channelID, blocks, threadTS)
-				if err != nil {
-					logger.Error().Err(err).Msg("failed to post permission prompt")
-					// Send deny on failure to post.
-					task.SendPermissionResponse(
-						PermissionResponse{Behavior: "deny", Message: "Failed to prompt user"},
-					)
-					continue
+				var msgTS string
+				// Special case: AskUserQuestion gets a CLI-style picker.
+				if custom := h.tryPostAskUserQuestionPrompt(req, channelID, threadTS, progressKey, logger); custom != "" {
+					msgTS = custom
+				} else {
+					blocks := h.buildPermissionBlocks(req, progressKey)
+					var err error
+					msgTS, err = h.bot.PostMessageBlocks(channelID, blocks, threadTS)
+					if err != nil {
+						logger.Error().Err(err).Msg("failed to post permission prompt")
+						// Send deny on failure to post.
+						task.SendPermissionResponse(
+							PermissionResponse{Behavior: "deny", Message: "Failed to prompt user"},
+						)
+						continue
+					}
 				}
 
 				// Track the pending permission with its message timestamp and tool details.
@@ -907,15 +1135,22 @@ func (h *Handler) runClod(
 
 				// Post formatted permission prompt with buttons to Slack.
 				flushBuffer() // Flush any pending output first.
-				blocks := h.buildPermissionBlocks(req, progressKey)
-				msgTS, err := h.bot.PostMessageBlocks(channelID, blocks, threadTS)
-				if err != nil {
-					logger.Error().Err(err).Msg("failed to post control permission prompt")
-					// Send deny on failure to post.
-					if err := task.SendControlResponse(task.pendingControlRequestID, "deny", "Failed to prompt user"); err != nil {
-						logger.Error().Err(err).Msg("failed to send deny control response")
+				var msgTS string
+				// Special case: AskUserQuestion gets a CLI-style picker.
+				if custom := h.tryPostAskUserQuestionPrompt(req, channelID, threadTS, progressKey, logger); custom != "" {
+					msgTS = custom
+				} else {
+					blocks := h.buildPermissionBlocks(req, progressKey)
+					var err error
+					msgTS, err = h.bot.PostMessageBlocks(channelID, blocks, threadTS)
+					if err != nil {
+						logger.Error().Err(err).Msg("failed to post control permission prompt")
+						// Send deny on failure to post.
+						if err := task.SendControlResponse(task.pendingControlRequestID, "deny", "Failed to prompt user"); err != nil {
+							logger.Error().Err(err).Msg("failed to send deny control response")
+						}
+						continue
 					}
-					continue
 				}
 
 				// Track the pending permission with its message timestamp, tool details, and control request ID.
@@ -1025,6 +1260,13 @@ type PermissionActionValue struct {
 	ThreadKey string `json:"k"`           // The progressKey for looking up the task
 	Behavior  string `json:"b"`           // "allow" or "deny"
 	Remember  string `json:"r,omitempty"` // Permission pattern to remember (empty = one-time)
+	// Redirect, when true, denies the pending permission and forwards the
+	// user's typed text as a fresh stdin turn to the task. Used by the
+	// ambiguous-response prompt to let the user cancel a stale permission
+	// and redirect the agent with new instructions. The text itself is
+	// looked up server-side from h.pendingAmbiguousTexts keyed by
+	// ThreadKey (Slack action values are capped at 2000 chars).
+	Redirect bool `json:"rd,omitempty"`
 }
 
 // buildPermissionBlocks creates Slack blocks for a permission prompt with buttons.
@@ -1150,6 +1392,145 @@ func (h *Handler) buildPermissionBlocks(req PermissionRequest, progressKey strin
 	return blocks
 }
 
+// tryPostAskUserQuestionPrompt renders the CLI-style Q&A picker in Slack when
+// the tool is AskUserQuestion and the input parses into a valid question set.
+// Returns the Slack message TS if a custom prompt was posted (and the caller
+// should NOT fall back to the generic permission prompt). Returns "" when the
+// tool/input doesn't qualify so the caller can use the generic path.
+func (h *Handler) tryPostAskUserQuestionPrompt(
+	req PermissionRequest,
+	channelID, threadTS, progressKey string,
+	logger zerolog.Logger,
+) string {
+	if req.ToolName != "AskUserQuestion" {
+		return ""
+	}
+	questions := parseAskUserQuestionInput(req.ToolInput)
+	if len(questions) == 0 {
+		return ""
+	}
+
+	blocks := buildAskUserQuestionBlocks(questions, progressKey)
+	msgTS, err := h.bot.PostMessageBlocks(channelID, blocks, threadTS)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to post AskUserQuestion prompt")
+		return ""
+	}
+
+	// Seed Selections with recommended defaults so a single Submit click
+	// submits the same answer the radio/checkbox initially shows.
+	selections := make([][]string, len(questions))
+	for i, q := range questions {
+		for j, opt := range q.Options {
+			if strings.Contains(strings.ToLower(opt.Label), "(recommended)") {
+				selections[i] = append(selections[i], fmt.Sprintf("%d", j))
+				if !q.MultiSelect {
+					break
+				}
+			}
+		}
+	}
+
+	h.askQuestionStates.Store(progressKey, &askUserQuestionState{
+		MessageTS:  msgTS,
+		ChannelID:  channelID,
+		ThreadTS:   threadTS,
+		Questions:  questions,
+		Selections: selections,
+	})
+
+	logger.Info().
+		Int("num_questions", len(questions)).
+		Str("message_ts", msgTS).
+		Msg("posted AskUserQuestion prompt")
+	return msgTS
+}
+
+// postAmbiguousResponsePrompt posts a permission-style block message when the
+// user types something during a pending permission that doesn't parse as
+// yes/no. Offers three buttons: treat as allow, treat as deny, or cancel the
+// pending permission and redirect the agent with the typed text as new input.
+func (h *Handler) postAmbiguousResponsePrompt(
+	channelID, threadTS, userID, userText, progressKey string,
+	logger zerolog.Logger,
+) {
+	allowValue, _ := json.Marshal(PermissionActionValue{
+		ThreadKey: progressKey,
+		Behavior:  "allow",
+	})
+	denyValue, _ := json.Marshal(PermissionActionValue{
+		ThreadKey: progressKey,
+		Behavior:  "deny",
+	})
+	redirectValue, _ := json.Marshal(PermissionActionValue{
+		ThreadKey: progressKey,
+		Behavior:  "deny",
+		Redirect:  true,
+	})
+
+	blocks := []slack.Block{
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject(
+				"mrkdwn",
+				":grey_question: *How should I route this message?*\nA permission prompt is still pending above and your reply isn't a clear yes/no.",
+				false, false,
+			),
+			nil, nil,
+		),
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject(
+				"mrkdwn",
+				fmt.Sprintf("*You said:*\n>%s", strings.ReplaceAll(userText, "\n", "\n>")),
+				false, false,
+			),
+			nil, nil,
+		),
+		slack.NewActionBlock(
+			"ambiguous_actions",
+			func() *slack.ButtonBlockElement {
+				b := slack.NewButtonBlockElement(
+					"ambiguous_allow",
+					string(allowValue),
+					slack.NewTextBlockObject("plain_text", "Allow pending", false, false),
+				)
+				b.Style = "primary"
+				return b
+			}(),
+			func() *slack.ButtonBlockElement {
+				b := slack.NewButtonBlockElement(
+					"ambiguous_deny",
+					string(denyValue),
+					slack.NewTextBlockObject("plain_text", "Deny pending", false, false),
+				)
+				b.Style = "danger"
+				return b
+			}(),
+			slack.NewButtonBlockElement(
+				"ambiguous_redirect",
+				string(redirectValue),
+				slack.NewTextBlockObject("plain_text", "Cancel & send as new input", false, false),
+			),
+		),
+	}
+
+	msgTS, err := h.bot.PostMessageBlocks(channelID, blocks, threadTS)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to post ambiguous response prompt")
+		return
+	}
+
+	h.pendingAmbiguous.Store(progressKey, &pendingAmbiguous{
+		Text:      userText,
+		MessageTS: msgTS,
+		ChannelID: channelID,
+		ThreadTS:  threadTS,
+		UserID:    userID,
+	})
+	logger.Info().
+		Str("message_ts", msgTS).
+		Msg("posted ambiguous response prompt")
+}
+
 // generateSimilarPattern creates a permission pattern for "similar" requests.
 // For example:
 // - Bash: "python script.py" -> "Bash(python:*)"
@@ -1215,8 +1596,20 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "permission_deny" ||
 		action.ActionID == "permission_allow_always" ||
 		action.ActionID == "permission_allow_similar"
-	if !isPermissionAction {
+	isAmbiguousAction := action.ActionID == "ambiguous_allow" ||
+		action.ActionID == "ambiguous_deny" ||
+		action.ActionID == "ambiguous_redirect"
+	isAskQuestionSelect := action.ActionID == "askq_radio" ||
+		action.ActionID == "askq_checkbox"
+	isAskQuestionFinal := action.ActionID == "askq_submit" ||
+		action.ActionID == "askq_cancel"
+	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal {
 		logger.Debug().Msg("ignoring non-permission action")
+		return
+	}
+
+	if isAskQuestionSelect {
+		h.handleAskQuestionSelect(callback, action, logger)
 		return
 	}
 
@@ -1231,7 +1624,18 @@ func (h *Handler) HandleBlockAction(
 		Str("thread_key", actionValue.ThreadKey).
 		Str("behavior", actionValue.Behavior).
 		Str("remember", actionValue.Remember).
+		Bool("redirect", actionValue.Redirect).
 		Logger()
+
+	if isAmbiguousAction {
+		h.handleAmbiguousAction(callback, actionValue, logger)
+		return
+	}
+
+	if isAskQuestionFinal {
+		h.handleAskQuestionFinal(callback, action, actionValue, logger)
+		return
+	}
 
 	// Look up the running task
 	taskVal, ok := h.runningTasks.Load(actionValue.ThreadKey)
@@ -1296,6 +1700,252 @@ func (h *Handler) HandleBlockAction(
 }
 
 // updatePermissionMessage updates a permission prompt message to show the result.
+// handleAskQuestionSelect records a radio-button or checkbox change on an
+// in-flight AskUserQuestion prompt. It does not resolve the permission —
+// that happens on Submit. The block_id carries the question index as
+// "askq_q<N>" so we can route the update to the right entry.
+func (h *Handler) handleAskQuestionSelect(
+	callback *slack.InteractionCallback,
+	action *slack.BlockAction,
+	logger zerolog.Logger,
+) {
+	// block_id format: "askq_q<idx>"
+	blockID := action.BlockID
+	if !strings.HasPrefix(blockID, "askq_q") {
+		logger.Warn().Str("block_id", blockID).Msg("malformed askq block_id")
+		return
+	}
+	qIdx, err := strconv.Atoi(strings.TrimPrefix(blockID, "askq_q"))
+	if err != nil {
+		logger.Warn().Err(err).Str("block_id", blockID).Msg("bad askq block_id index")
+		return
+	}
+
+	// We don't know the threadKey from the action alone — scan askQuestionStates
+	// for the state whose MessageTS matches the message this action fired on.
+	// (Slack doesn't round-trip our server-side thread key on radio/checkbox
+	// changes like it does with button values.) There's usually at most a
+	// handful of pending states at once; a linear scan is fine.
+	msgTS := callback.Container.MessageTs
+	var state *askUserQuestionState
+	h.askQuestionStates.Range(func(k, v any) bool {
+		s := v.(*askUserQuestionState)
+		if s.MessageTS == msgTS {
+			state = s
+			return false
+		}
+		return true
+	})
+	if state == nil {
+		logger.Debug().Str("message_ts", msgTS).Msg("no askq state for selection; prompt may be stale")
+		return
+	}
+
+	if qIdx < 0 || qIdx >= len(state.Selections) {
+		logger.Warn().Int("q_idx", qIdx).Msg("askq index out of range")
+		return
+	}
+
+	switch action.ActionID {
+	case "askq_radio":
+		if action.SelectedOption.Value != "" {
+			state.Selections[qIdx] = []string{action.SelectedOption.Value}
+		} else {
+			state.Selections[qIdx] = nil
+		}
+	case "askq_checkbox":
+		picks := make([]string, 0, len(action.SelectedOptions))
+		for _, opt := range action.SelectedOptions {
+			picks = append(picks, opt.Value)
+		}
+		state.Selections[qIdx] = picks
+	}
+	logger.Debug().
+		Int("q_idx", qIdx).
+		Strs("selections", state.Selections[qIdx]).
+		Msg("recorded askq selection")
+}
+
+// handleAskQuestionFinal resolves an AskUserQuestion prompt on Submit or
+// Cancel. Submit sends the underlying permission as allow with the user's
+// formatted answer as the message so Claude sees what was chosen (approve-
+// and-see path — if Claude's AskUserQuestion implementation doesn't honor
+// this in headless mode we'll switch to the deny-with-answer strategy).
+// Cancel denies the permission.
+func (h *Handler) handleAskQuestionFinal(
+	callback *slack.InteractionCallback,
+	action *slack.BlockAction,
+	actionValue PermissionActionValue,
+	logger zerolog.Logger,
+) {
+	stateVal, ok := h.askQuestionStates.LoadAndDelete(actionValue.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no AskUserQuestion state found; prompt is stale")
+		if err := h.bot.UpdateMessage(
+			callback.Channel.ID, callback.Message.Timestamp,
+			":warning: This question prompt is no longer active.",
+		); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale askq message")
+		}
+		return
+	}
+	state := stateVal.(*askUserQuestionState)
+
+	taskVal, ok := h.runningTasks.Load(actionValue.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no running task for askq final action")
+		return
+	}
+	task := taskVal.(*RunningTask)
+
+	pendingVal, hasPending := h.pendingPermissions.LoadAndDelete(actionValue.ThreadKey)
+	var pending *PendingPermission
+	if hasPending {
+		pending = pendingVal.(*PendingPermission)
+	}
+
+	isCancel := action.ActionID == "askq_cancel"
+
+	// Build the permission response.
+	//
+	// Approve-and-see doesn't work: Claude Code's internal AskUserQuestion
+	// implementation runs the tool after permission is granted and — in
+	// headless `--input-format stream-json` mode — has no interactive UI to
+	// collect the answer, so it returns an empty result. The allow response's
+	// message field is NOT substituted for the tool output. Observed in
+	// practice: Claude replied "The AskUserQuestion tool is returning empty
+	// answers both times."
+	//
+	// Instead we DENY the tool call and stuff the user's answers into the
+	// deny message. Claude sees the deny as the tool result and reads the
+	// answers out of the message body. This keeps the tool invocation from
+	// racing with user input and is the documented pattern for surfacing
+	// user-provided context when a tool can't run.
+	resp := PermissionResponse{}
+	var answerSummary string
+	if isCancel {
+		resp.Behavior = "deny"
+		resp.Message = fmt.Sprintf("User %s cancelled the question prompt.", callback.User.Name)
+	} else {
+		resp.Behavior = "deny"
+		answerSummary = formatAskUserQuestionAnswer(state)
+		resp.Message = "AskUserQuestion is unavailable in this environment; the user answered directly:\n" + answerSummary
+	}
+
+	if hasPending {
+		if pending.IsControlPermission && pending.ControlRequestID != "" {
+			if err := task.SendControlResponse(pending.ControlRequestID, resp.Behavior, resp.Message); err != nil {
+				logger.Error().Err(err).Msg("failed to send control response for askq")
+			}
+		} else {
+			task.SendPermissionResponse(resp)
+		}
+	}
+
+	// Update the prompt message with the outcome.
+	var updated string
+	if isCancel {
+		updated = fmt.Sprintf(":x: *Question cancelled* by <@%s>", callback.User.ID)
+	} else {
+		updated = fmt.Sprintf(":white_check_mark: *Answer submitted* by <@%s>\n%s",
+			callback.User.ID, answerSummary)
+	}
+	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, updated); err != nil {
+		logger.Error().Err(err).Msg("failed to update askq prompt after final click")
+	}
+}
+
+// handleAmbiguousAction dispatches button clicks on the ambiguous-response
+// prompt. allow/deny route the user's text as the corresponding permission
+// response; redirect denies the pending permission and forwards the text as
+// a fresh turn to the task.
+func (h *Handler) handleAmbiguousAction(
+	callback *slack.InteractionCallback,
+	actionValue PermissionActionValue,
+	logger zerolog.Logger,
+) {
+	ambigVal, ok := h.pendingAmbiguous.LoadAndDelete(actionValue.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no pending ambiguous prompt found; button is stale")
+		if err := h.bot.UpdateMessage(
+			callback.Channel.ID, callback.Message.Timestamp,
+			":warning: This prompt is no longer active.",
+		); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale ambiguous message")
+		}
+		return
+	}
+	ambig := ambigVal.(*pendingAmbiguous)
+
+	taskVal, ok := h.runningTasks.Load(actionValue.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no running task for ambiguous action")
+		if err := h.bot.UpdateMessage(
+			callback.Channel.ID, callback.Message.Timestamp,
+			":warning: Task is no longer running.",
+		); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale ambiguous message")
+		}
+		return
+	}
+	task := taskVal.(*RunningTask)
+
+	pendingVal, hasPending := h.pendingPermissions.Load(actionValue.ThreadKey)
+	var pending *PendingPermission
+	if hasPending {
+		pending = pendingVal.(*PendingPermission)
+	}
+
+	// Build the permission response.
+	resp := PermissionResponse{Behavior: actionValue.Behavior}
+	switch {
+	case actionValue.Redirect:
+		resp.Message = fmt.Sprintf("User %s cancelled the pending permission to redirect with new instructions.", callback.User.Name)
+	case actionValue.Behavior == "deny":
+		resp.Message = fmt.Sprintf("User %s denied permission", callback.User.Name)
+	}
+
+	if hasPending {
+		if pending.IsControlPermission && pending.ControlRequestID != "" {
+			if err := task.SendControlResponse(pending.ControlRequestID, resp.Behavior, resp.Message); err != nil {
+				logger.Error().Err(err).Msg("failed to send control response from ambiguous action")
+			}
+		} else {
+			task.SendPermissionResponse(resp)
+		}
+		h.pendingPermissions.Delete(actionValue.ThreadKey)
+		// Rewrite the ORIGINAL permission prompt to show the outcome — same
+		// visual treatment as a direct button click on the prompt.
+		h.updatePermissionMessage(pending, actionValue.Behavior, callback.User.ID, "")
+	}
+
+	// For redirect: forward the user's originally-typed text to Claude as a
+	// new stdin turn so the agent picks up the new instructions.
+	if actionValue.Redirect && ambig.Text != "" {
+		// Clear output consolidation since the user is starting a new turn.
+		h.lastOutputMsg.Delete(actionValue.ThreadKey)
+		if err := task.SendInput(ambig.Text); err != nil {
+			logger.Error().Err(err).Msg("failed to send redirected input")
+		}
+	}
+
+	// Rewrite the ambiguous prompt itself with the outcome.
+	var outcome string
+	switch {
+	case actionValue.Redirect:
+		outcome = fmt.Sprintf(":twisted_rightwards_arrows: Cancelled pending and forwarded message by <@%s>", callback.User.ID)
+	case actionValue.Behavior == "allow":
+		outcome = fmt.Sprintf(":white_check_mark: Treated as *Allow* by <@%s>", callback.User.ID)
+	default:
+		outcome = fmt.Sprintf(":x: Treated as *Deny* by <@%s>", callback.User.ID)
+	}
+	quoted := strings.ReplaceAll(ambig.Text, "\n", "\n>")
+	updated := fmt.Sprintf("%s\n>%s", outcome, quoted)
+	if err := h.bot.UpdateMessage(ambig.ChannelID, ambig.MessageTS, updated); err != nil {
+		logger.Error().Err(err).Msg("failed to update ambiguous prompt after click")
+	}
+}
+
 func (h *Handler) updatePermissionMessage(perm *PendingPermission, behavior, userID, remembered string) {
 	var emoji, action string
 	if behavior == "allow" {

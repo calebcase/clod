@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -192,6 +193,12 @@ type RunningTask struct {
 	permissionFIFO            *PermissionFIFO
 	controlPermissionRequests chan PermissionRequest
 	pendingControlRequestID   string
+	// sessionIDCaptured receives the session ID exactly once, as soon as the
+	// stream parser observes it (normally the first system/init message). The
+	// handler uses it to persist the thread → session mapping early so that
+	// a bot restart mid-task doesn't orphan the thread.
+	sessionIDCaptured chan string
+	sessionIDOnce     sync.Once
 }
 
 // closeStdin closes the bot's end of the child's stdin pipe. It's safe to
@@ -358,6 +365,25 @@ func (t *RunningTask) GetSessionID() string {
 	return t.sessionID
 }
 
+// SessionIDCaptured returns a channel that receives the session ID exactly
+// once, as soon as the stream parser observes it. Callers use this to persist
+// the session mapping early so a bot restart mid-task doesn't orphan the
+// thread.
+func (t *RunningTask) SessionIDCaptured() <-chan string {
+	return t.sessionIDCaptured
+}
+
+// notifySessionID fires the one-shot notification. Safe to call repeatedly;
+// only the first call has any effect.
+func (t *RunningTask) notifySessionID(id string) {
+	t.sessionIDOnce.Do(func() {
+		select {
+		case t.sessionIDCaptured <- id:
+		default:
+		}
+	})
+}
+
 // readAllowedTools reads the allowed tools from the task's claude.json config.
 // It also checks for a permissions.allow array in the project config (Claude's native format).
 func readAllowedTools(taskPath string, logger zerolog.Logger) []string {
@@ -456,10 +482,14 @@ func readAllowedTools(taskPath string, logger zerolog.Logger) []string {
 
 // Start begins executing clod in a task directory with the given prompt.
 // If sessionID is provided, it resumes an existing session.
+// If model is non-empty, it's passed through as claude's --model flag (e.g.
+// "opus", "sonnet", or a full model id). Mid-session model switching isn't
+// supported by claude --input-format stream-json, but --resume honors a
+// changed --model on the next start.
 // Returns a RunningTask that can be used to send input and receive output.
 func (r *Runner) Start(
 	ctx context.Context,
-	taskPath, prompt, sessionID string,
+	taskPath, prompt, sessionID, model string,
 ) (*RunningTask, error) {
 	// Create command with timeout context.
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
@@ -530,10 +560,14 @@ func (r *Runner) Start(
 	if sessionID != "" {
 		args = append(args, "--resume", sessionID)
 	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
 
 	r.logger.Debug().
 		Str("task_path", taskPath).
 		Str("session_id", sessionID).
+		Str("model", model).
 		Strs("args", args).
 		Msg("starting clod with pty")
 
@@ -638,7 +672,14 @@ func (r *Runner) Start(
 	_ = stderrW.Close()
 
 	// Drain stderr in the background. These lines are diagnostics from the
-	// wrapper — never stream-json — so we just log them.
+	// wrapper — never stream-json — so we log them at debug and keep the
+	// most recent handful in a bounded tail buffer. The tail is appended to
+	// the final error message so the user sees *why* clod failed (SSH agent
+	// missing, docker build error, login required, etc.) instead of a bare
+	// "exit status 1".
+	var stderrMu sync.Mutex
+	const maxStderrTailLines = 40
+	stderrTail := make([]string, 0, maxStderrTailLines)
 	go func() {
 		defer func() { _ = stderrR.Close() }()
 		scanner := bufio.NewScanner(stderrR)
@@ -649,11 +690,22 @@ func (r *Runner) Start(
 			if line == "" {
 				continue
 			}
+			stderrMu.Lock()
+			if len(stderrTail) >= maxStderrTailLines {
+				stderrTail = stderrTail[1:]
+			}
+			stderrTail = append(stderrTail, line)
+			stderrMu.Unlock()
 			r.logger.Debug().
 				Str("stderr", line).
 				Msg("clod wrapper stderr")
 		}
 	}()
+	snapshotStderrTail := func() string {
+		stderrMu.Lock()
+		defer stderrMu.Unlock()
+		return strings.Join(stderrTail, "\n")
+	}
 
 	task := &RunningTask{
 		cmd:                       cmd,
@@ -667,6 +719,13 @@ func (r *Runner) Start(
 		logger:                    r.logger,
 		permissionFIFO:            permFIFO,
 		controlPermissionRequests: make(chan PermissionRequest, 10),
+		sessionIDCaptured:         make(chan string, 1),
+	}
+	// When resuming an existing session, the caller already has the mapping,
+	// but fire the notification anyway so the save-on-first-observation path
+	// is uniform and idempotent.
+	if sessionID != "" {
+		task.notifySessionID(sessionID)
 	}
 
 	// Start permission FIFO listener
@@ -758,6 +817,7 @@ func (r *Runner) Start(
 				r.logger.Debug().
 					Str("session_id", task.sessionID).
 					Msg("captured session ID")
+				task.notifySessionID(msg.SessionID)
 			}
 
 			// Handle different message types.
@@ -774,6 +834,7 @@ func (r *Runner) Start(
 					r.logger.Debug().
 						Str("session_id", task.sessionID).
 						Msg("captured session ID from system init")
+					task.notifySessionID(msg.SessionID)
 				}
 			case "assistant":
 				// Assistant messages contain text output and tool_use requests.
@@ -839,8 +900,12 @@ func (r *Runner) Start(
 
 							var outputMsg string
 							if info.Name == "Bash" && contentLen <= maxInlineLen {
-								// Short Bash output: inline code block.
-								outputMsg = fmt.Sprintf("\n```\n%s\n```", trimmedContent)
+								// Short Bash output: inline code block. Trailing newline
+								// guarantees the closing fence sits on its own line even
+								// when assistant text streams in right after — without
+								// it, concatenating produces "```SSH works..." and the
+								// fence never closes in Slack's parser.
+								outputMsg = fmt.Sprintf("\n```\n%s\n```\n", trimmedContent)
 							} else {
 								// Show summary + upload as expandable snippet.
 								// Use __SNIPPET__ prefix so handler can upload as collapsible file.
@@ -954,15 +1019,31 @@ func (r *Runner) Start(
 				}
 			case "result":
 				// Final result with stats.
-				r.logger.Info().
+				resultLog := r.logger.Info().
 					Str("subtype", msg.Subtype).
 					Float64("cost_usd", msg.TotalCostUSD).
 					Int("duration_ms", msg.DurationMS).
 					Int("num_turns", msg.NumTurns).
-					Bool("is_error", msg.IsError).
-					Msg("task result")
+					Bool("is_error", msg.IsError)
+				if msg.IsError && msg.Result != "" {
+					resultLog = resultLog.Str("result", msg.Result)
+				}
+				resultLog.Msg("task result")
 				if msg.Result != "" {
 					outputBuilder.WriteString(msg.Result)
+				}
+				// Surface the result text to Slack when the task errored.
+				// On success, the same text already reached the channel via
+				// content_block_delta streaming. On a synthetic error like
+				// "Not logged in · Please run /login" there are no deltas,
+				// so without this the user only sees the stats warning.
+				if msg.IsError && msg.Result != "" {
+					errMsg := fmt.Sprintf(":warning: %s", msg.Result)
+					select {
+					case task.output <- errMsg:
+					default:
+						r.logger.Warn().Msg("output channel full, dropping error result text")
+					}
 				}
 				// Send stats as JSON for special formatting by handler.
 				// Use __STATS__ prefix so handler can detect and format with blocks.
@@ -1052,7 +1133,14 @@ func (r *Runner) Start(
 			} else if runCtx.Err() == context.Canceled {
 				result.Error = oops.New("clod execution was cancelled")
 			} else {
-				result.Error = oops.Trace(err)
+				// Include the recent stderr tail so the caller can surface
+				// the actual reason to the user (SSH agent missing, auth
+				// required, etc.) instead of "exit status 1".
+				if tail := snapshotStderrTail(); tail != "" {
+					result.Error = oops.New("%s\n```\n%s\n```", err.Error(), tail)
+				} else {
+					result.Error = oops.Trace(err)
+				}
 			}
 		}
 

@@ -57,15 +57,25 @@ version_gt() {
   return 1
 }
 
+# Seed .clod/claude/claude.json from the host config if it isn't already
+# populated. Runs on every invocation, not just first-time init, so that a
+# user who authenticates on the host *after* .clod was created still gets
+# their credentials picked up on the next run. Never overwrites an existing
+# file — the bot persists permission grants there and we must not clobber
+# them.
+sync_claude_config() {
+  mkdir -p .clod/claude
+  if [[ ! -f .clod/claude/claude.json && -f "$config" ]]; then
+    cp "$config" .clod/claude/claude.json
+  fi
+}
+
 # Is this directory initialized?
 initialize() {
   mkdir -p .clod/claude
   mkdir -p .clod/system
 
-  # Use an existing config if available.
-  if [[ ! -f .clod/claude/claude.json && -f "$config" ]]; then
-    cp "$config" .clod/claude/claude.json
-  fi
+  sync_claude_config
 
   local cwd=$(pwd)
 
@@ -534,6 +544,9 @@ elif [[ $needs_upgrade == 'true' ]]; then
   printf 'Upgrading clod from v%s to v%s...\n' "$installed_version" "$CLOD_VERSION" >&2
   initialize
 fi
+
+# Pick up host credentials if they appeared after the initial init.
+sync_claude_config
 
 # It's go time!
 .clod/system/build

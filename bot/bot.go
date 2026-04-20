@@ -38,6 +38,7 @@ func NewBot(
 	runner *Runner,
 	verboseTools []string,
 	verbosityLevel int,
+	defaultModel string,
 	logger zerolog.Logger,
 ) (*Bot, error) {
 	client := slack.New(
@@ -65,7 +66,7 @@ func NewBot(
 		logger:        logger.With().Str("component", "bot").Logger(),
 	}
 
-	bot.handler = NewHandler(bot, verboseTools, verbosityLevel)
+	bot.handler = NewHandler(bot, verboseTools, verbosityLevel, defaultModel)
 
 	// Register event handlers using the socketmode handler pattern
 	bot.registerEventHandlers()
@@ -225,6 +226,41 @@ func (b *Bot) UpdateMessageBlocks(channelID, ts string, blocks []slack.Block) er
 		return oops.Trace(err)
 	}
 	return nil
+}
+
+// AddReaction adds an emoji reaction to a message. name is without colons
+// (e.g. "musical_score", not ":musical_score:"). Returns nil if the
+// reaction already exists ("already_reacted"), since that's the desired
+// end state.
+func (b *Bot) AddReaction(channelID, messageTS, name string) error {
+	err := b.client.AddReaction(name, slack.ItemRef{
+		Channel:   channelID,
+		Timestamp: messageTS,
+	})
+	if err == nil {
+		return nil
+	}
+	// Idempotent: ignore "already_reacted".
+	if err.Error() == "already_reacted" {
+		return nil
+	}
+	return oops.Trace(err)
+}
+
+// RemoveReaction removes an emoji reaction from a message. Idempotent: a
+// missing reaction ("no_reaction") is not an error.
+func (b *Bot) RemoveReaction(channelID, messageTS, name string) error {
+	err := b.client.RemoveReaction(name, slack.ItemRef{
+		Channel:   channelID,
+		Timestamp: messageTS,
+	})
+	if err == nil {
+		return nil
+	}
+	if err.Error() == "no_reaction" {
+		return nil
+	}
+	return oops.Trace(err)
 }
 
 // PostMessageBlocks sends a message with blocks to a channel.
