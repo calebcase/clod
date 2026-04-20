@@ -105,7 +105,12 @@ func (r *mrkdwnRenderer) RenderNode(w io.Writer, node ast.Node, entering bool) a
 			code := strings.TrimSuffix(string(n.Literal), "\n")
 			// Skip empty code blocks
 			if code != "" {
-				_, _ = fmt.Fprintf(w, "```\n%s\n```\n", code)
+				// Trailing blank line ensures two consecutive code blocks don't
+				// end up with their closing and opening fences on adjacent
+				// lines. Slack's mrkdwn parser renders "```\n```" as six
+				// literal backticks instead of as a fence boundary, which
+				// leaks the rest of the document out of code formatting.
+				_, _ = fmt.Fprintf(w, "```\n%s\n```\n\n", code)
 			}
 		}
 		return ast.GoToNext
