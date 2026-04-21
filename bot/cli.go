@@ -11,7 +11,7 @@ import (
 )
 
 // Version is the bot version. Update this when releasing.
-const Version = "0.8.0"
+const Version = "0.9.0"
 
 type Flags struct {
 	Log struct {
@@ -41,6 +41,8 @@ type Flags struct {
 	DefaultModel string `kong:"default='',env='CLOD_BOT_DEFAULT_MODEL',help='Default claude --model to use (e.g. opus, sonnet, claude-haiku-4-5). Empty defers to claude default.'"`
 
 	GracefulShutdownTTL time.Duration `kong:"default='30s',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
+
+	ResumeStaleAfter time.Duration `kong:"default='10m',env='CLOD_BOT_RESUME_STALE_AFTER',help='Active sessions older than this are treated as stale on startup (flag cleared, no auto-resume). Set to 0 to disable auto-resume entirely.'"`
 }
 
 type CLI struct {
@@ -99,6 +101,13 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	go func() {
 		errors <- bot.Run(*ctx)
 	}()
+
+	// Resume any sessions that were mid-task when the previous bot
+	// process exited. A zero staleness threshold disables the feature
+	// entirely (explicit opt-out).
+	if cli.ResumeStaleAfter > 0 {
+		bot.ResumeActiveSessions(*ctx, cli.ResumeStaleAfter)
+	}
 
 	// Signal handling (buffer of 2 to catch second signal for force exit)
 	signals := make(chan os.Signal, 2)

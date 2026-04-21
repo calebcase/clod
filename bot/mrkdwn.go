@@ -13,16 +13,34 @@ import (
 // ConvertMarkdownToMrkdwn converts GitHub-flavored markdown to Slack's mrkdwn format.
 // Uses an AST parser for robust handling of nested structures.
 func ConvertMarkdownToMrkdwn(md string) string {
+	// Peel off leading/trailing spaces and tabs before parsing. CommonMark
+	// strips leading whitespace from paragraph text, so a streaming chunk
+	// that begins with a single space (like " loading." arriving after a
+	// prior "Models") would lose the word boundary on round-trip. Newlines
+	// at the edges are still noise worth dropping via the final Trim —
+	// callers expect a compact message without leading/trailing blank
+	// lines.
+	var leading, trailing string
+	body := md
+	for len(body) > 0 && (body[0] == ' ' || body[0] == '\t') {
+		leading += string(body[0])
+		body = body[1:]
+	}
+	for len(body) > 0 && (body[len(body)-1] == ' ' || body[len(body)-1] == '\t') {
+		trailing = string(body[len(body)-1]) + trailing
+		body = body[:len(body)-1]
+	}
+
 	extensions := parser.CommonExtensions | parser.AutoHeadingIDs | parser.Strikethrough
 	p := parser.NewWithExtensions(extensions)
 
-	data := markdown.NormalizeNewlines([]byte(md))
+	data := markdown.NormalizeNewlines([]byte(body))
 	node := p.Parse(data)
 
 	renderer := &mrkdwnRenderer{}
 	result := markdown.Render(node, renderer)
 
-	return strings.TrimSpace(string(result))
+	return leading + strings.Trim(string(result), "\n\r") + trailing
 }
 
 // mrkdwnRenderer renders markdown AST to Slack's mrkdwn format.

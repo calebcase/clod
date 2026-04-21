@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -38,6 +40,21 @@ var initSSHOptions = []initSSHOption{
 	{"auto", "auto (recommended)", "Use an existing SSH agent or spawn one on demand."},
 	{"false", "false", "No SSH forwarding into the container."},
 	{"true", "true", "Require a pre-existing SSH agent; fail if none."},
+}
+
+// initModelOption is one model choice for `claude --model`. Values must
+// match what the model-switch reaction emoji mapping uses so that the
+// indicator reaction ends up consistent after setup.
+type initModelOption struct {
+	Value       string
+	Label       string
+	Description string
+}
+
+var initModelOptions = []initModelOption{
+	{"opus", "🎼 Opus (most capable)", "Best for complex reasoning and hard problems. Slower and more expensive."},
+	{"sonnet", "📜 Sonnet (balanced, recommended)", "Good default for most tasks. Faster and cheaper than Opus."},
+	{"claude-haiku-4-5", "🌸 Haiku (fast and cheap)", "Best for quick, simple tasks. Fastest and cheapest."},
 }
 
 // defaultAptPackages are always offered in the package picker.
@@ -117,6 +134,31 @@ func discoverSiblingPackages(basePath, excludeTask string) []string {
 	return out
 }
 
+// discoverTemplateTasks lists sibling directory names under basePath
+// (excluding the new task's own name) that are candidates for copying as
+// a template. We don't require a `.clod/` to exist — any sibling directory
+// with content is a valid starting point — but we do skip dotfiles so
+// bot bookkeeping (.git, .DS_Store, etc.) doesn't show up as a choice.
+func discoverTemplateTasks(basePath, excludeTask string) []string {
+	entries, err := os.ReadDir(basePath)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == excludeTask || strings.HasPrefix(name, ".") {
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // initPackageSuggestions builds the deduplicated package list for the
 // checkbox picker: defaults + packages appearing in 2+ sibling tasks.
 func initPackageSuggestions(basePath, excludeTask string) []string {
@@ -154,8 +196,11 @@ type pendingInit struct {
 	UserID       string
 	MentionTS    string   // ev.TimeStamp of the user's @-mention
 	Packages     []string // suggestion list, also the checkbox options
+	Templates    []string // sibling task names available as templates (empty for none)
 	SelImage     string   // currently-selected image value
 	SelSSH       string   // currently-selected ssh mode
+	SelModel     string   // currently-selected model (value from initModelOptions)
+	SelTemplate  string   // currently-selected template (sibling task name) or "" for none
 	SelPackages  []string // currently-selected package indices (as strings)
 }
 
@@ -233,6 +278,74 @@ func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
 	sshRadio := slack.NewRadioButtonsBlockElement("init_ssh", sshOpts...)
 	sshRadio.InitialOption = initialSSH
 	blocks = append(blocks, slack.NewActionBlock("init_ssh_row", sshRadio))
+
+	// Model (radio). The selection becomes the thread's stored Model
+	// preference and gets forwarded to claude as --model on every run
+	// until the user switches via reaction emoji.
+	modelOpts := make([]*slack.OptionBlockObject, 0, len(initModelOptions))
+	var initialModel *slack.OptionBlockObject
+	for _, o := range initModelOptions {
+		label := truncateForSlackText(o.Label, 75)
+		desc := truncateForSlackText(o.Description, 75)
+		opt := slack.NewOptionBlockObject(
+			o.Value,
+			slack.NewTextBlockObject("plain_text", label, false, false),
+			slack.NewTextBlockObject("plain_text", desc, false, false),
+		)
+		modelOpts = append(modelOpts, opt)
+		if o.Value == p.SelModel {
+			initialModel = opt
+		}
+	}
+	if initialModel == nil && len(modelOpts) > 0 {
+		initialModel = modelOpts[0]
+	}
+	blocks = append(blocks,
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", "*Model*", false, false),
+			nil, nil,
+		),
+	)
+	modelRadio := slack.NewRadioButtonsBlockElement("init_model", modelOpts...)
+	modelRadio.InitialOption = initialModel
+	blocks = append(blocks, slack.NewActionBlock("init_model_row", modelRadio))
+
+	// Template (radio). If there are sibling tasks, offer them as a
+	// starting point — picking one copies that directory's contents
+	// (excluding per-instance `.clod/` state) before the .clod config
+	// files below are written from the other pickers.
+	if len(p.Templates) > 0 {
+		tplOpts := make([]*slack.OptionBlockObject, 0, len(p.Templates)+1)
+		noneOpt := slack.NewOptionBlockObject(
+			"",
+			slack.NewTextBlockObject("plain_text", "(none)", false, false),
+			slack.NewTextBlockObject("plain_text", "Start from an empty directory.", false, false),
+		)
+		tplOpts = append(tplOpts, noneOpt)
+		var initialTpl *slack.OptionBlockObject = noneOpt
+		for _, t := range p.Templates {
+			label := truncateForSlackText(t, 75)
+			desc := truncateForSlackText(fmt.Sprintf("Copy contents of `%s` as a starting point.", t), 75)
+			opt := slack.NewOptionBlockObject(
+				t,
+				slack.NewTextBlockObject("plain_text", label, false, false),
+				slack.NewTextBlockObject("plain_text", desc, false, false),
+			)
+			tplOpts = append(tplOpts, opt)
+			if t == p.SelTemplate {
+				initialTpl = opt
+			}
+		}
+		blocks = append(blocks,
+			slack.NewSectionBlock(
+				slack.NewTextBlockObject("mrkdwn", "*Template* (optional)\n_Copies the chosen task's files into the new directory. Per-task `.clod/` state is regenerated._", false, false),
+				nil, nil,
+			),
+		)
+		tplRadio := slack.NewRadioButtonsBlockElement("init_template", tplOpts...)
+		tplRadio.InitialOption = initialTpl
+		blocks = append(blocks, slack.NewActionBlock("init_template_row", tplRadio))
+	}
 
 	// Packages (checkboxes). Values are indices into p.Packages so the
 	// label length doesn't blow past the 75-char option-text cap.
@@ -394,4 +507,109 @@ func writeInitFiles(p *pendingInit, image, sshMode string, packages []string) er
 	}
 
 	return nil
+}
+
+// copyTaskTemplate clones the contents of src into dst, skipping paths
+// under `.clod/` that carry per-instance state (id, system/, runtime-*,
+// claude/). Called before writeInitFiles so the subsequent `.clod/` files
+// written from the user's picks land on top of the template — if the
+// template included those same files they get overwritten with the
+// current selections, which is what we want.
+func copyTaskTemplate(src, dst string) error {
+	srcAbs, err := filepath.Abs(src)
+	if err != nil {
+		return fmt.Errorf("abs template src: %w", err)
+	}
+	info, err := os.Stat(srcAbs)
+	if err != nil {
+		return fmt.Errorf("stat template src %s: %w", srcAbs, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("template src is not a directory: %s", srcAbs)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("create template dst: %w", err)
+	}
+
+	return filepath.WalkDir(srcAbs, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(srcAbs, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if isPerInstanceClodPath(rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			// 0o755 is fine for new task dirs — matches what clod's
+			// init creates. Preserving exact template perms isn't
+			// worth the complexity.
+			return os.MkdirAll(target, 0o755)
+		}
+		return copyRegularFile(path, target)
+	})
+}
+
+// isPerInstanceClodPath returns true for `.clod/` subpaths that must NOT
+// carry across when cloning a task. These are regenerated by clod on the
+// new task's first run; copying them would share docker image names,
+// credentials, or cached build state with the template.
+func isPerInstanceClodPath(rel string) bool {
+	skips := []string{
+		filepath.Join(".clod", "id"),
+		filepath.Join(".clod", "hash"),
+		filepath.Join(".clod", "system"),
+		filepath.Join(".clod", "claude"),
+	}
+	for _, s := range skips {
+		if rel == s || strings.HasPrefix(rel, s+string(filepath.Separator)) {
+			return true
+		}
+	}
+	// runtime-XXX directories are per-invocation scratch space.
+	if strings.HasPrefix(rel, filepath.Join(".clod", "runtime-")) {
+		return true
+	}
+	return false
+}
+
+func copyRegularFile(srcPath, dstPath string) error {
+	info, err := os.Stat(srcPath)
+	if err != nil {
+		return err
+	}
+	// Symlinks: preserve as symlinks (don't follow + re-copy a potentially
+	// giant target).
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(srcPath)
+		if err != nil {
+			return err
+		}
+		_ = os.Remove(dstPath)
+		return os.Symlink(target, dstPath)
+	}
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return err
+	}
+	s, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	d, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	_, err = io.Copy(d, s)
+	return err
 }

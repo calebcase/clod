@@ -42,3 +42,55 @@ func ParseContinuation(text string) string {
 	}
 	return strings.TrimSpace(matches[1])
 }
+
+// AllowCommand represents a parsed `@bot allow @user` or
+// `@bot disallow @user` message. Action is "allow" or "disallow".
+// UserID is the target Slack user id (without the `<@...>` wrapping).
+type AllowCommand struct {
+	Action string
+	UserID string
+}
+
+// allowCommandPattern matches: <@BOT> (allow|disallow) <@USERID>
+var allowCommandPattern = regexp.MustCompile(`(?i)<@[A-Z0-9]+>\s+(allow|disallow)\s+<@([A-Z0-9]+)>`)
+
+// ParseAllowCommand extracts an allow/disallow command from a bot
+// mention. Returns nil if the message doesn't match the shape.
+func ParseAllowCommand(text string) *AllowCommand {
+	m := allowCommandPattern.FindStringSubmatch(text)
+	if len(m) < 3 {
+		return nil
+	}
+	return &AllowCommand{
+		Action: strings.ToLower(m[1]),
+		UserID: m[2],
+	}
+}
+
+// SetCommand represents a parsed `@bot set FIELD=VALUE` message.
+type SetCommand struct {
+	Field string // normalized: "verbosity", "model", "plan"
+	Value string // raw value token (whitespace trimmed)
+}
+
+// setCommandPattern matches: <@BOT> set FIELD=VALUE
+// Group 1: field name. Group 2: value (greedy rest of line).
+// Field names are alphanumeric + dash/underscore. Value can contain
+// anything including emoji markup like :musical_score:.
+var setCommandPattern = regexp.MustCompile(`(?i)<@[A-Z0-9]+>\s+set\s+([a-z_-]+)\s*=\s*(.+)`)
+
+// ParseSetCommand extracts a `set field=value` command from a bot mention.
+// Returns nil if the message isn't a set command. The field is
+// lowercased; the value is whitespace-trimmed but otherwise preserved
+// (callers interpret it based on the field — e.g. emoji markup vs
+// literal values vs "+"/"-" deltas).
+func ParseSetCommand(text string) *SetCommand {
+	m := setCommandPattern.FindStringSubmatch(text)
+	if len(m) < 3 {
+		return nil
+	}
+	return &SetCommand{
+		Field: strings.ToLower(strings.TrimSpace(m[1])),
+		Value: strings.TrimSpace(m[2]),
+	}
+}

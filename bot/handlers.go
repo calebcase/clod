@@ -113,9 +113,17 @@ const (
 	// Model-indicator emojis. Bot adds its own reaction to the task's
 	// status message to show which model is active; a user reacting with a
 	// different model emoji switches the active model for the thread.
-	opusEmoji   = "musical_score" // 🎼 Opus
-	sonnetEmoji = "scroll"        // 📜 Sonnet
+	opusEmoji   = "musical_score"  // 🎼 Opus
+	sonnetEmoji = "scroll"         // 📜 Sonnet
 	haikuEmoji  = "cherry_blossom" // 🌸 Haiku
+
+	// planModeEmoji marks plan-mode on the anchor message. A thread starts
+	// with plan mode ON by default (bot adds this reaction); removing the
+	// reaction drops back to default permission mode; re-adding it turns
+	// plan mode back on. Takes effect on the NEXT runClod invocation —
+	// claude can't switch permission modes mid-session in stream-json
+	// mode.
+	planModeEmoji = "thought_balloon" // 💭 plan mode
 
 	// Default model string when no thread preference exists and no bot
 	// default is set. Matches a common --model alias.
@@ -188,8 +196,10 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 
 	logger.Info().Msg("received app mention")
 
-	// Check authorization
-	if !h.bot.auth.IsAuthorized(ev.User) {
+	// Authorization — global allowlist plus the per-thread allowlist
+	// maintained via `@bot allow/disallow @user`. The per-thread list
+	// only carries weight inside the thread it was set in.
+	if !h.authorizedInThread(ev.Channel, threadTS, ev.User) {
 		logger.Warn().Msg("unauthorized user")
 		if _, err := h.bot.PostMessage(ev.Channel, h.bot.auth.RejectMessage(), threadTS); err != nil {
 			logger.Error().Err(err).Msg("failed to post authorization rejection message")
@@ -197,12 +207,34 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 		return
 	}
 
+	// `@bot allow @user` / `@bot disallow @user` — manage the
+	// per-thread allowlist. Handled before `set` so the field-value
+	// regex can't accidentally match it (it won't, but be explicit).
+	if cmd := ParseAllowCommand(ev.Text); cmd != nil {
+		h.handleAllowCommand(ev, threadTS, cmd, logger)
+		return
+	}
+
+	// `@bot set FIELD=VALUE` — thread-level preference change. Handled
+	// before running-task input forwarding so commands work regardless of
+	// whether the task is still running.
+	if cmd := ParseSetCommand(ev.Text); cmd != nil {
+		h.handleSetCommand(ev, threadTS, cmd, logger)
+		return
+	}
+
 	// Check if there's already a running task in this thread
 	progressKey := key(ev.Channel, threadTS)
 	if taskVal, ok := h.runningTasks.Load(progressKey); ok {
-		// Task is running - send this as input to Claude
+		// Task is running - send this as input to Claude.
 		task := taskVal.(*RunningTask)
 		input := ParseContinuation(ev.Text)
+		// If the user attached files, download them into the task dir
+		// and append the paths so the agent can act on them.
+		input = h.augmentInputWithAttachments(
+			ev.Channel, threadTS, ev.TimeStamp, task.taskPath,
+			input, false, logger,
+		)
 		if input != "" {
 			logger.Debug().Str("input", input).Msg("sending input to running task")
 			if err := task.SendInput(input); err != nil {
@@ -258,7 +290,14 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 	taskVal, ok := h.runningTasks.Load(progressKey)
 
 	if ok {
-		// Task is running - send input or handle permission
+		// Task is running - send input or handle permission.
+		// Authorization check: only bot-wide or per-thread allowed users
+		// can drive the agent. Everyone else is silently ignored so we
+		// don't disrupt unrelated conversation in the same channel.
+		if !h.authorizedInThread(ev.Channel, threadTS, ev.User) {
+			logger.Debug().Msg("unauthorized user posted in active thread, ignoring")
+			return
+		}
 		task := taskVal.(*RunningTask)
 
 		// Check if we're waiting for a permission response (text fallback - buttons are preferred)
@@ -297,11 +336,16 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 			return
 		}
 
-		// Send the message as input to Claude
-		logger.Debug().Str("input", ev.Text).Msg("sending thread reply to running task")
+		// Send the message as input to Claude, augmented with file
+		// attachment paths if any were uploaded alongside the message.
+		input := h.augmentInputWithAttachments(
+			ev.Channel, threadTS, ev.TimeStamp, task.taskPath,
+			ev.Text, true, logger,
+		)
+		logger.Debug().Str("input", input).Msg("sending thread reply to running task")
 		// Clear output message consolidation since user sent a message.
 		h.lastOutputMsg.Delete(key(ev.Channel, threadTS))
-		if err := task.SendInput(ev.Text); err != nil {
+		if err := task.SendInput(input); err != nil {
 			logger.Error().Err(err).Msg("failed to send input to task")
 		}
 		return
@@ -315,8 +359,8 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		return
 	}
 
-	// Check authorization
-	if !h.bot.auth.IsAuthorized(ev.User) {
+	// Check authorization — accept bot-wide OR per-thread allowlist.
+	if !h.authorizedInThread(ev.Channel, threadTS, ev.User) {
 		logger.Warn().Msg("unauthorized user trying to resume session")
 		return
 	}
@@ -333,51 +377,12 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 	// Clear output message consolidation since user sent a message.
 	h.lastOutputMsg.Delete(key(ev.Channel, threadTS))
 
-	// Check for files attached to the message and download them to .clod-runtime/inputs.
-	slackFiles, err := h.bot.files.GetThreadReplyFiles(ev.Channel, threadTS, ev.TimeStamp)
-	if err != nil {
-		logger.Warn().Err(err).Msg("failed to check for thread reply files")
-	}
-
-	// Download files to disk for Claude to read.
-	var downloadedFiles []string
-	if len(slackFiles) > 0 {
-		if _, err := h.bot.PostMessage(
-			ev.Channel,
-			fmt.Sprintf(":inbox_tray: Downloading %d file(s)...", len(slackFiles)),
-			threadTS,
-		); err != nil {
-			logger.Error().Err(err).Msg("failed to post file download message")
-		}
-		for _, file := range slackFiles {
-			localPath, err := h.bot.files.DownloadToTask(file, session.TaskPath)
-			if err != nil {
-				logger.Error().Err(err).Str("file_id", file.ID).Msg("failed to download file")
-				if _, postErr := h.bot.PostMessage(
-					ev.Channel,
-					fmt.Sprintf(":warning: Failed to download `%s`: %v", file.Name, err),
-					threadTS,
-				); postErr != nil {
-					logger.Error().Err(postErr).Msg("failed to post download error message")
-				}
-				continue
-			}
-			logger.Info().
-				Str("file_id", file.ID).
-				Str("local_path", localPath).
-				Msg("file downloaded to task inputs")
-			downloadedFiles = append(downloadedFiles, localPath)
-		}
-	}
-
-	// Build the prompt, appending file paths if any were downloaded.
-	prompt := ev.Text
-	if len(downloadedFiles) > 0 {
-		prompt += "\n\nAttached files have been saved to:\n"
-		for _, path := range downloadedFiles {
-			prompt += fmt.Sprintf("- %s\n", path)
-		}
-	}
+	// Download any attached files and append their saved paths to the
+	// prompt so the resumed agent can pick them up on this turn.
+	prompt := h.augmentInputWithAttachments(
+		ev.Channel, threadTS, ev.TimeStamp, session.TaskPath,
+		ev.Text, true, logger,
+	)
 
 	// Post status
 	if _, err := h.bot.PostMessage(
@@ -402,78 +407,446 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 	)
 }
 
-// HandleReactionAdded processes reaction_added events.
+// HandleReactionAdded is intentionally a no-op. Thread-level state
+// (verbosity, model, plan mode) is changed via `@bot set FIELD=VALUE`
+// messages, not reactions. The bot still *posts* its own reactions on
+// the anchor message as a read-only visual indicator of current state,
+// but user-added reactions are ignored so accidental clicks don't flip
+// settings and so the bot-vs-user reaction asymmetry (the bot can't
+// remove a user's reaction) stops causing stuck indicators.
 func (h *Handler) HandleReactionAdded(ctx context.Context, ev *slackevents.ReactionAddedEvent) {
-	// Model-switch reactions fall through to a dedicated handler since they
-	// don't fit the verbosity level/message shape.
-	if _, ok := emojiToModel[ev.Reaction]; ok {
-		h.handleModelReaction(ctx, ev)
-		return
-	}
+	// Intentionally blank — see comment above.
+}
 
-	var level int
-	var message string
-	switch ev.Reaction {
-	case verbosityEmoji:
-		level = 1
-		message = ":speech_balloon: Verbose mode enabled - tool outputs will include full content."
-	case seeNoEvilEmoji:
-		level = -1
-		message = ":see_no_evil: Silent mode enabled - verbose tool outputs will be hidden."
-	default:
-		return
+// augmentInputWithAttachments downloads any Slack files attached to a
+// message and appends their local paths to `input` in the same
+// "Attached files have been saved to:" shape that the initial prompt
+// uses. Posts status/error messages in the thread as side-effects.
+// When isThreadReply is true we use GetThreadReplyFiles (which resolves
+// via conversations.replies); false uses GetMessageFiles (resolves via
+// conversations.history) — app_mention events don't carry the files
+// array directly so we always have to refetch.
+func (h *Handler) augmentInputWithAttachments(
+	channelID, threadTS, messageTS, taskPath, input string,
+	isThreadReply bool,
+	logger zerolog.Logger,
+) string {
+	var slackFiles []slack.File
+	var err error
+	if isThreadReply {
+		slackFiles, err = h.bot.files.GetThreadReplyFiles(channelID, threadTS, messageTS)
+	} else {
+		slackFiles, err = h.bot.files.GetMessageFiles(channelID, messageTS)
 	}
+	if err != nil {
+		logger.Warn().Err(err).Msg("failed to check for message files")
+		return input
+	}
+	if len(slackFiles) == 0 {
+		return input
+	}
+	if _, err := h.bot.PostMessage(
+		channelID,
+		fmt.Sprintf(":inbox_tray: Downloading %d file(s)...", len(slackFiles)),
+		threadTS,
+	); err != nil {
+		logger.Error().Err(err).Msg("failed to post file download message")
+	}
+	var downloaded []string
+	for _, file := range slackFiles {
+		localPath, err := h.bot.files.DownloadToTask(file, taskPath)
+		if err != nil {
+			logger.Error().Err(err).Str("file_id", file.ID).Msg("failed to download file")
+			if _, postErr := h.bot.PostMessage(
+				channelID,
+				fmt.Sprintf(":warning: Failed to download `%s`: %v", file.Name, err),
+				threadTS,
+			); postErr != nil {
+				logger.Error().Err(postErr).Msg("failed to post download error message")
+			}
+			continue
+		}
+		logger.Info().
+			Str("file_id", file.ID).
+			Str("local_path", localPath).
+			Msg("file downloaded to task inputs")
+		downloaded = append(downloaded, localPath)
+	}
+	if len(downloaded) == 0 {
+		return input
+	}
+	if input != "" {
+		input += "\n\n"
+	}
+	input += "Attached files have been saved to:\n"
+	for _, p := range downloaded {
+		input += fmt.Sprintf("- %s\n", p)
+	}
+	return input
+}
 
-	logger := h.logger.With().
-		Str("channel", ev.Item.Channel).
-		Str("item_ts", ev.Item.Timestamp).
-		Str("user", ev.User).
-		Str("reaction", ev.Reaction).
-		Int("level", level).
+// authorizedInThread reports whether userID can drive the bot in this
+// thread: either they're on the bot-wide allowlist OR the thread's
+// per-thread allowlist (managed via `@bot allow/disallow @user`).
+func (h *Handler) authorizedInThread(channelID, threadTS, userID string) bool {
+	if h.bot.auth.IsAuthorized(userID) {
+		return true
+	}
+	return h.bot.sessions.IsExtraAllowedUser(channelID, threadTS, userID)
+}
+
+// handleAllowCommand adds or removes a Slack user from the thread's
+// per-thread allowlist. The thread owner (and anyone already authorized
+// in this thread) can manage the list.
+func (h *Handler) handleAllowCommand(
+	ev *slackevents.AppMentionEvent,
+	threadTS string,
+	cmd *AllowCommand,
+	logger zerolog.Logger,
+) {
+	logger = logger.With().
+		Str("allow_action", cmd.Action).
+		Str("target_user", cmd.UserID).
 		Logger()
 
-	// Determine thread TS - the reacted item could be the thread root or a reply.
-	threadTS, err := h.getThreadTS(ev.Item.Channel, ev.Item.Timestamp)
-	if err != nil {
-		logger.Debug().Err(err).Msg("failed to get thread TS for reaction")
+	session := h.bot.sessions.Get(ev.Channel, threadTS)
+	if session == nil || session.TaskName == "" {
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":warning: `allow`/`disallow` only work inside a thread the bot has started.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post allow-command scope warning")
+		}
 		return
 	}
 
-	logger = logger.With().Str("thread_ts", threadTS).Logger()
-
-	// A non-empty SessionID means the bot was explicitly invoked in this thread.
-	session := h.bot.sessions.Get(ev.Item.Channel, threadTS)
-	hasActiveTask := session != nil && session.SessionID != ""
-
-	if hasActiveTask {
-		logger.Info().Msg("setting verbosity level for active thread")
-	} else {
-		logger.Debug().Msg("setting verbosity level for inactive thread (no confirmation will be posted)")
-	}
-
-	h.bot.sessions.SetVerbosityLevel(ev.Item.Channel, threadTS, level)
-
-	if err := h.bot.sessions.Save(); err != nil {
-		logger.Error().Err(err).Msg("failed to save session after verbosity change")
-	}
-
-	// Don't post a confirmation in threads that haven't explicitly invoked the bot.
-	if hasActiveTask {
-		if _, err := h.bot.PostMessage(
-			ev.Item.Channel,
-			message,
-			threadTS,
-		); err != nil {
-			logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
+	switch cmd.Action {
+	case "allow":
+		added, count := h.bot.sessions.AddExtraAllowedUser(ev.Channel, threadTS, cmd.UserID)
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Debug().Err(err).Msg("save after AddExtraAllowedUser")
+		}
+		var msg string
+		if added {
+			msg = fmt.Sprintf(":white_check_mark: <@%s> is now allowed to interact with the bot in this thread (%d extra user%s).",
+				cmd.UserID, count, pluralSuffix(count))
+		} else {
+			msg = fmt.Sprintf(":information_source: <@%s> already has permission in this thread (%d extra user%s).",
+				cmd.UserID, count, pluralSuffix(count))
+		}
+		if _, err := h.bot.PostMessage(ev.Channel, msg, threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post allow confirmation")
+		}
+	case "disallow":
+		removed, count := h.bot.sessions.RemoveExtraAllowedUser(ev.Channel, threadTS, cmd.UserID)
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Debug().Err(err).Msg("save after RemoveExtraAllowedUser")
+		}
+		var msg string
+		if removed {
+			msg = fmt.Sprintf(":no_entry: <@%s> no longer has per-thread permission (%d extra user%s remain).",
+				cmd.UserID, count, pluralSuffix(count))
+		} else {
+			msg = fmt.Sprintf(":information_source: <@%s> was not on this thread's allowlist.", cmd.UserID)
+		}
+		if _, err := h.bot.PostMessage(ev.Channel, msg, threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post disallow confirmation")
 		}
 	}
 }
 
-// handleModelReaction updates the per-thread model preference when a user
-// reacts with one of the model-indicator emojis. It moves the bot's own
-// reaction on the status message so "active model" stays accurate. The new
-// model applies on the next invocation of clod in this thread (claude can't
-// change models mid-session in stream-json mode).
+func pluralSuffix(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// handleSetCommand processes `@bot set FIELD=VALUE` messages. Supported
+// fields: verbosity (−1/0/1 or emoji), model (opus/sonnet/haiku or emoji),
+// plan (on/off/+/-/emoji). Values of "+" and "-" mean "step up" and
+// "step down" respectively — sensible for ordinals (verbosity) and
+// cyclic (model) values, binary-toggle for plan. The bot-owned anchor
+// reactions are updated to reflect the new state so they remain a
+// read-only visual indicator.
+func (h *Handler) handleSetCommand(
+	ev *slackevents.AppMentionEvent,
+	threadTS string,
+	cmd *SetCommand,
+	logger zerolog.Logger,
+) {
+	logger = logger.With().
+		Str("set_field", cmd.Field).
+		Str("set_value", cmd.Value).
+		Logger()
+
+	session := h.bot.sessions.Get(ev.Channel, threadTS)
+	if session == nil || session.TaskName == "" {
+		// Only accept `set` commands inside bot-initiated threads so
+		// random users in random channels can't flip state on sessions
+		// they don't own.
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":warning: `set` commands only work inside a thread the bot has started.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post set-command scope warning")
+		}
+		return
+	}
+
+	// Older sessions (created before ReactionAnchorTS tracking, or via
+	// continuation paths that didn't set it) have no anchor recorded.
+	// Fall back to the thread root — that's always the message that
+	// kicked off the thread — and persist so subsequent set commands
+	// hit the fast path.
+	if session.ReactionAnchorTS == "" {
+		session.ReactionAnchorTS = threadTS
+		h.bot.sessions.Set(session)
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Debug().Err(err).Msg("failed to persist backfilled reaction anchor")
+		}
+		logger.Info().Str("anchor_ts", threadTS).Msg("backfilled reaction anchor from thread root")
+	}
+
+	switch cmd.Field {
+	case "verbosity", "v":
+		h.applyVerbositySet(ev.Channel, threadTS, session, cmd.Value, logger)
+	case "model", "m":
+		h.applyModelSet(ev.Channel, threadTS, session, cmd.Value, logger)
+	case "plan", "plan_mode", "p":
+		h.applyPlanSet(ev.Channel, threadTS, session, cmd.Value, logger)
+	default:
+		if _, err := h.bot.PostMessage(ev.Channel,
+			fmt.Sprintf(":warning: Unknown setting `%s`. Valid: `verbosity`, `model`, `plan`.", cmd.Field),
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post unknown-field warning")
+		}
+	}
+}
+
+// normalizeEmojiToken strips surrounding colons so ":musical_score:" and
+// "musical_score" both map to the same emoji name.
+func normalizeEmojiToken(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, ":")
+	v = strings.TrimSuffix(v, ":")
+	return strings.ToLower(v)
+}
+
+// applyVerbositySet interprets the value against the verbosity ladder
+// (-1 silent, 0 summary, 1 full) and updates session + anchor reaction.
+func (h *Handler) applyVerbositySet(channelID, threadTS string, session *SessionMapping, value string, logger zerolog.Logger) {
+	current := h.bot.sessions.GetVerbosityLevel(channelID, threadTS)
+	var newLevel int
+	switch normalizeEmojiToken(value) {
+	case "+":
+		newLevel = current + 1
+	case "-":
+		newLevel = current - 1
+	case "0", "summary", "default":
+		newLevel = 0
+	case "1", "full", "verbose", verbosityEmoji:
+		newLevel = 1
+	case "-1", "silent", seeNoEvilEmoji:
+		newLevel = -1
+	default:
+		if _, err := h.bot.PostMessage(channelID,
+			fmt.Sprintf(":warning: Unknown verbosity value `%s`. Use `+`, `-`, `-1`/`0`/`1`, or `:speech_balloon:`/`:see_no_evil:`.", value),
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post verbosity-value warning")
+		}
+		return
+	}
+	if newLevel > 1 {
+		newLevel = 1
+	}
+	if newLevel < -1 {
+		newLevel = -1
+	}
+
+	h.bot.sessions.SetVerbosityLevel(channelID, threadTS, newLevel)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("save after verbosity set")
+	}
+	// Sync bot's anchor reactions: remove the other verbosity emojis,
+	// add the one that matches the new level. Level 0 means "default" —
+	// no dedicated reaction.
+	if session.ReactionAnchorTS != "" {
+		for _, e := range []string{verbosityEmoji, seeNoEvilEmoji} {
+			if err := h.bot.RemoveReaction(channelID, session.ReactionAnchorTS, e); err != nil {
+				logger.Debug().Err(err).Str("emoji", e).Msg("failed to remove old verbosity emoji")
+			}
+		}
+		switch newLevel {
+		case 1:
+			_ = h.bot.AddReaction(channelID, session.ReactionAnchorTS, verbosityEmoji)
+		case -1:
+			_ = h.bot.AddReaction(channelID, session.ReactionAnchorTS, seeNoEvilEmoji)
+		}
+	}
+
+	var msg string
+	switch newLevel {
+	case 1:
+		msg = ":speech_balloon: Verbose mode enabled — tool outputs include full content."
+	case 0:
+		msg = ":bookmark: Summary mode — tool outputs are summarised (default)."
+	case -1:
+		msg = ":see_no_evil: Silent mode — verbose tool outputs are hidden."
+	}
+	if _, err := h.bot.PostMessage(channelID, msg, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
+	}
+}
+
+// applyModelSet accepts model names, model emoji tokens, or `+`/`-`
+// (cycle forward/back through the known model list).
+func (h *Handler) applyModelSet(channelID, threadTS string, session *SessionMapping, value string, logger zerolog.Logger) {
+	// Canonical cycle order: sonnet (default) → opus → haiku → sonnet …
+	cycle := []string{"sonnet", "opus", "claude-haiku-4-5"}
+
+	current := session.Model
+	if current == "" {
+		current = fallbackModel
+	}
+
+	var newModel string
+	switch v := normalizeEmojiToken(value); v {
+	case "+":
+		newModel = cycleModel(cycle, current, 1)
+	case "-":
+		newModel = cycleModel(cycle, current, -1)
+	case "opus", opusEmoji:
+		newModel = "opus"
+	case "sonnet", sonnetEmoji:
+		newModel = "sonnet"
+	case "haiku", "claude-haiku-4-5", haikuEmoji:
+		newModel = "claude-haiku-4-5"
+	default:
+		// Accept any other string verbatim — the user may pass a full
+		// model id we don't hard-code. claude will reject it at the
+		// --model flag if it's genuinely bogus.
+		newModel = value
+	}
+
+	if newModel == current {
+		if _, err := h.bot.PostMessage(channelID,
+			fmt.Sprintf(":information_source: Model already `%s`.", newModel), threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post already-set notice")
+		}
+		return
+	}
+
+	h.bot.sessions.SetModel(channelID, threadTS, newModel)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("save after model set")
+	}
+
+	// Refresh the anchor reaction — remove any known model emoji, add
+	// the new one. Idempotent RemoveReaction on emojis we didn't add.
+	newEmoji := emojiForModel(newModel)
+	if session.ReactionAnchorTS != "" {
+		for _, e := range []string{opusEmoji, sonnetEmoji, haikuEmoji} {
+			if e == newEmoji {
+				continue
+			}
+			if err := h.bot.RemoveReaction(channelID, session.ReactionAnchorTS, e); err != nil {
+				logger.Debug().Err(err).Str("emoji", e).Msg("failed to remove old model emoji")
+			}
+		}
+		if err := h.bot.AddReaction(channelID, session.ReactionAnchorTS, newEmoji); err != nil {
+			logger.Debug().Err(err).Msg("failed to add new model emoji")
+		}
+		h.bot.sessions.SetModelReactionEmoji(channelID, threadTS, newEmoji)
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Debug().Err(err).Msg("save after model emoji update")
+		}
+	}
+
+	if _, err := h.bot.PostMessage(channelID,
+		fmt.Sprintf(":%s: Model set to `%s` — takes effect on the next message you send in this thread.", newEmoji, newModel),
+		threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post model-set confirmation")
+	}
+}
+
+func cycleModel(cycle []string, current string, step int) string {
+	if len(cycle) == 0 {
+		return current
+	}
+	idx := 0
+	for i, m := range cycle {
+		if m == current {
+			idx = i
+			break
+		}
+	}
+	next := (idx + step) % len(cycle)
+	if next < 0 {
+		next += len(cycle)
+	}
+	return cycle[next]
+}
+
+// applyPlanSet accepts on/off/+/-/emoji and toggles the thread's plan mode.
+func (h *Handler) applyPlanSet(channelID, threadTS string, session *SessionMapping, value string, logger zerolog.Logger) {
+	var newEnabled bool
+	switch normalizeEmojiToken(value) {
+	case "on", "+", "plan", "true", "yes", planModeEmoji:
+		newEnabled = true
+	case "off", "-", "default", "none", "false", "no":
+		newEnabled = false
+	default:
+		if _, err := h.bot.PostMessage(channelID,
+			fmt.Sprintf(":warning: Unknown plan value `%s`. Use `on`/`off`, `+`/`-`, or `:thought_balloon:`.", value),
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post plan-value warning")
+		}
+		return
+	}
+	newMode := ""
+	if newEnabled {
+		newMode = "plan"
+	}
+	if session.PermissionMode == newMode {
+		if _, err := h.bot.PostMessage(channelID,
+			fmt.Sprintf(":information_source: Plan mode is already `%s`.",
+				map[bool]string{true: "on", false: "off"}[newEnabled]),
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post already-set notice")
+		}
+		return
+	}
+
+	h.bot.sessions.SetPermissionMode(channelID, threadTS, newMode)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("save after plan set")
+	}
+
+	if session.ReactionAnchorTS != "" {
+		if newEnabled {
+			_ = h.bot.AddReaction(channelID, session.ReactionAnchorTS, planModeEmoji)
+		} else {
+			_ = h.bot.RemoveReaction(channelID, session.ReactionAnchorTS, planModeEmoji)
+		}
+	}
+
+	var msg string
+	if newEnabled {
+		msg = ":thought_balloon: *Plan mode ON* — the agent will propose changes for approval before editing. Takes effect on the next message you send in this thread."
+	} else {
+		msg = ":thought_balloon: *Plan mode OFF* — the agent can edit directly. Takes effect on the next message you send in this thread."
+	}
+	if _, err := h.bot.PostMessage(channelID, msg, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post plan-mode confirmation")
+	}
+}
+
+// handleModelReaction is retained for history but no longer called —
+// model changes go through `applyModelSet` via the `set` command.
+// Kept compiled so a future user-reaction path can re-enable it
+// trivially; remove after the new command UX settles if the dead code
+// bothers anyone.
+//
+//lint:ignore U1000 retained for potential re-enable
 func (h *Handler) handleModelReaction(ctx context.Context, ev *slackevents.ReactionAddedEvent) {
 	newModel, ok := emojiToModel[ev.Reaction]
 	if !ok {
@@ -515,91 +888,122 @@ func (h *Handler) handleModelReaction(ctx context.Context, ev *slackevents.React
 	}
 
 	// Move the bot's own indicator reaction on the task's anchor message
-	// (the user's @-mention that kicked off the task).
+	// (the user's @-mention that kicked off the task). We don't trust
+	// session.ModelReactionEmoji alone — sessions from older bot builds
+	// don't carry that field, so the stored hint can be empty even when
+	// the bot previously added an indicator. Instead, unconditionally
+	// try to remove every OTHER model emoji; each RemoveReaction is
+	// idempotent (Slack's "no_reaction" error is swallowed inside
+	// bot.RemoveReaction), so asking to remove emojis we never added
+	// is harmless and it guarantees a stale indicator doesn't survive.
+	newEmoji := emojiForModel(newModel)
 	if session.ReactionAnchorTS != "" {
-		if oldModel != "" && oldModel != newModel {
-			if err := h.bot.RemoveReaction(session.ChannelID, session.ReactionAnchorTS, emojiForModel(oldModel)); err != nil {
-				logger.Debug().Err(err).Msg("failed to remove old model reaction")
+		for _, e := range []string{opusEmoji, sonnetEmoji, haikuEmoji} {
+			if e == newEmoji {
+				continue
+			}
+			if err := h.bot.RemoveReaction(session.ChannelID, session.ReactionAnchorTS, e); err != nil {
+				logger.Debug().Err(err).Str("emoji", e).Msg("failed to remove stale model reaction")
 			}
 		}
-		if err := h.bot.AddReaction(session.ChannelID, session.ReactionAnchorTS, emojiForModel(newModel)); err != nil {
+		if err := h.bot.AddReaction(session.ChannelID, session.ReactionAnchorTS, newEmoji); err != nil {
 			logger.Debug().Err(err).Msg("failed to add new model reaction")
+		}
+		h.bot.sessions.SetModelReactionEmoji(session.ChannelID, session.ThreadTS, newEmoji)
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Debug().Err(err).Msg("failed to persist model reaction emoji")
 		}
 	}
 
 	logger.Info().Str("old_model", oldModel).Msg("switched thread model")
 
 	// Post a confirmation so the user sees the switch landed. Next-turn
-	// semantics are important context.
-	msg := fmt.Sprintf(":%s: Model set to `%s` — takes effect on the next message you send in this thread.",
+	// semantics are important context; also remind them that only their
+	// own reaction can be cleared by them (the bot can't remove a user's
+	// reaction, so their old model emoji will linger until they click
+	// to remove it).
+	msg := fmt.Sprintf(":%s: Model set to `%s` — takes effect on the next message you send in this thread. _Your previous reaction stays until you unclick it._",
 		ev.Reaction, newModel)
 	if _, err := h.bot.PostMessage(session.ChannelID, msg, threadTS); err != nil {
 		logger.Debug().Err(err).Msg("failed to post model switch confirmation")
 	}
 }
 
-// HandleReactionRemoved processes reaction_removed events.
-func (h *Handler) HandleReactionRemoved(ctx context.Context, ev *slackevents.ReactionRemovedEvent) {
-	// Only handle verbosity-related emojis.
-	if ev.Reaction != verbosityEmoji && ev.Reaction != seeNoEvilEmoji {
-		return
-	}
-
+// handlePlanModeReaction is retained for history; plan-mode toggles are
+// now driven by `applyPlanSet` via the `set` command. See the analogous
+// note on handleModelReaction.
+//
+//lint:ignore U1000 retained for potential re-enable
+func (h *Handler) handlePlanModeReaction(ctx context.Context, ev *slackevents.ReactionAddedEvent, enable bool) {
 	logger := h.logger.With().
 		Str("channel", ev.Item.Channel).
 		Str("item_ts", ev.Item.Timestamp).
 		Str("user", ev.User).
 		Str("reaction", ev.Reaction).
+		Bool("enable", enable).
 		Logger()
 
-	// Determine thread TS.
 	threadTS, err := h.getThreadTS(ev.Item.Channel, ev.Item.Timestamp)
 	if err != nil {
-		logger.Debug().Err(err).Msg("failed to get thread TS for reaction")
+		logger.Debug().Err(err).Msg("failed to get thread TS for plan-mode reaction")
+		return
+	}
+	logger = logger.With().Str("thread_ts", threadTS).Logger()
+
+	session := h.bot.sessions.Get(ev.Item.Channel, threadTS)
+	if session == nil || session.TaskName == "" {
+		logger.Debug().Msg("ignoring plan-mode reaction outside a bot-initiated thread")
 		return
 	}
 
-	logger = logger.With().Str("thread_ts", threadTS).Logger()
-
-	// Check if this thread has an active task session before posting messages.
-	// A session with a SessionID means the bot was explicitly invoked.
-	session := h.bot.sessions.Get(ev.Item.Channel, threadTS)
-	hasActiveTask := session != nil && session.SessionID != ""
-
-	level := h.getThreadVerbosityFromReactions(ev.Item.Channel, threadTS, logger)
-
-	if hasActiveTask {
-		logger.Info().Int("level", level).Msg("updating verbosity level for active thread after reaction removal")
-	} else {
-		logger.Debug().Int("level", level).Msg("updating verbosity level for inactive thread (no confirmation will be posted)")
+	newMode := ""
+	if enable {
+		newMode = "plan"
+	}
+	if session.PermissionMode == newMode {
+		logger.Debug().Msg("plan-mode reaction matches current state; nothing to do")
+		return
 	}
 
-	h.bot.sessions.SetVerbosityLevel(ev.Item.Channel, threadTS, level)
-
+	h.bot.sessions.SetPermissionMode(ev.Item.Channel, threadTS, newMode)
 	if err := h.bot.sessions.Save(); err != nil {
-		logger.Error().Err(err).Msg("failed to save session after verbosity change")
+		logger.Error().Err(err).Msg("failed to save session after plan-mode change")
 	}
 
-	// Don't post a confirmation in threads that haven't explicitly invoked the bot.
-	if hasActiveTask {
-		var message string
-		switch level {
-		case -1:
-			message = ":see_no_evil: Silent mode - verbose tool outputs hidden."
-		case 0:
-			message = ":mute: Summary mode - tool outputs show summaries only."
-		case 1:
-			message = ":speech_balloon: Verbose mode - tool outputs include full content."
-		}
-
-		if _, err := h.bot.PostMessage(
-			ev.Item.Channel,
-			message,
-			threadTS,
-		); err != nil {
-			logger.Debug().Err(err).Msg("failed to post verbosity confirmation")
+	// Keep the bot's own indicator reaction in sync — add it when turning
+	// on, remove it when turning off. User's reactions are per-user and
+	// can't be removed by the bot, so we only manage our own.
+	if session.ReactionAnchorTS != "" {
+		if enable {
+			if err := h.bot.AddReaction(ev.Item.Channel, session.ReactionAnchorTS, planModeEmoji); err != nil {
+				logger.Debug().Err(err).Msg("failed to add plan-mode reaction")
+			}
+		} else {
+			if err := h.bot.RemoveReaction(ev.Item.Channel, session.ReactionAnchorTS, planModeEmoji); err != nil {
+				logger.Debug().Err(err).Msg("failed to remove plan-mode reaction")
+			}
 		}
 	}
+
+	logger.Info().Msg("toggled thread plan mode")
+
+	// Post confirmation so the user sees the switch landed.
+	var msg string
+	if enable {
+		msg = ":thought_balloon: *Plan mode ON* — the agent will propose changes for approval before editing. Takes effect on the next message you send in this thread."
+	} else {
+		msg = ":thought_balloon: *Plan mode OFF* — the agent can edit directly. Takes effect on the next message you send in this thread."
+	}
+	if _, err := h.bot.PostMessage(ev.Item.Channel, msg, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post plan-mode confirmation")
+	}
+}
+
+// HandleReactionRemoved is a no-op for the same reason HandleReactionAdded
+// is: thread state is controlled exclusively via `@bot set FIELD=VALUE`
+// messages. User reactions don't mutate state.
+func (h *Handler) HandleReactionRemoved(ctx context.Context, ev *slackevents.ReactionRemovedEvent) {
+	// Intentionally blank.
 }
 
 // getThreadTS determines the thread timestamp for a message.
@@ -635,8 +1039,11 @@ func (h *Handler) getThreadTS(channelID, messageTS string) (string, error) {
 	return messageTS, nil
 }
 
-// getThreadVerbosityFromReactions returns the least verbose verbosity level
-// found across all reactions in the thread, or the store default if none are found.
+// getThreadVerbosityFromReactions is retained for history. Verbosity is
+// now set via `@bot set verbosity=...` so there's no reaction walk
+// needed; `applyVerbositySet` writes the level directly.
+//
+//lint:ignore U1000 retained for potential re-enable
 func (h *Handler) getThreadVerbosityFromReactions(channelID, threadTS string, logger zerolog.Logger) int {
 	params := &slack.GetConversationRepliesParameters{
 		ChannelID: channelID,
@@ -774,8 +1181,10 @@ func (h *Handler) handleNewTask(
 
 	// Post initial status with verbosity + model info
 	startMsg := fmt.Sprintf(":rocket: Starting a `%s` task...\n\n"+
-		"_Verbosity: React with 🙈 for silent, 💬 for full output (including thinking)_\n"+
-		"_Model: 🎼 Opus / 📜 Sonnet / 🌸 Haiku_",
+		"_Settings are controlled with `@bot set FIELD=VALUE`:_\n"+
+		"• `verbosity=+`/`-` or `0`/`1`/`-1` (or `:speech_balloon:` / `:see_no_evil:`) — 🙈 silent · summary · 💬 full\n"+
+		"• `model=opus|sonnet|haiku` (or `+`/`-` to cycle, or the emoji) — 🎼 · 📜 · 🌸\n"+
+		"• `plan=on|off` (or `+`/`-`) — 💭 plan mode is on by default",
 		parsed.TaskName)
 	if _, err := h.bot.PostMessage(
 		ev.Channel,
@@ -808,12 +1217,24 @@ func (h *Handler) handleNewTask(
 	}
 	session.ReactionAnchorTS = ev.TimeStamp
 	session.Model = initialModel
+	session.ModelReactionEmoji = emojiForModel(initialModel)
+	// New tasks start in plan mode by default so the agent proposes
+	// before doing; user can drop the reaction to switch to the bot's
+	// configured default permission mode.
+	if session.PermissionMode == "" {
+		session.PermissionMode = "plan"
+	}
 	h.bot.sessions.Set(session)
 	if err := h.bot.sessions.Save(); err != nil {
 		logger.Error().Err(err).Msg("failed to save session after status post")
 	}
-	if err := h.bot.AddReaction(ev.Channel, ev.TimeStamp, emojiForModel(initialModel)); err != nil {
+	if err := h.bot.AddReaction(ev.Channel, ev.TimeStamp, session.ModelReactionEmoji); err != nil {
 		logger.Debug().Err(err).Msg("failed to add model reaction")
+	}
+	if session.PermissionMode == "plan" {
+		if err := h.bot.AddReaction(ev.Channel, ev.TimeStamp, planModeEmoji); err != nil {
+			logger.Debug().Err(err).Msg("failed to add plan-mode reaction")
+		}
 	}
 
 	// Run clod
@@ -828,6 +1249,58 @@ func (h *Handler) handleNewTask(
 		threadTS,
 		logger,
 	)
+}
+
+// monitorStartPattern pulls the task id out of Monitor's success text
+// ("Monitor started (task b85o0dvlc, timeout …"). It tolerates any suffix.
+var monitorStartPattern = regexp.MustCompile(`Monitor started \(task ([a-z0-9]+)`)
+
+// monitorCountEmojis maps a current count to the Slack reaction name we
+// attach to the task's anchor message. Index 0 is unused (count 0 means
+// no emoji); 1..10 are keycap digits; counts above 10 fall through to
+// "1234" as the generic "many" marker.
+var monitorCountEmojis = [...]string{
+	"", "one", "two", "three", "four", "five",
+	"six", "seven", "eight", "nine", "keycap_ten",
+}
+
+func monitorCountEmojiFor(count int) string {
+	switch {
+	case count <= 0:
+		return ""
+	case count < len(monitorCountEmojis):
+		return monitorCountEmojis[count]
+	default:
+		return "1234"
+	}
+}
+
+// syncMonitorCountEmoji brings the anchor-message reaction into line with
+// the session's current ActiveMonitors count. Idempotent; safe to call
+// whenever monitor state changes.
+func (h *Handler) syncMonitorCountEmoji(channelID, threadTS string, logger zerolog.Logger) {
+	session := h.bot.sessions.Get(channelID, threadTS)
+	if session == nil || session.ReactionAnchorTS == "" {
+		return
+	}
+	target := monitorCountEmojiFor(len(session.ActiveMonitors))
+	if target == session.MonitorCountEmoji {
+		return
+	}
+	if session.MonitorCountEmoji != "" {
+		if err := h.bot.RemoveReaction(channelID, session.ReactionAnchorTS, session.MonitorCountEmoji); err != nil {
+			logger.Debug().Err(err).Msg("failed to remove old monitor count emoji")
+		}
+	}
+	if target != "" {
+		if err := h.bot.AddReaction(channelID, session.ReactionAnchorTS, target); err != nil {
+			logger.Debug().Err(err).Msg("failed to add monitor count emoji")
+		}
+	}
+	h.bot.sessions.SetMonitorCountEmoji(channelID, threadTS, target)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("failed to save session after monitor emoji update")
+	}
 }
 
 // safeTaskNamePattern enforces a conservative set of characters for task
@@ -898,6 +1371,14 @@ func (h *Handler) maybePromptInit(
 		}
 	}
 
+	// Preselect the bot's configured default model, falling back to the
+	// "sonnet" option (which is the second entry and lines up with the
+	// fallbackModel constant used elsewhere).
+	selModel := h.defaultModel
+	if selModel == "" {
+		selModel = fallbackModel
+	}
+	templates := discoverTemplateTasks(base, parsed.TaskName)
 	pi := &pendingInit{
 		ChannelID:    ev.Channel,
 		ThreadTS:     threadTS,
@@ -908,8 +1389,11 @@ func (h *Handler) maybePromptInit(
 		UserID:       ev.User,
 		MentionTS:    ev.TimeStamp,
 		Packages:     packages,
+		Templates:    templates,
 		SelImage:     initImageOptions[0].Value,
 		SelSSH:       initSSHOptions[0].Value,
+		SelModel:     selModel,
+		SelTemplate:  "",
 		SelPackages:  selPkgs,
 	}
 
@@ -976,6 +1460,134 @@ func (h *Handler) handleContinuation(
 	)
 }
 
+// ResumeActiveSessions is called once at bot startup. Any session still
+// flagged Active in sessions.json (the bot previously crashed / was killed
+// / timed out without a clean completion) gets revived: we post a notice
+// in the thread and spawn runClod with --resume + a nudge prompt that
+// tells the agent to pick up where it left off. Sessions whose UpdatedAt
+// is older than maxAge are considered stale — we clear the flag without
+// resuming so stopped-then-left-overnight threads don't all wake up at
+// once.
+func (h *Handler) ResumeActiveSessions(ctx context.Context, maxAge time.Duration) {
+	fresh, stale := h.bot.sessions.ActiveSessions(maxAge)
+
+	logger := h.logger.With().
+		Int("fresh", len(fresh)).
+		Int("stale", len(stale)).
+		Dur("max_age", maxAge).
+		Logger()
+
+	// Clear stale flags first so a subsequent crash during resume doesn't
+	// leave them hanging.
+	for _, s := range stale {
+		age := time.Since(s.UpdatedAt)
+		h.logger.Info().
+			Str("channel", s.ChannelID).
+			Str("thread_ts", s.ThreadTS).
+			Str("task", s.TaskName).
+			Dur("idle", age).
+			Msg("skipping stale active session")
+		h.bot.sessions.SetActive(s.ChannelID, s.ThreadTS, false)
+	}
+	if len(stale) > 0 {
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Error().Err(err).Msg("failed to persist cleared stale flags")
+		}
+	}
+
+	if len(fresh) == 0 {
+		logger.Debug().Msg("no fresh active sessions to resume")
+		return
+	}
+
+	logger.Info().Msg("resuming active sessions after bot restart")
+
+	for _, s := range fresh {
+		s := s // capture for goroutine
+		go h.resumeOneSession(ctx, s)
+	}
+}
+
+// resumeOneSession revives a single previously-active thread. Posts a
+// notice so the user knows what happened, then synthesizes a "continue
+// where you left off" prompt and runs clod via the normal session-resume
+// path. Gated per-thread by runningTasks so a duplicate resume doesn't
+// race with a human @-mention that arrives at the same moment.
+func (h *Handler) resumeOneSession(ctx context.Context, s *SessionMapping) {
+	logger := h.logger.With().
+		Str("channel", s.ChannelID).
+		Str("thread_ts", s.ThreadTS).
+		Str("task", s.TaskName).
+		Str("session_id", s.SessionID).
+		Logger()
+
+	progressKey := key(s.ChannelID, s.ThreadTS)
+	if _, alreadyRunning := h.runningTasks.Load(progressKey); alreadyRunning {
+		logger.Debug().Msg("thread already has a running task; skipping auto-resume")
+		return
+	}
+
+	// Don't resume if we have no session_id to resume against — claude
+	// won't know what conversation to pick up. Clear the flag so we
+	// don't keep trying.
+	if s.SessionID == "" {
+		logger.Warn().Msg("active session missing session_id; clearing flag without resuming")
+		h.bot.sessions.SetActive(s.ChannelID, s.ThreadTS, false)
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Debug().Err(err).Msg("failed to clear active flag")
+		}
+		return
+	}
+
+	// Verify the task dir is still on disk (user may have rm'd it).
+	if _, err := os.Stat(filepath.Join(s.TaskPath, ".clod", "system", "run")); err != nil {
+		logger.Warn().Str("task_path", s.TaskPath).Err(err).
+			Msg("active session's task path no longer exists; clearing flag without resuming")
+		h.bot.sessions.SetActive(s.ChannelID, s.ThreadTS, false)
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Debug().Err(err).Msg("failed to clear active flag")
+		}
+		return
+	}
+
+	// Monitors from the previous run died with that container. Clear the
+	// session's list and remove the count emoji so the anchor reflects
+	// "none active yet"; the agent will re-announce any monitors it
+	// restarts and we'll rebuild the count from those Monitor starts.
+	if s.MonitorCountEmoji != "" {
+		if err := h.bot.RemoveReaction(s.ChannelID, s.ReactionAnchorTS, s.MonitorCountEmoji); err != nil {
+			logger.Debug().Err(err).Msg("failed to remove monitor count emoji on resume")
+		}
+	}
+	h.bot.sessions.ClearMonitors(s.ChannelID, s.ThreadTS)
+	h.bot.sessions.SetMonitorCountEmoji(s.ChannelID, s.ThreadTS, "")
+
+	if _, err := h.bot.PostMessage(
+		s.ChannelID,
+		fmt.Sprintf(":arrows_counterclockwise: Resuming task `%s` after bot restart…", s.TaskName),
+		s.ThreadTS,
+	); err != nil {
+		logger.Debug().Err(err).Msg("failed to post resume notice")
+	}
+
+	nudge := "The bot was restarted while this task was in progress. " +
+		"Continue where you left off: if you had state worth saving, check it now; " +
+		"if you were monitoring a background process, verify it's still alive and restart it if needed; " +
+		"otherwise simply resume the work. Do not redo steps that already completed."
+
+	h.runClod(
+		ctx,
+		s.ChannelID,
+		s.UserID,
+		s.TaskPath,
+		s.TaskName,
+		nudge,
+		s.SessionID,
+		s.ThreadTS,
+		logger,
+	)
+}
+
 // runClod executes clod and streams output to Slack.
 func (h *Handler) runClod(
 	ctx context.Context,
@@ -994,14 +1606,27 @@ func (h *Handler) runClod(
 		model = h.defaultModel
 	}
 
+	// Per-thread permission mode too (currently: plan mode on/off via
+	// the :thought_balloon: reaction). Empty falls through to the
+	// Runner's bot-wide default inside Start().
+	permissionMode := h.bot.sessions.GetPermissionMode(channelID, threadTS)
+
 	// Start the task
-	task, err := h.bot.runner.Start(ctx, taskPath, prompt, sessionID, model)
+	task, err := h.bot.runner.Start(ctx, taskPath, prompt, sessionID, model, permissionMode)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to start clod")
 		if _, postErr := h.bot.PostMessage(channelID, fmt.Sprintf(":x: Failed to start task: %v", err), threadTS); postErr != nil {
 			logger.Error().Err(postErr).Msg("failed to post task start error message")
 		}
 		return
+	}
+
+	// Flag the session as actively running so a bot restart can resume it.
+	// The flag is only cleared on clean completion below — shutdown, crash,
+	// or timeout leaves it set so the next startup picks it up.
+	h.bot.sessions.SetActive(channelID, threadTS, true)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("failed to persist active flag")
 	}
 
 	// Register the running task
@@ -1022,13 +1647,24 @@ func (h *Handler) runClod(
 	var outputBuffer strings.Builder
 	ticker := time.NewTicker(batchInterval)
 	defer ticker.Stop()
+	// lastHeartbeat records when we last bumped the session's UpdatedAt
+	// via Touch+Save. See the ticker case for the gating rationale.
+	lastHeartbeat := time.Now()
 
 	// Function to flush the buffer with message consolidation.
 	threadKey := key(channelID, threadTS)
 	flushBuffer := func() {
 		if outputBuffer.Len() > 0 {
-			// Convert GitHub-flavored markdown to Slack's mrkdwn format.
-			newContent := strings.TrimSpace(outputBuffer.String())
+			// Trim only leading/trailing NEWLINES, tabs, and carriage
+			// returns — not spaces. A streaming chunk often begins with
+			// a single space because it's the continuation of the prior
+			// chunk's sentence (claude sends "Models" then " loading.");
+			// TrimSpace would eat that boundary space and the consolidation
+			// join below would glue the two chunks into "Modelsloading."
+			// since neither edge has a newline or fence. Tabs/newlines at
+			// the message edges are still noise worth trimming for tidy
+			// Slack posts.
+			newContent := strings.Trim(outputBuffer.String(), "\n\r\t")
 			if newContent != "" {
 				newContent = ConvertMarkdownToMrkdwn(newContent)
 
@@ -1147,6 +1783,20 @@ func (h *Handler) runClod(
 				goto done
 			}
 
+			// Drop trivial tool results ("(Bash completed with no output)"
+			// and similar) at default verbosity. At verbosity >= 1 we strip
+			// the prefix and let the normal output path handle it. This
+			// runs before any other prefix check because the underlying
+			// content is a normal __SNIPPET__ / fenced block that those
+			// checks expect to see raw.
+			if strings.HasPrefix(content, "__TRIVIAL__") {
+				verbosityLevel := h.bot.sessions.GetVerbosityLevel(channelID, threadTS)
+				if verbosityLevel < 1 {
+					continue
+				}
+				content = strings.TrimPrefix(content, "__TRIVIAL__")
+			}
+
 			// Surface wrapper/docker progress while the container is
 			// being prepared. Update a single rolling message so the user
 			// sees build steps happening instead of ~90s of silence on a
@@ -1226,7 +1876,11 @@ func (h *Handler) runClod(
 				if custom := h.tryPostAskUserQuestionPrompt(req, channelID, threadTS, progressKey, logger); custom != "" {
 					msgTS = custom
 				} else {
-					blocks := h.buildPermissionBlocks(req, progressKey)
+					// For ExitPlanMode with a long plan, upload the full
+					// plan as a snippet first so the user can read the
+					// portion that won't fit in the truncated prompt.
+					planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
+					blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
 					var err error
 					msgTS, err = h.bot.PostMessageBlocks(channelID, blocks, threadTS)
 					if err != nil {
@@ -1279,7 +1933,8 @@ func (h *Handler) runClod(
 				if custom := h.tryPostAskUserQuestionPrompt(req, channelID, threadTS, progressKey, logger); custom != "" {
 					msgTS = custom
 				} else {
-					blocks := h.buildPermissionBlocks(req, progressKey)
+					planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
+					blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
 					var err error
 					msgTS, err = h.bot.PostMessageBlocks(channelID, blocks, threadTS)
 					if err != nil {
@@ -1315,53 +1970,46 @@ func (h *Handler) runClod(
 			}
 
 		case <-ticker.C:
-			// Periodic flush
+			// Periodic flush + heartbeat. The heartbeat bumps the
+			// session's UpdatedAt so resume-on-restart can judge
+			// whether an Active session died "just now" (worth
+			// resuming) or "a long time ago" (stale — skip). Gated
+			// at 30s so we're not hammering the sessions.json file
+			// every 2s tick.
 			flushBuffer()
+			if time.Since(lastHeartbeat) >= 30*time.Second {
+				h.bot.sessions.Touch(channelID, threadTS)
+				if err := h.bot.sessions.Save(); err != nil {
+					logger.Debug().Err(err).Msg("heartbeat save failed")
+				}
+				lastHeartbeat = time.Now()
+			}
 
 		case result := <-task.Done():
 			// Task completed
 			flushBuffer()
-
-			// Post completion message
-			var finalMsg string
-			if result.Error != nil {
-				logger.Error().Err(result.Error).Msg("clod returned error")
-				finalMsg = fmt.Sprintf(":warning: Task completed with error: %v", result.Error)
-			} else {
-				logger.Info().
-					Str("session_id", result.SessionID).
-					Msg("task completed successfully")
-				finalMsg = ":white_check_mark: Task completed!"
-			}
-			if _, err := h.bot.PostMessage(channelID, finalMsg, threadTS); err != nil {
-				logger.Error().Err(err).Msg("failed to post final task message")
-			}
-
-			// Save session mapping
-			if result.SessionID != "" {
-				session := &SessionMapping{
-					ChannelID: channelID,
-					ThreadTS:  threadTS,
-					TaskName:  taskName,
-					TaskPath:  taskPath,
-					SessionID: result.SessionID,
-					UserID:    userID,
-					CreatedAt: time.Now(),
-				}
-				h.bot.sessions.Set(session)
-
-				if err := h.bot.sessions.Save(); err != nil {
-					logger.Error().Err(err).Msg("failed to save sessions")
-				}
-			}
+			h.finalizeTask(channelID, threadTS, taskName, taskPath, userID, result, logger)
 			return
 		}
 	}
 
 done:
-	// Wait for final result if we exited via output channel close
+	// Wait for final result if we exited via output channel close.
 	result := <-task.Done()
+	h.finalizeTask(channelID, threadTS, taskName, taskPath, userID, result, logger)
+}
+
+// finalizeTask posts the completion message, saves the session mapping,
+// and clears the Active flag *only* on clean completion. An error exit
+// (crash, timeout, shutdown cancel) leaves Active set so the next bot
+// startup can resume-or-skip based on the staleness threshold.
+func (h *Handler) finalizeTask(
+	channelID, threadTS, taskName, taskPath, userID string,
+	result *Result,
+	logger zerolog.Logger,
+) {
 	var finalMsg string
+	cleanExit := result.Error == nil
 	if result.Error != nil {
 		logger.Error().Err(result.Error).Msg("clod returned error")
 		finalMsg = fmt.Sprintf(":warning: Task completed with error: %v", result.Error)
@@ -1375,21 +2023,47 @@ done:
 		logger.Error().Err(err).Msg("failed to post final task message")
 	}
 
-	// Save session mapping
+	// The task's container is gone regardless of exit code, so any
+	// monitors that were running inside it are dead too. Drop them from
+	// the session and clear the count emoji so the anchor doesn't show
+	// a stale "N monitors active".
+	if session := h.bot.sessions.Get(channelID, threadTS); session != nil && session.ReactionAnchorTS != "" && session.MonitorCountEmoji != "" {
+		if err := h.bot.RemoveReaction(channelID, session.ReactionAnchorTS, session.MonitorCountEmoji); err != nil {
+			logger.Debug().Err(err).Msg("failed to remove stale monitor count emoji")
+		}
+	}
+	h.bot.sessions.ClearMonitors(channelID, threadTS)
+	h.bot.sessions.SetMonitorCountEmoji(channelID, threadTS, "")
+
 	if result.SessionID != "" {
-		session := &SessionMapping{
-			ChannelID: channelID,
-			ThreadTS:  threadTS,
-			TaskName:  taskName,
-			TaskPath:  taskPath,
-			SessionID: result.SessionID,
-			UserID:    userID,
-			CreatedAt: time.Now(),
+		session := h.bot.sessions.Get(channelID, threadTS)
+		if session == nil {
+			session = &SessionMapping{
+				ChannelID: channelID,
+				ThreadTS:  threadTS,
+				TaskName:  taskName,
+				TaskPath:  taskPath,
+				UserID:    userID,
+				CreatedAt: time.Now(),
+			}
+		}
+		session.SessionID = result.SessionID
+		session.TaskName = taskName
+		session.TaskPath = taskPath
+		if cleanExit {
+			session.Active = false
 		}
 		h.bot.sessions.Set(session)
-
 		if err := h.bot.sessions.Save(); err != nil {
 			logger.Error().Err(err).Msg("failed to save sessions")
+		}
+	} else if cleanExit {
+		// No session_id captured (e.g., failure before init). Clear
+		// the Active flag anyway so we don't try to resume a task
+		// claude never accepted.
+		h.bot.sessions.SetActive(channelID, threadTS, false)
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Debug().Err(err).Msg("failed to clear active flag")
 		}
 	}
 }
@@ -1409,7 +2083,30 @@ type PermissionActionValue struct {
 }
 
 // buildPermissionBlocks creates Slack blocks for a permission prompt with buttons.
-func (h *Handler) buildPermissionBlocks(req PermissionRequest, progressKey string) []slack.Block {
+// maybeUploadLongPlan uploads an ExitPlanMode tool's `plan` field as a
+// Slack snippet when it's too long to fit in the permission-prompt
+// section (Slack's 3000-char section-text cap). Returns true if a snippet
+// was successfully posted so the caller knows to swap the truncation
+// marker for an "attached file" pointer. No-op for any other tool or for
+// plans that fit inline.
+const maxInlinePlanLen = 2800
+
+func (h *Handler) maybeUploadLongPlan(req PermissionRequest, channelID, threadTS string, logger zerolog.Logger) bool {
+	if req.ToolName != "ExitPlanMode" {
+		return false
+	}
+	plan, ok := req.ToolInput["plan"].(string)
+	if !ok || len(plan) <= maxInlinePlanLen {
+		return false
+	}
+	if _, err := h.bot.files.UploadSnippet(plan, "plan.md", ":bookmark_tabs: Full proposed plan", channelID, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to upload long plan snippet")
+		return false
+	}
+	return true
+}
+
+func (h *Handler) buildPermissionBlocks(req PermissionRequest, progressKey string, planAttached bool) []slack.Block {
 	blocks := []slack.Block{}
 
 	// Header
@@ -1452,6 +2149,16 @@ func (h *Handler) buildPermissionBlocks(req PermissionRequest, progressKey strin
 		if query, ok := req.ToolInput["query"].(string); ok {
 			detailText = fmt.Sprintf("*Query:* `%s`", query)
 		}
+	case "ExitPlanMode":
+		// ExitPlanMode's input carries the full plan markdown, which can
+		// run many KB. Rendering it inline via the generic fallback
+		// blows past Slack's 3000-char section-text cap and Slack rejects
+		// the whole block with "invalid_blocks", dropping the permission
+		// prompt. Render as-is (it's already markdown) and truncate to
+		// fit the cap.
+		if plan, ok := req.ToolInput["plan"].(string); ok {
+			detailText = "*Proposed plan:*\n" + plan
+		}
 	default:
 		// Generic display of tool input
 		var parts []string
@@ -1462,6 +2169,17 @@ func (h *Handler) buildPermissionBlocks(req PermissionRequest, progressKey strin
 	}
 
 	if detailText != "" {
+		// Slack caps section text at 3000 chars. Hit that and the whole
+		// prompt is rejected with "invalid_blocks". Hard-trim with an
+		// indicator so the user sees *something* rather than nothing.
+		const maxSectionText = 2900
+		if len(detailText) > maxSectionText {
+			marker := "_(truncated)_"
+			if req.ToolName == "ExitPlanMode" && planAttached {
+				marker = "_(truncated — full plan attached as file in the thread)_"
+			}
+			detailText = detailText[:maxSectionText] + "\n…" + marker
+		}
 		detailBlock := slack.NewTextBlockObject("mrkdwn", detailText, false, false)
 		blocks = append(blocks, slack.NewSectionBlock(detailBlock, nil, nil))
 	}
@@ -1744,6 +2462,8 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "askq_cancel"
 	isInitSelect := action.ActionID == "init_image" ||
 		action.ActionID == "init_ssh" ||
+		action.ActionID == "init_model" ||
+		action.ActionID == "init_template" ||
 		action.ActionID == "init_packages"
 	isInitFinal := action.ActionID == "init_create" ||
 		action.ActionID == "init_cancel"
@@ -2012,6 +2732,14 @@ func (h *Handler) handleInitSelect(
 		if action.SelectedOption.Value != "" {
 			state.SelSSH = action.SelectedOption.Value
 		}
+	case "init_model":
+		if action.SelectedOption.Value != "" {
+			state.SelModel = action.SelectedOption.Value
+		}
+	case "init_template":
+		// Empty value = user picked "(none)". Accept that too so
+		// deselecting a previous choice works.
+		state.SelTemplate = action.SelectedOption.Value
 	case "init_packages":
 		picks := make([]string, 0, len(action.SelectedOptions))
 		for _, opt := range action.SelectedOptions {
@@ -2023,6 +2751,8 @@ func (h *Handler) handleInitSelect(
 		Str("action_id", action.ActionID).
 		Str("image", state.SelImage).
 		Str("ssh", state.SelSSH).
+		Str("model", state.SelModel).
+		Str("template", state.SelTemplate).
 		Strs("packages", state.SelPackages).
 		Msg("recorded init selection")
 }
@@ -2072,6 +2802,36 @@ func (h *Handler) handleInitFinal(
 		chosenPkgs = append(chosenPkgs, state.Packages[i])
 	}
 
+	// If the user picked a template, clone its contents into the new
+	// task directory BEFORE writing `.clod/` config — writeInitFiles
+	// overwrites the .clod/ files from the user's pickers, so template
+	// .clod choices yield to the explicit UI selections.
+	if state.SelTemplate != "" {
+		base := h.bot.tasks.BasePath()
+		srcPath := filepath.Join(base, state.SelTemplate)
+		// Ensure the new task dir exists so the copy has a target.
+		if err := os.MkdirAll(state.TaskPath, 0o755); err != nil {
+			logger.Error().Err(err).Str("dst", state.TaskPath).Msg("failed to create task dir for template copy")
+			msg := fmt.Sprintf(":x: Couldn't create the task directory: %v", err)
+			if updErr := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, msg); updErr != nil {
+				logger.Error().Err(updErr).Msg("failed to update init prompt after mkdir error")
+			}
+			return
+		}
+		if err := copyTaskTemplate(srcPath, state.TaskPath); err != nil {
+			logger.Error().Err(err).Str("template", state.SelTemplate).Msg("failed to copy template")
+			msg := fmt.Sprintf(":x: Couldn't copy template `%s`: %v", state.SelTemplate, err)
+			if updErr := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, msg); updErr != nil {
+				logger.Error().Err(updErr).Msg("failed to update init prompt after copy error")
+			}
+			return
+		}
+		// The copy may have placed a task dir; mark CreateDir=false so
+		// writeInitFiles doesn't try to MkdirAll again (it's idempotent
+		// but this keeps intent clear).
+		state.CreateDir = false
+	}
+
 	if err := writeInitFiles(state, state.SelImage, state.SelSSH, chosenPkgs); err != nil {
 		logger.Error().Err(err).Msg("failed to write init files")
 		msg := fmt.Sprintf(":x: Couldn't create the task setup: %v", err)
@@ -2090,14 +2850,26 @@ func (h *Handler) handleInitFinal(
 		logger.Warn().Err(err).Msg("failed to refresh task registry after init")
 	}
 
+	// Store the chosen model on the session so runClod + the anchor
+	// indicator both pick it up when startTaskAfterInit fires.
+	if state.SelModel != "" {
+		h.bot.sessions.SetModel(state.ChannelID, state.ThreadTS, state.SelModel)
+		if err := h.bot.sessions.Save(); err != nil {
+			logger.Debug().Err(err).Msg("failed to persist chosen model")
+		}
+	}
+
 	// Update the prompt with the outcome.
-	var pkgLine string
+	var pkgLine, tplLine string
 	if len(chosenPkgs) > 0 {
 		pkgLine = fmt.Sprintf("\n• Packages: `%s`", strings.Join(chosenPkgs, ", "))
 	}
+	if state.SelTemplate != "" {
+		tplLine = fmt.Sprintf("\n• Template: `%s`", state.SelTemplate)
+	}
 	outcome := fmt.Sprintf(
-		":white_check_mark: *Task `%s` initialized* by <@%s>\n• Image: `%s`\n• SSH: `%s`%s\n_Starting the task now…_",
-		state.TaskName, callback.User.ID, state.SelImage, state.SelSSH, pkgLine,
+		":white_check_mark: *Task `%s` initialized* by <@%s>\n• Image: `%s`\n• SSH: `%s`\n• Model: `%s`%s%s\n_Starting the task now…_",
+		state.TaskName, callback.User.ID, state.SelImage, state.SelSSH, state.SelModel, tplLine, pkgLine,
 	)
 	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
 		logger.Error().Err(err).Msg("failed to update init prompt after success")
@@ -2113,8 +2885,10 @@ func (h *Handler) handleInitFinal(
 // lookup).
 func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger zerolog.Logger) {
 	startMsg := fmt.Sprintf(":rocket: Starting a `%s` task...\n\n"+
-		"_Verbosity: React with 🙈 for silent, 💬 for full output (including thinking)_\n"+
-		"_Model: 🎼 Opus / 📜 Sonnet / 🌸 Haiku_",
+		"_Settings are controlled with `@bot set FIELD=VALUE`:_\n"+
+		"• `verbosity=+`/`-` or `0`/`1`/`-1` (or `:speech_balloon:` / `:see_no_evil:`) — 🙈 silent · summary · 💬 full\n"+
+		"• `model=opus|sonnet|haiku` (or `+`/`-` to cycle, or the emoji) — 🎼 · 📜 · 🌸\n"+
+		"• `plan=on|off` (or `+`/`-`) — 💭 plan mode is on by default",
 		p.TaskName)
 	if _, err := h.bot.PostMessage(p.ChannelID, startMsg, p.ThreadTS); err != nil {
 		logger.Error().Err(err).Msg("failed to post task start message after init")
@@ -2140,14 +2914,25 @@ func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger
 	}
 	session.ReactionAnchorTS = p.MentionTS
 	session.Model = initialModel
+	session.ModelReactionEmoji = emojiForModel(initialModel)
+	// Default plan mode on for a freshly-initialized task — same policy
+	// as handleNewTask for tasks that already had a `.clod/` present.
+	if session.PermissionMode == "" {
+		session.PermissionMode = "plan"
+	}
 	session.TaskPath = p.TaskPath
 	session.TaskName = p.TaskName
 	h.bot.sessions.Set(session)
 	if err := h.bot.sessions.Save(); err != nil {
 		logger.Error().Err(err).Msg("failed to save session after init")
 	}
-	if err := h.bot.AddReaction(p.ChannelID, p.MentionTS, emojiForModel(initialModel)); err != nil {
+	if err := h.bot.AddReaction(p.ChannelID, p.MentionTS, session.ModelReactionEmoji); err != nil {
 		logger.Debug().Err(err).Msg("failed to add model reaction after init")
+	}
+	if session.PermissionMode == "plan" {
+		if err := h.bot.AddReaction(p.ChannelID, p.MentionTS, planModeEmoji); err != nil {
+			logger.Debug().Err(err).Msg("failed to add plan-mode reaction after init")
+		}
 	}
 
 	h.runClod(
@@ -2401,6 +3186,10 @@ func (h *Handler) updatePermissionMessage(perm *PendingPermission, behavior, use
 		if query, ok := perm.ToolInput["query"].(string); ok {
 			detailText = fmt.Sprintf("*Query:* `%s`", query)
 		}
+	case "ExitPlanMode":
+		if plan, ok := perm.ToolInput["plan"].(string); ok {
+			detailText = "*Proposed plan:*\n" + plan
+		}
 	default:
 		var parts []string
 		for k, v := range perm.ToolInput {
@@ -2410,6 +3199,10 @@ func (h *Handler) updatePermissionMessage(perm *PendingPermission, behavior, use
 	}
 
 	if detailText != "" {
+		const maxSectionText = 2900
+		if len(detailText) > maxSectionText {
+			detailText = detailText[:maxSectionText] + "\n…_(truncated)_"
+		}
 		detailBlock := slack.NewTextBlockObject("mrkdwn", detailText, false, false)
 		blocks = append(blocks, slack.NewSectionBlock(detailBlock, nil, nil))
 	}
@@ -2604,6 +3397,120 @@ func formatBytes(bytes int) string {
 	}
 }
 
+// maybeHandleMonitorResult registers a successful Monitor start and, at
+// default verbosity, posts a one-liner instead of uploading the full
+// boilerplate text ("Monitor started (task X, timeout Yms). You will be
+// notified on each event. Keep working — do not poll…"). Returns true if
+// the result was handled (caller should NOT fall through to snippet
+// upload); false otherwise.
+func (h *Handler) maybeHandleMonitorResult(
+	channelID, threadTS, content string,
+	input map[string]any,
+	verbosityLevel int,
+	logger zerolog.Logger,
+) bool {
+	m := monitorStartPattern.FindStringSubmatch(content)
+	if len(m) < 2 {
+		// Not a success message (likely tool_use_error). Fall through so
+		// the user sees what went wrong in the normal snippet path.
+		return false
+	}
+	taskID := m[1]
+	count := h.bot.sessions.AddMonitor(channelID, threadTS, taskID)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("save after AddMonitor")
+	}
+	h.syncMonitorCountEmoji(channelID, threadTS, logger)
+
+	if verbosityLevel >= 1 {
+		// Verbose mode: let the default path upload the full confirmation.
+		return false
+	}
+
+	// Terse: describe the monitor in one line. If the caller supplied a
+	// `description`, use it; else show the first line of the command.
+	desc := ""
+	if d, ok := input["description"].(string); ok {
+		desc = d
+	}
+	if desc == "" {
+		if cmd, ok := input["command"].(string); ok {
+			desc = cmd
+			if idx := strings.Index(desc, "\n"); idx != -1 {
+				desc = desc[:idx] + "…"
+			}
+			if len(desc) > 80 {
+				desc = desc[:77] + "…"
+			}
+		}
+	}
+	var summary string
+	if desc != "" {
+		summary = fmt.Sprintf(":satellite_antenna: Monitor started `%s` — %s (now %d active)", taskID, desc, count)
+	} else {
+		summary = fmt.Sprintf(":satellite_antenna: Monitor started `%s` (now %d active)", taskID, count)
+	}
+	if _, err := h.bot.PostMessage(channelID, summary, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post terse monitor start")
+	}
+	return true
+}
+
+// maybeHandleTaskStopResult parses the TaskStop JSON result and renders a
+// tidy Slack message (emoji + task id + command in a code span) instead
+// of uploading the raw JSON as a collapsible snippet. Also deregisters
+// the monitor from the thread's active set so the count reaction stays
+// accurate. Returns true if handled.
+func (h *Handler) maybeHandleTaskStopResult(
+	channelID, threadTS, content string,
+	verbosityLevel int,
+	logger zerolog.Logger,
+) bool {
+	var parsed struct {
+		Message  string `json:"message"`
+		TaskID   string `json:"task_id"`
+		TaskType string `json:"task_type"`
+		Command  string `json:"command"`
+	}
+	if err := json.Unmarshal([]byte(content), &parsed); err != nil || parsed.TaskID == "" {
+		// Not a success payload (e.g., <tool_use_error> saying the id
+		// wasn't found). Let the default path handle it.
+		return false
+	}
+
+	count := h.bot.sessions.RemoveMonitor(channelID, threadTS, parsed.TaskID)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("save after RemoveMonitor")
+	}
+	h.syncMonitorCountEmoji(channelID, threadTS, logger)
+
+	if verbosityLevel < 0 {
+		// Silent mode: skip entirely.
+		return true
+	}
+
+	cmd := parsed.Command
+	// Keep the command displayed on one line so the Slack post stays
+	// tidy; if it's truly long the full thing is still in the transcript.
+	if idx := strings.Index(cmd, "\n"); idx != -1 {
+		cmd = cmd[:idx] + "…"
+	}
+	if len(cmd) > 200 {
+		cmd = cmd[:197] + "…"
+	}
+
+	var msg string
+	if cmd != "" {
+		msg = fmt.Sprintf(":octagonal_sign: Stopped monitor `%s` (%d active) — `%s`", parsed.TaskID, count, cmd)
+	} else {
+		msg = fmt.Sprintf(":octagonal_sign: Stopped monitor `%s` (%d active)", parsed.TaskID, count)
+	}
+	if _, err := h.bot.PostMessage(channelID, msg, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post TaskStop summary")
+	}
+	return true
+}
+
 // postToolSnippet posts a tool result summary, optionally uploading the full
 // content as a collapsible snippet based on verbosity level and tool type.
 func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, content string, logger zerolog.Logger) {
@@ -2621,6 +3528,22 @@ func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, cont
 			return v
 		}
 		return ""
+	}
+
+	// Monitor and TaskStop emit structured results that we render
+	// specially: Monitor's success text is verbose boilerplate best
+	// hidden at default verbosity, and TaskStop returns JSON that's
+	// nicer parsed than uploaded as a snippet. Both also adjust the
+	// "active monitor count" reaction on the thread's anchor message.
+	switch toolName {
+	case "Monitor":
+		if h.maybeHandleMonitorResult(channelID, threadTS, content, input, verbosityLevel, logger) {
+			return
+		}
+	case "TaskStop":
+		if h.maybeHandleTaskStopResult(channelID, threadTS, content, verbosityLevel, logger) {
+			return
+		}
 	}
 
 	var summary string
