@@ -153,6 +153,29 @@ func TestConsolidationAcrossFlushes(t *testing.T) {
 	fmt.Println(consolidated)
 }
 
+// TestSplitStreamingTextPreservesWordBoundary guards against the
+// "Modelsloading." bug: claude streams sentence fragments that often begin
+// or end with a single space ("Models" then " loading."), and
+// flushBuffer's edge trim must not eat that space or consolidation will
+// join the two chunks into one long word.
+func TestSplitStreamingTextPreservesWordBoundary(t *testing.T) {
+	// Two deltas from claude, each flushed in its own tick.
+	chunk1 := "Models"
+	chunk2 := " loading."
+
+	// flushBuffer now trims only \n\r\t (see handlers.go). Simulate the
+	// same trim + convert + consolidation join.
+	trim := func(s string) string { return strings.Trim(s, "\n\r\t") }
+
+	a := ConvertMarkdownToMrkdwn(trim(chunk1))
+	b := ConvertMarkdownToMrkdwn(trim(chunk2))
+
+	joined := joinConsolidated(a, b)
+	if !strings.Contains(joined, "Models loading.") {
+		t.Errorf("consolidation ate the word boundary space:\ngot:  %q\nwant substring: %q", joined, "Models loading.")
+	}
+}
+
 // TestTwoShortBashResultsInOneFlush reproduces the "(Bash completed with no
 // output)" scenario where two adjacent bash calls return trivial content.
 func TestTwoShortBashResultsInOneFlush(t *testing.T) {

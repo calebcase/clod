@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/calebcase/oops"
 	"github.com/rs/zerolog"
@@ -75,6 +76,16 @@ func NewBot(
 }
 
 // Run starts the bot and processes events until the context is cancelled.
+// ResumeActiveSessions asks the handler to revive any sessions left
+// flagged Active from a previous run. Delegates to Handler so cli.go
+// doesn't need a handle on internal handler state.
+func (b *Bot) ResumeActiveSessions(ctx context.Context, maxAge time.Duration) {
+	if b.handler == nil {
+		return
+	}
+	b.handler.ResumeActiveSessions(ctx, maxAge)
+}
+
 func (b *Bot) Run(ctx context.Context) error {
 	b.logger.Info().Msg("starting socket mode connection")
 

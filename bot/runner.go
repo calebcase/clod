@@ -24,6 +24,26 @@ import (
 // Matches both "[rerun: b1]" (with space) and "[rerun:b1]" (without space).
 var rerunPattern = regexp.MustCompile(`\[rerun:\s*[^\]]+\]\s*`)
 
+// trivialBashResults are exact tool_result bodies that carry no useful
+// information. They're tagged with __TRIVIAL__ so the handler drops them
+// unless the user bumped verbosity. Keep the match list conservative —
+// false positives here silently hide real output.
+var trivialBashResults = map[string]bool{
+	"(Bash completed with no output)": true,
+	"(No output)":                     true,
+}
+
+// isTrivialToolResult reports whether a tool_result is safe to hide at
+// default verbosity. Only Bash's "no output" sentinels qualify today; other
+// tools' empty/short results often still carry signal (grep's "no matches
+// found", ls of an empty dir, etc.).
+func isTrivialToolResult(toolName, trimmedContent string) bool {
+	if toolName != "Bash" {
+		return false
+	}
+	return trivialBashResults[trimmedContent]
+}
+
 // progressStderrPattern matches stderr lines worth surfacing to the user as
 // "something is happening" progress updates while the container/image is
 // being prepared. Matches:
@@ -497,10 +517,15 @@ func readAllowedTools(taskPath string, logger zerolog.Logger) []string {
 // "opus", "sonnet", or a full model id). Mid-session model switching isn't
 // supported by claude --input-format stream-json, but --resume honors a
 // changed --model on the next start.
+// If permissionMode is non-empty and not "default", it overrides the
+// Runner's configured default for this invocation — used to turn plan
+// mode on/off per-thread without spinning up a new Runner. Like --model,
+// this takes effect at process-start only; switches across turns require
+// the next Start() call (typically via resume-after-finish).
 // Returns a RunningTask that can be used to send input and receive output.
 func (r *Runner) Start(
 	ctx context.Context,
-	taskPath, prompt, sessionID, model string,
+	taskPath, prompt, sessionID, model, permissionMode string,
 ) (*RunningTask, error) {
 	// Create command with timeout context.
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
@@ -565,8 +590,15 @@ func (r *Runner) Start(
 		r.logger.Info().Msg("no saved allowed tools found")
 	}
 
-	if r.permissionMode != "" && r.permissionMode != "default" {
-		args = append(args, "--permission-mode", r.permissionMode)
+	// Per-call permissionMode beats the Runner-wide default so callers can
+	// flip plan mode on/off per thread. Empty falls through to the Runner's
+	// configured value; either "" or "default" produces no flag.
+	effectivePermissionMode := permissionMode
+	if effectivePermissionMode == "" {
+		effectivePermissionMode = r.permissionMode
+	}
+	if effectivePermissionMode != "" && effectivePermissionMode != "default" {
+		args = append(args, "--permission-mode", effectivePermissionMode)
 	}
 	if sessionID != "" {
 		args = append(args, "--resume", sessionID)
@@ -586,19 +618,26 @@ func (r *Runner) Start(
 	cmd := exec.CommandContext(runCtx, "clod", args...)
 	cmd.Dir = taskPath
 
-	// Set MCP tool timeout to allow time for user to respond to permission prompts.
-	// Default is too short (causes "technical issues" when user doesn't respond quickly).
-	// 5 minutes = 300000ms should be plenty for interactive approval.
-	// Note: CLOD_RUNTIME_DIR is constructed by the run script from CLOD_RUNTIME_SUFFIX.
+	// Set MCP tool timeout generously so permission prompts waiting on a
+	// human in Slack don't fail with "technical issues" when the approver
+	// steps away. 24h = 86_400_000 ms — long enough for overnight pauses,
+	// short enough to still eventually give up. Caller can override via
+	// the MCP_TOOL_TIMEOUT env var on the bot process.
+	// CLOD_RUNTIME_DIR is constructed by the run script from CLOD_RUNTIME_SUFFIX.
+	const defaultMCPToolTimeoutMS = "86400000"
+	mcpToolTimeout := os.Getenv("MCP_TOOL_TIMEOUT")
+	if mcpToolTimeout == "" {
+		mcpToolTimeout = defaultMCPToolTimeoutMS
+	}
 	cmd.Env = append(os.Environ(),
-		"MCP_TOOL_TIMEOUT=300000",
+		"MCP_TOOL_TIMEOUT="+mcpToolTimeout,
 		"CLOD_RUNTIME_SUFFIX="+permFIFO.RuntimeSuffix(),
 		"CLOD_CONCURRENT=true",
 		"CLOD_NONINTERACTIVE=true",
 	)
 
 	r.logger.Debug().
-		Str("MCP_TOOL_TIMEOUT", "300000").
+		Str("MCP_TOOL_TIMEOUT", mcpToolTimeout).
 		Str("CLOD_RUNTIME_SUFFIX", permFIFO.RuntimeSuffix()).
 		Bool("CLOD_CONCURRENT", true).
 		Bool("CLOD_NONINTERACTIVE", true).
@@ -948,6 +987,16 @@ func (r *Runner) Start(
 								// Format: __SNIPPET__toolName\x00inputJSON\x00content
 								inputJSON, _ := json.Marshal(info.Input)
 								outputMsg = fmt.Sprintf("__SNIPPET__%s\x00%s\x00%s", info.Name, inputJSON, trimmedContent)
+							}
+
+							// Tag results with no meaningful content so the
+							// handler can drop them at default verbosity. The
+							// sentinel text is what Bash emits when both stdout
+							// and stderr are empty; there's no reason to clutter
+							// the thread with a dozen "no output" fenced blocks
+							// unless the user asked for full verbosity.
+							if isTrivialToolResult(info.Name, trimmedContent) {
+								outputMsg = "__TRIVIAL__" + outputMsg
 							}
 
 							select {
