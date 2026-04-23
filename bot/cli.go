@@ -11,7 +11,7 @@ import (
 )
 
 // Version is the bot version. Update this when releasing.
-const Version = "0.9.0"
+const Version = "0.10.0"
 
 type Flags struct {
 	Log struct {
@@ -32,7 +32,7 @@ type Flags struct {
 
 	ClodTimeout time.Duration `kong:"default='24h',env='CLOD_BOT_TIMEOUT',help='Timeout for clod execution'"`
 
-	PermissionMode string `kong:"default='default',env='CLOD_BOT_PERMISSION_MODE',help='Claude permission mode (default, acceptEdits, bypassPermissions)'"`
+	PermissionMode string `kong:"default='bypassPermissions',env='CLOD_BOT_PERMISSION_MODE',help='Claude permission mode (default, acceptEdits, plan, bypassPermissions). Defaults to bypassPermissions since clod runs claude inside an isolated docker container — matching the official recommendation for confined environments.'"`
 
 	VerboseTools []string `kong:"default='Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode',env='CLOD_BOT_VERBOSE_TOOLS',sep=',',help='Tools affected by verbosity toggle'"`
 

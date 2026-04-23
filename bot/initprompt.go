@@ -204,6 +204,19 @@ type pendingInit struct {
 	SelPackages  []string // currently-selected package indices (as strings)
 }
 
+// slackMaxOptionCount is the per-element cap Slack enforces on
+// radio_buttons and checkboxes option lists. Exceed it and the whole
+// block message gets rejected with "invalid_blocks", dropping the
+// entire init prompt.
+const slackMaxOptionCount = 10
+
+// noneTemplateSentinel is the `value` used for the "(none)" template
+// radio option. Slack rejects option `value` fields that are empty
+// strings with an "invalid_blocks" error, so we use this non-empty
+// sentinel and translate it back to "" in the action handler /
+// writeInitFiles before it's used as a real template name.
+const noneTemplateSentinel = "__none__"
+
 // buildInitPromptBlocks renders the setup prompt: header, image radio,
 // ssh radio, package checkboxes, Create/Cancel buttons.
 func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
@@ -315,15 +328,21 @@ func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
 	// (excluding per-instance `.clod/` state) before the .clod config
 	// files below are written from the other pickers.
 	if len(p.Templates) > 0 {
-		tplOpts := make([]*slack.OptionBlockObject, 0, len(p.Templates)+1)
+		// Leave one slot for the "(none)" option so total options stay
+		// inside Slack's radio_buttons cap.
+		templates := p.Templates
+		if len(templates) > slackMaxOptionCount-1 {
+			templates = templates[:slackMaxOptionCount-1]
+		}
+		tplOpts := make([]*slack.OptionBlockObject, 0, len(templates)+1)
 		noneOpt := slack.NewOptionBlockObject(
-			"",
+			noneTemplateSentinel,
 			slack.NewTextBlockObject("plain_text", "(none)", false, false),
 			slack.NewTextBlockObject("plain_text", "Start from an empty directory.", false, false),
 		)
 		tplOpts = append(tplOpts, noneOpt)
 		var initialTpl *slack.OptionBlockObject = noneOpt
-		for _, t := range p.Templates {
+		for _, t := range templates {
 			label := truncateForSlackText(t, 75)
 			desc := truncateForSlackText(fmt.Sprintf("Copy contents of `%s` as a starting point.", t), 75)
 			opt := slack.NewOptionBlockObject(
@@ -349,14 +368,22 @@ func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
 
 	// Packages (checkboxes). Values are indices into p.Packages so the
 	// label length doesn't blow past the 75-char option-text cap.
+	// Slack caps checkbox groups at 10 options — exceed that and the
+	// whole init prompt gets rejected with invalid_blocks. The pool
+	// (defaults ∪ packages found in 2+ sibling tasks) can easily go
+	// over, so clamp here.
 	if len(p.Packages) > 0 {
-		pkgOpts := make([]*slack.OptionBlockObject, 0, len(p.Packages))
+		packages := p.Packages
+		if len(packages) > slackMaxOptionCount {
+			packages = packages[:slackMaxOptionCount]
+		}
+		pkgOpts := make([]*slack.OptionBlockObject, 0, len(packages))
 		var initialPkgs []*slack.OptionBlockObject
 		preSel := map[string]bool{}
 		for _, s := range p.SelPackages {
 			preSel[s] = true
 		}
-		for i, pkg := range p.Packages {
+		for i, pkg := range packages {
 			val := fmt.Sprintf("%d", i)
 			opt := slack.NewOptionBlockObject(
 				val,
@@ -583,19 +610,34 @@ func isPerInstanceClodPath(rel string) bool {
 }
 
 func copyRegularFile(srcPath, dstPath string) error {
-	info, err := os.Stat(srcPath)
+	// Lstat (not Stat) so we see the symlink itself rather than its
+	// target. Without this, a symlink to a directory reports as a
+	// directory here, the symlink branch below doesn't trigger, and we
+	// try to io.Copy from a directory fd — which fails with
+	// "copy_file_range: is a directory" partway through the copy.
+	info, err := os.Lstat(srcPath)
 	if err != nil {
 		return err
 	}
-	// Symlinks: preserve as symlinks (don't follow + re-copy a potentially
-	// giant target).
+	// Symlinks (to files OR directories): preserve as symlinks. Safer
+	// and cheaper than dereferencing and re-copying a potentially huge
+	// target, and it matches the semantics of the source task.
 	if info.Mode()&os.ModeSymlink != 0 {
 		target, err := os.Readlink(srcPath)
 		if err != nil {
 			return err
 		}
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			return err
+		}
 		_ = os.Remove(dstPath)
 		return os.Symlink(target, dstPath)
+	}
+	// Non-regular non-symlink entries (sockets, devices, named pipes,
+	// etc.) — skip silently. They shouldn't appear in a normal task
+	// dir; if they do, they're not portable across a template copy.
+	if !info.Mode().IsRegular() {
+		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return err

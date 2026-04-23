@@ -207,6 +207,62 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 		return
 	}
 
+	// `@bot *: <instructions>` — run clod directly in the agents base
+	// directory (treat the base itself as the task, not a subdir of it).
+	// Useful for cross-task work or setups where the base dir IS the
+	// project you want the agent working in.
+	if instructions := ParseRootMention(ev.Text); instructions != "" {
+		h.handleRootTask(ctx, ev, threadTS, instructions, logger)
+		return
+	}
+
+	// `@bot :: <instructions>` — auto-generate a memorable task name
+	// (YYYY-MM-DD-adjective-noun) and route into the normal new-task
+	// flow. The init prompt still surfaces so the user can tweak image
+	// / ssh / model / packages; they can just click Create to take the
+	// defaults.
+	if instructions := ParseAutoNameMention(ev.Text); instructions != "" {
+		base := h.bot.tasks.BasePath()
+		if base == "" {
+			if _, err := h.bot.PostMessage(ev.Channel,
+				":warning: Couldn't generate a task name — `CLOD_BOT_AGENTS_PATH` isn't set.",
+				threadTS); err != nil {
+				logger.Debug().Err(err).Msg("failed to post auto-name error")
+			}
+			return
+		}
+		name, err := generateTaskName(base)
+		if err != nil {
+			logger.Error().Err(err).Msg("failed to generate task name")
+			if _, perr := h.bot.PostMessage(ev.Channel,
+				fmt.Sprintf(":warning: Couldn't generate a unique task name: %v", err),
+				threadTS); perr != nil {
+				logger.Debug().Err(perr).Msg("failed to post auto-name error")
+			}
+			return
+		}
+		if _, err := h.bot.PostMessage(ev.Channel,
+			fmt.Sprintf(":label: Auto-generated task name: `%s`", name),
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post auto-name notice")
+		}
+		// Rewrite the mention text so ParseMention sees a normal
+		// `<@BOT> name: instructions` shape for the downstream flow.
+		// Replace only the first `::` occurrence (the one we matched).
+		ev.Text = strings.Replace(ev.Text, "::", name+":", 1)
+		h.handleNewTask(ctx, ev, threadTS, logger)
+		return
+	}
+
+	// `@bot close` — stop the current task (if any) and mark the
+	// session dormant so resume-on-restart skips it. The session
+	// record stays so reactions/metadata persist; a later @-mention
+	// in this thread re-opens via the normal continuation path.
+	if ParseCloseCommand(ev.Text) {
+		h.handleCloseCommand(ev, threadTS, logger)
+		return
+	}
+
 	// `@bot allow @user` / `@bot disallow @user` — manage the
 	// per-thread allowlist. Handled before `set` so the field-value
 	// regex can't accidentally match it (it won't, but be explicit).
@@ -323,6 +379,8 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 
 				// Update the permission message to show it was handled
 				h.updatePermissionMessage(perm, resp.Behavior, ev.User, "")
+				// Post-resolution hooks (plan-mode exit, etc.).
+				h.afterPermissionResolved(ev.Channel, threadTS, perm.ToolName, resp.Behavior, logger)
 				return
 			}
 			// Not a clear yes/no. Instead of a plaintext reminder, post a
@@ -559,6 +617,96 @@ func pluralSuffix(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// afterPermissionResolved runs any extra cleanup that should happen
+// once the user has answered a permission prompt. Today the only hook
+// is exiting plan mode when the agent's ExitPlanMode tool was
+// approved — that's the moment plan mode has served its purpose and
+// the thread should revert to the bot's default permission mode.
+// Centralised so every permission-resolution path (buttons, text
+// reply, ambiguous-response prompt) stays in sync.
+func (h *Handler) afterPermissionResolved(channelID, threadTS, toolName, behavior string, logger zerolog.Logger) {
+	if toolName == "ExitPlanMode" && behavior == "allow" {
+		h.exitPlanModeIndicator(channelID, threadTS, logger)
+	}
+}
+
+// exitPlanModeIndicator clears session.PermissionMode and removes the
+// bot's plan-mode reaction from the anchor. Posts a confirmation so
+// the user knows plan mode is no longer active. Idempotent: safe to
+// call when plan mode wasn't on.
+func (h *Handler) exitPlanModeIndicator(channelID, threadTS string, logger zerolog.Logger) {
+	session := h.bot.sessions.Get(channelID, threadTS)
+	if session == nil || session.PermissionMode != "plan" {
+		return
+	}
+	h.bot.sessions.SetPermissionMode(channelID, threadTS, "")
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("save after plan-mode exit")
+	}
+	if session.ReactionAnchorTS != "" {
+		if err := h.bot.RemoveReaction(channelID, session.ReactionAnchorTS, planModeEmoji); err != nil {
+			logger.Debug().Err(err).Msg("failed to remove plan-mode indicator after exit")
+		}
+	}
+	if _, err := h.bot.PostMessage(channelID,
+		":thought_balloon: Exited plan mode — the agent will now make changes directly. `@bot set plan=on` to re-enable for the next turn.",
+		threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post plan-exit confirmation")
+	}
+}
+
+// handleCloseCommand stops the currently running task (if any) and
+// clears the thread's Active flag so resume-on-restart skips it. The
+// session record stays intact — session.TaskPath, model, permission
+// mode, extra-allowed users etc. all survive, so a later @-mention in
+// the thread re-opens via the normal continuation path. Use this when
+// you're done with a thread but might want to come back to it later;
+// delete the thread or just stop mentioning the bot if you want it
+// completely forgotten.
+func (h *Handler) handleCloseCommand(
+	ev *slackevents.AppMentionEvent,
+	threadTS string,
+	logger zerolog.Logger,
+) {
+	session := h.bot.sessions.Get(ev.Channel, threadTS)
+	if session == nil || session.TaskName == "" {
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":warning: No active bot session in this thread.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post close no-session warning")
+		}
+		return
+	}
+
+	// Clear Active FIRST so neither finalizeTask (fires after Cancel)
+	// nor a crashing restart picks this thread up as "should resume".
+	// finalizeTask's non-clean-exit path leaves Active alone, so our
+	// explicit false survives.
+	h.bot.sessions.SetActive(ev.Channel, threadTS, false)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("save after close-clear-active")
+	}
+
+	progressKey := key(ev.Channel, threadTS)
+	var wasRunning bool
+	if taskVal, ok := h.runningTasks.Load(progressKey); ok {
+		task := taskVal.(*RunningTask)
+		task.Cancel()
+		wasRunning = true
+		logger.Info().Msg("cancelling running task due to close command")
+	}
+
+	var msg string
+	if wasRunning {
+		msg = ":wave: *Session closed.* The running task has been stopped. Auto-resume is disabled for this thread — @-mention me here with new instructions to pick it back up."
+	} else {
+		msg = ":wave: *Session closed.* Auto-resume is disabled for this thread — @-mention me here with new instructions to pick it back up."
+	}
+	if _, err := h.bot.PostMessage(ev.Channel, msg, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post close confirmation")
+	}
 }
 
 // handleSetCommand processes `@bot set FIELD=VALUE` messages. Supported
@@ -1117,6 +1265,73 @@ func (h *Handler) handleNewTask(
 		return
 	}
 
+	h.runNewTask(ctx, ev, threadTS, parsed.TaskName, taskPath, parsed.Instructions, logger)
+}
+
+// handleRootTask runs a task directly in the agents base directory
+// rather than a subdirectory. The base dir itself is the task — `.clod/`
+// lives at basePath, `taskPath = basePath`. If `.clod/` isn't set up
+// yet, we fall through to the standard init prompt (with createDir=false
+// since the base dir definitely exists).
+func (h *Handler) handleRootTask(
+	ctx context.Context,
+	ev *slackevents.AppMentionEvent,
+	threadTS string,
+	instructions string,
+	logger zerolog.Logger,
+) {
+	base := h.bot.tasks.BasePath()
+	if base == "" {
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":warning: Can't run a root task — `CLOD_BOT_AGENTS_PATH` isn't set.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post root-task error")
+		}
+		return
+	}
+	taskName := filepath.Base(base)
+	logger = logger.With().
+		Str("task", taskName).
+		Str("task_path", base).
+		Str("instructions", instructions).
+		Bool("root_task", true).
+		Logger()
+
+	// If `.clod/system/run` is present, just run — skip the init prompt.
+	if _, err := os.Stat(filepath.Join(base, ".clod", "system", "run")); err == nil {
+		h.runNewTask(ctx, ev, threadTS, taskName, base, instructions, logger)
+		return
+	}
+
+	// Otherwise show the init prompt with createDir=false (base dir
+	// always exists, we just need to seed `.clod/`).
+	if h.postInitPrompt(ev, threadTS, taskName, base, false, instructions, logger) {
+		return
+	}
+	// Fall-through (shouldn't normally happen — postInitPrompt returns
+	// false only on Slack post failure or a stacked prompt).
+	if _, err := h.bot.PostMessage(ev.Channel,
+		":warning: Couldn't start a root task.",
+		threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post root-task fallthrough error")
+	}
+}
+
+// runNewTask performs the actual task start once taskName + taskPath are
+// resolved: it downloads any attached files into the task dir, gathers
+// prior thread context, posts the starting-a-task status, anchors the
+// model / plan-mode reactions on the user's mention, and calls runClod.
+// Shared by handleNewTask (subdir task via the registry) and
+// handleRootTask (the agents dir itself as the task).
+func (h *Handler) runNewTask(
+	ctx context.Context,
+	ev *slackevents.AppMentionEvent,
+	threadTS string,
+	taskName string,
+	taskPath string,
+	instructions string,
+	logger zerolog.Logger,
+) {
 	logger.Info().Str("task_path", taskPath).Msg("starting new task")
 
 	// Clear output message consolidation for this thread.
@@ -1171,7 +1386,7 @@ func (h *Handler) handleNewTask(
 	if threadContext != "" {
 		prompt = threadContext
 	}
-	prompt += parsed.Instructions
+	prompt += instructions
 	if len(downloadedFiles) > 0 {
 		prompt += "\n\nAttached files have been saved to:\n"
 		for _, path := range downloadedFiles {
@@ -1185,7 +1400,7 @@ func (h *Handler) handleNewTask(
 		"• `verbosity=+`/`-` or `0`/`1`/`-1` (or `:speech_balloon:` / `:see_no_evil:`) — 🙈 silent · summary · 💬 full\n"+
 		"• `model=opus|sonnet|haiku` (or `+`/`-` to cycle, or the emoji) — 🎼 · 📜 · 🌸\n"+
 		"• `plan=on|off` (or `+`/`-`) — 💭 plan mode is on by default",
-		parsed.TaskName)
+		taskName)
 	if _, err := h.bot.PostMessage(
 		ev.Channel,
 		startMsg,
@@ -1209,7 +1424,7 @@ func (h *Handler) handleNewTask(
 		session = &SessionMapping{
 			ChannelID: ev.Channel,
 			ThreadTS:  threadTS,
-			TaskName:  parsed.TaskName,
+			TaskName:  taskName,
 			TaskPath:  taskPath,
 			UserID:    ev.User,
 			CreatedAt: time.Now(),
@@ -1243,7 +1458,7 @@ func (h *Handler) handleNewTask(
 		ev.Channel,
 		ev.User,
 		taskPath,
-		parsed.TaskName,
+		taskName,
 		prompt,
 		"",
 		threadTS,
@@ -1349,6 +1564,23 @@ func (h *Handler) maybePromptInit(
 		createDir = false
 	}
 
+	return h.postInitPrompt(ev, threadTS, parsed.TaskName, taskPath, createDir, parsed.Instructions, logger)
+}
+
+// postInitPrompt builds the pendingInit state and posts the setup block
+// message. Shared by maybePromptInit (subdirectory tasks) and
+// handleRootTask (the agents dir itself). The caller is responsible for
+// deciding whether an init prompt is warranted (whether `.clod/` is set
+// up, whether the dir needs to be created) — this function just does
+// the UI posting. Returns false if the prompt couldn't be posted.
+func (h *Handler) postInitPrompt(
+	ev *slackevents.AppMentionEvent,
+	threadTS string,
+	taskName, taskPath string,
+	createDir bool,
+	instructions string,
+	logger zerolog.Logger,
+) bool {
 	progressKey := key(ev.Channel, threadTS)
 	// If an init prompt is already pending for this thread, skip — don't
 	// stack prompts.
@@ -1357,7 +1589,8 @@ func (h *Handler) maybePromptInit(
 		return true
 	}
 
-	packages := initPackageSuggestions(base, parsed.TaskName)
+	base := h.bot.tasks.BasePath()
+	packages := initPackageSuggestions(base, taskName)
 	// Preselect the baseline defaults (by index) so one click gives a
 	// reasonable setup.
 	defaultsSet := map[string]bool{}
@@ -1378,14 +1611,14 @@ func (h *Handler) maybePromptInit(
 	if selModel == "" {
 		selModel = fallbackModel
 	}
-	templates := discoverTemplateTasks(base, parsed.TaskName)
+	templates := discoverTemplateTasks(base, taskName)
 	pi := &pendingInit{
 		ChannelID:    ev.Channel,
 		ThreadTS:     threadTS,
-		TaskName:     parsed.TaskName,
+		TaskName:     taskName,
 		TaskPath:     taskPath,
 		CreateDir:    createDir,
-		Instructions: parsed.Instructions,
+		Instructions: instructions,
 		UserID:       ev.User,
 		MentionTS:    ev.TimeStamp,
 		Packages:     packages,
@@ -1400,7 +1633,14 @@ func (h *Handler) maybePromptInit(
 	blocks := buildInitPromptBlocks(pi, progressKey)
 	msgTS, err := h.bot.PostMessageBlocks(ev.Channel, blocks, threadTS)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to post init prompt")
+		// Dump the rejected payload so we can see which block Slack
+		// is complaining about. invalid_blocks keeps recurring for
+		// reasons that aren't obvious from the error message alone.
+		if dump, mErr := json.MarshalIndent(blocks, "", "  "); mErr == nil {
+			logger.Error().Err(err).RawJSON("blocks", dump).Msg("failed to post init prompt")
+		} else {
+			logger.Error().Err(err).Msg("failed to post init prompt")
+		}
 		return false
 	}
 	pi.MessageTS = msgTS
@@ -2570,6 +2810,9 @@ func (h *Handler) HandleBlockAction(
 
 	// Update the permission message to show it was handled
 	h.updatePermissionMessage(pending, actionValue.Behavior, callback.User.ID, actionValue.Remember)
+
+	// Post-resolution hooks (plan-mode exit, etc.).
+	h.afterPermissionResolved(pending.ChannelID, pending.ThreadTS, pending.ToolName, actionValue.Behavior, logger)
 }
 
 // updatePermissionMessage updates a permission prompt message to show the result.
@@ -2737,9 +2980,15 @@ func (h *Handler) handleInitSelect(
 			state.SelModel = action.SelectedOption.Value
 		}
 	case "init_template":
-		// Empty value = user picked "(none)". Accept that too so
-		// deselecting a previous choice works.
-		state.SelTemplate = action.SelectedOption.Value
+		// Slack option values can't be empty strings, so the "(none)"
+		// option carries a sentinel value — translate it back to ""
+		// here since downstream logic keys "no template selected" off
+		// an empty SelTemplate.
+		v := action.SelectedOption.Value
+		if v == noneTemplateSentinel {
+			v = ""
+		}
+		state.SelTemplate = v
 	case "init_packages":
 		picks := make([]string, 0, len(action.SelectedOptions))
 		for _, opt := range action.SelectedOptions {
@@ -2787,6 +3036,19 @@ func (h *Handler) handleInitFinal(
 			logger.Error().Err(err).Msg("failed to update cancelled init message")
 		}
 		return
+	}
+
+	// Give the user immediate visual feedback that the click registered.
+	// Copying a large template + the subsequent clod build can take
+	// several seconds, and without this the prompt sits unchanged and
+	// looks like the button didn't fire. The final outcome message
+	// below replaces this placeholder.
+	pendingMsg := fmt.Sprintf(":hourglass_flowing_sand: *Setting up `%s`…* (by <@%s>)", state.TaskName, callback.User.ID)
+	if state.SelTemplate != "" {
+		pendingMsg += fmt.Sprintf("\n_Copying template `%s`…_", state.SelTemplate)
+	}
+	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, pendingMsg); err != nil {
+		logger.Debug().Err(err).Msg("failed to post immediate setup-in-progress update")
 	}
 
 	// Materialize the task.
@@ -3099,6 +3361,8 @@ func (h *Handler) handleAmbiguousAction(
 		// Rewrite the ORIGINAL permission prompt to show the outcome — same
 		// visual treatment as a direct button click on the prompt.
 		h.updatePermissionMessage(pending, actionValue.Behavior, callback.User.ID, "")
+		// Post-resolution hooks (plan-mode exit, etc.).
+		h.afterPermissionResolved(pending.ChannelID, pending.ThreadTS, pending.ToolName, resp.Behavior, logger)
 	}
 
 	// For redirect: forward the user's originally-typed text to Claude as a
@@ -3334,6 +3598,15 @@ type TaskStats struct {
 }
 
 // postStatsMessage posts a formatted stats message using Slack blocks.
+//
+// Each stream-json `result` event carries per-interaction stats (one
+// user message's cost/turns/duration), NOT a running total for the
+// claude process — confirmed both by the Agent SDK cost-tracking docs
+// and empirically (e.g. successive `num_turns` values of 79, 22, 1 in
+// one process's results would be non-monotonic if cumulative). So we
+// add each event into the session's running totals and render those.
+// That scheme also survives process restarts: a `--resume` run's new
+// per-interaction stats simply keep adding to the prior totals.
 func (h *Handler) postStatsMessage(channelID, threadTS, statsJSON string) {
 	var stats TaskStats
 	if err := json.Unmarshal([]byte(statsJSON), &stats); err != nil {
@@ -3341,7 +3614,12 @@ func (h *Handler) postStatsMessage(channelID, threadTS, statsJSON string) {
 		return
 	}
 
-	// Format duration.
+	cumulativeCost, cumulativeTurns := h.bot.sessions.AddStats(channelID, threadTS, stats.CostUSD, stats.NumTurns)
+	if err := h.bot.sessions.Save(); err != nil {
+		h.logger.Debug().Err(err).Msg("save after AddStats")
+	}
+
+	// Format duration (this turn only — duration is not aggregated).
 	duration := time.Duration(stats.DurationMS) * time.Millisecond
 	var durationStr string
 	if duration >= time.Minute {
@@ -3350,13 +3628,8 @@ func (h *Handler) postStatsMessage(channelID, threadTS, statsJSON string) {
 		durationStr = fmt.Sprintf("%.1fs", duration.Seconds())
 	}
 
-	// Format cost.
-	costStr := fmt.Sprintf("$%.4f", stats.CostUSD)
+	costStr := fmt.Sprintf("$%.4f", cumulativeCost)
 
-	// Build blocks with fields for table-like layout.
-	blocks := []slack.Block{}
-
-	// Status emoji based on error state.
 	var statusEmoji string
 	if stats.IsError {
 		statusEmoji = ":warning:"
@@ -3364,18 +3637,15 @@ func (h *Handler) postStatsMessage(channelID, threadTS, statsJSON string) {
 		statusEmoji = ":chart_with_upwards_trend:"
 	}
 
-	// Use context block for compact inline display.
 	contextElements := []slack.MixedElement{
 		slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("%s *Task Stats*", statusEmoji), false, false),
-		slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("⏱️ %s", durationStr), false, false),
-		slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("🔄 %d turns", stats.NumTurns), false, false),
-		slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("💰 %s", costStr), false, false),
+		slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("⏱️ %s (this turn)", durationStr), false, false),
+		slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("🔄 %d turns total", cumulativeTurns), false, false),
+		slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("💰 %s total", costStr), false, false),
 	}
 
-	contextBlock := slack.NewContextBlock("", contextElements...)
-	blocks = append(blocks, contextBlock)
+	blocks := []slack.Block{slack.NewContextBlock("", contextElements...)}
 
-	// Post the stats message.
 	if _, err := h.bot.PostMessageBlocks(channelID, blocks, threadTS); err != nil {
 		h.logger.Error().Err(err).Msg("failed to post stats message")
 	}
