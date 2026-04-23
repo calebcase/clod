@@ -63,6 +63,23 @@ func ParseRootMention(text string) string {
 	return strings.TrimSpace(m[1])
 }
 
+// dangerousRootMentionPattern matches `<@BOT> !: instructions` — the
+// shorthand for "run claude directly on the host, outside any docker
+// sandbox, in the agents base directory". The `!:` form is visually
+// distinct from `*:` to reinforce that the user is opting out of the
+// container isolation.
+var dangerousRootMentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+!:\s*(.+)`)
+
+// ParseDangerousRootMention returns the instructions from a `@bot !: ...`
+// message, or empty string when the text doesn't match.
+func ParseDangerousRootMention(text string) string {
+	m := dangerousRootMentionPattern.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
 // ParseAutoNameMention extracts the instructions from a `@bot :: ...`
 // message. Returns an empty string when the message doesn't match.
 func ParseAutoNameMention(text string) string {

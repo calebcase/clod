@@ -63,6 +63,16 @@ type SessionMapping struct {
 	// `@bot allow @user` / `@bot disallow @user`. Only users authorized
 	// in this thread (bot-wide OR per-thread) can drive the bot here.
 	ExtraAllowedUsers []string `json:"extra_allowed_users,omitempty"`
+	// FileSyncDisabled turns off the task-directory-to-Slack file
+	// watcher for this thread. Default (false) means sync is ON — new
+	// or modified files in the top-level task dir get uploaded as
+	// snippets. Toggled via `@bot set filesync=off`.
+	FileSyncDisabled bool `json:"file_sync_disabled,omitempty"`
+	// UseClaudeDirect runs `claude` on the host instead of `clod` (which
+	// wraps claude in a docker container). Set exclusively via `@bot !:`
+	// after the user confirms the risk. Sticky for the life of the
+	// session so continuations keep the same execution mode.
+	UseClaudeDirect bool `json:"use_claude_direct,omitempty"`
 	// CumulativeCostUSD and CumulativeTurns accumulate across every clod
 	// invocation within this thread. Claude's per-result stats cover only
 	// the current process's lifetime, so a resume (or a crash-and-respawn)
@@ -430,6 +440,74 @@ func (s *SessionStore) IsExtraAllowedUser(channelID, threadTS, userID string) bo
 		}
 	}
 	return false
+}
+
+// SetFileSyncDisabled toggles the per-thread file-sync preference.
+// disabled=true turns off the task-directory-to-Slack watcher.
+func (s *SessionStore) SetFileSyncDisabled(channelID, threadTS string, disabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := key(channelID, threadTS)
+	session := s.sessions[k]
+	if session == nil {
+		session = &SessionMapping{
+			ChannelID: channelID,
+			ThreadTS:  threadTS,
+			CreatedAt: time.Now(),
+		}
+		s.sessions[k] = session
+	}
+	session.FileSyncDisabled = disabled
+	session.UpdatedAt = time.Now()
+}
+
+// IsFileSyncDisabled reports whether file sync has been explicitly
+// disabled on this thread. Returns false (i.e. sync enabled) when no
+// session exists yet.
+func (s *SessionStore) IsFileSyncDisabled(channelID, threadTS string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	session := s.sessions[key(channelID, threadTS)]
+	if session == nil {
+		return false
+	}
+	return session.FileSyncDisabled
+}
+
+// SetUseClaudeDirect marks the thread as running claude directly on
+// the host (bypassing clod/docker). Creates a bare session entry if
+// none exists yet so the flag sticks through to runClod.
+func (s *SessionStore) SetUseClaudeDirect(channelID, threadTS string, direct bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := key(channelID, threadTS)
+	session := s.sessions[k]
+	if session == nil {
+		session = &SessionMapping{
+			ChannelID: channelID,
+			ThreadTS:  threadTS,
+			CreatedAt: time.Now(),
+		}
+		s.sessions[k] = session
+	}
+	session.UseClaudeDirect = direct
+	session.UpdatedAt = time.Now()
+}
+
+// IsUseClaudeDirect reports whether this thread is configured to run
+// claude directly on the host. Returns false when no session exists.
+func (s *SessionStore) IsUseClaudeDirect(channelID, threadTS string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	session := s.sessions[key(channelID, threadTS)]
+	if session == nil {
+		return false
+	}
+	return session.UseClaudeDirect
 }
 
 // SetPermissionMode stores the per-thread claude --permission-mode

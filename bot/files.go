@@ -307,11 +307,17 @@ func (f *FileHandler) GetThreadReplyFiles(channelID, threadTS, messageTS string)
 
 // WatchOutputs monitors the task directory for new files and uploads them.
 // This is intended to run in a goroutine during task execution.
+//
+// shouldSync is consulted on every poll tick. When it returns false the
+// watcher still tracks existing file state (so re-enabling doesn't cause
+// a flood of retroactive uploads) but skips the actual upload step.
+// When shouldSync is nil the watcher always uploads.
 func (f *FileHandler) WatchOutputs(
 	taskPath string,
 	channelID string,
 	threadTS string,
 	done <-chan struct{},
+	shouldSync func() bool,
 ) {
 	// Track files we've already uploaded with their modification times.
 	uploaded := make(map[string]*uploadedFile)
@@ -336,15 +342,42 @@ func (f *FileHandler) WatchOutputs(
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	tick := func() {
+		if shouldSync != nil && !shouldSync() {
+			// Keep the `uploaded` map fresh so re-enabling later
+			// doesn't re-upload every modified file back through
+			// "old state". Treat a disabled sync as if we had just
+			// uploaded everything.
+			entries, _ := os.ReadDir(taskPath)
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				if info, err := e.Info(); err == nil {
+					if _, ok := uploaded[e.Name()]; !ok {
+						uploaded[e.Name()] = &uploadedFile{
+							modTime:        info.ModTime(),
+							lastUploadTime: time.Now(),
+						}
+					} else {
+						uploaded[e.Name()].modTime = info.ModTime()
+					}
+				}
+			}
+			return
+		}
+		f.uploadNewFiles(taskPath, channelID, threadTS, uploaded)
+	}
+
 	for {
 		select {
 		case <-done:
 			f.logger.Debug().Msg("output file watcher stopping")
 			// Do one final check for new files.
-			f.uploadNewFiles(taskPath, channelID, threadTS, uploaded)
+			tick()
 			return
 		case <-ticker.C:
-			f.uploadNewFiles(taskPath, channelID, threadTS, uploaded)
+			tick()
 		}
 	}
 }
