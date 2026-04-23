@@ -795,6 +795,16 @@ func (h *Handler) resolveAndRouteRefs(
 	hasOverCap := false
 	for _, ref := range refs {
 		res := resolveSlackRef(h.bot.client, ref, logger)
+		if res.Joined {
+			// Auto-joined to read this ref. Post a thread notice
+			// so human members of the channel don't wonder why the
+			// bot suddenly appeared in their member list.
+			if _, err := h.bot.PostMessage(channelID,
+				fmt.Sprintf(":inbox_tray: Auto-joined <#%s|%s> to read the referenced thread.", res.Ref.ChannelID, res.ChannelName),
+				threadTS); err != nil {
+				logger.Debug().Err(err).Msg("failed to post auto-join notice")
+			}
+		}
 		if res.Err != nil {
 			h.postRefError(channelID, threadTS, res, logger)
 			continue

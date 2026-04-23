@@ -89,8 +89,9 @@ type SlackRefResult struct {
 	IsPrivate   bool   // is_private || is_im || is_mpim
 	IsDM        bool
 	Messages    []slack.Message
-	MsgCount    int // len(Messages)
-	CharCount   int // total chars across message text
+	MsgCount    int  // len(Messages)
+	CharCount   int  // total chars across message text
+	Joined      bool // bot auto-joined the channel to read this ref
 	Err         error
 	ErrReason   string // user-facing summary of Err
 }
@@ -137,11 +138,23 @@ func resolveSlackRef(client *slack.Client, ref SlackRef, logger zerolog.Logger) 
 		}
 	}
 
-	msgs, _, _, err := client.GetConversationReplies(&slack.GetConversationRepliesParameters{
-		ChannelID: ref.ChannelID,
-		Timestamp: ref.RootTS(),
-		Limit:     1000,
-	})
+	msgs, err := fetchThreadReplies(client, ref)
+	if err != nil && isNotInChannelErr(err) && isJoinableChannel(info) {
+		// Bot lacks membership in a public channel it could join.
+		// channels:join is in the manifest, so try auto-join and
+		// retry once. This keeps the "bot isn't in #X" error
+		// reserved for private channels / DMs where no scope or
+		// auto-join can fix the situation.
+		if _, _, _, joinErr := client.JoinConversation(ref.ChannelID); joinErr != nil {
+			logger.Warn().Err(joinErr).Str("channel", ref.ChannelID).Msg("auto-join failed for ref channel")
+			// Fall through — surface the original not_in_channel
+			// error since the join attempt didn't succeed.
+		} else {
+			logger.Info().Str("channel", ref.ChannelID).Str("channel_name", res.ChannelName).Msg("auto-joined public channel to read ref")
+			res.Joined = true
+			msgs, err = fetchThreadReplies(client, ref)
+		}
+	}
 	if err != nil {
 		res.Err = err
 		res.ErrReason = humanizeSlackErr(err, res.ChannelName, scopeHintForHistory(ref.ChannelID, res.IsDM, info.IsMpIM))
@@ -155,6 +168,46 @@ func resolveSlackRef(client *slack.Client, ref SlackRef, logger zerolog.Logger) 
 		res.CharCount += len(m.Text)
 	}
 	return res
+}
+
+// fetchThreadReplies is a thin wrapper so we can retry cleanly after
+// an auto-join without duplicating the parameter struct.
+func fetchThreadReplies(client *slack.Client, ref SlackRef) ([]slack.Message, error) {
+	msgs, _, _, err := client.GetConversationReplies(&slack.GetConversationRepliesParameters{
+		ChannelID: ref.ChannelID,
+		Timestamp: ref.RootTS(),
+		Limit:     1000,
+	})
+	return msgs, err
+}
+
+// isNotInChannelErr reports whether a Slack API error indicates that
+// the bot isn't a member of the target channel. Slack returns this
+// via the bare `not_in_channel` error string.
+func isNotInChannelErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "not_in_channel")
+}
+
+// isJoinableChannel reports whether the channel is one the bot can
+// auto-join via conversations.join. Limited to public channels —
+// private channels require an explicit invite (no scope fixes that),
+// IMs and MpIMs aren't joinable at all, and #general / archived
+// channels fail the API call anyway (Slack returns specific errors
+// we'll surface instead of silently swallowing).
+func isJoinableChannel(c *slack.Channel) bool {
+	if c == nil {
+		return false
+	}
+	if c.IsPrivate || c.IsIM || c.IsMpIM {
+		return false
+	}
+	if c.IsArchived {
+		return false
+	}
+	return c.IsChannel
 }
 
 // humanizeSlackErr turns a slack-go error into a short user-friendly
