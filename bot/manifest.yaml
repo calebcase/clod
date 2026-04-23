@@ -31,6 +31,8 @@ oauth_config:
       - groups:read
       - im:history
       - im:read
+      - im:write
+      - im:write.topic
       - mpim:history
       - mpim:read
       - files:read
@@ -39,6 +41,8 @@ oauth_config:
       - reactions:write
       - remote_files:read
       - remote_files:write
+      - search:read.im
+      - search:read.mpim
       - users:read
 
 settings:
