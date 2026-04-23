@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 )
 
 // Version is the bot version. Update this when releasing.
-const Version = "0.21.1"
+const Version = "0.22.0"
 
 type Flags struct {
 	Log struct {
@@ -28,7 +29,9 @@ type Flags struct {
 
 	AgentsPath string `kong:"default='.',env='CLOD_BOT_AGENTS_PATH',help='Base path to search for agent directories'"`
 
-	AgentsPromptPath string `kong:"default='README.md',env='CLOD_BOT_AGENTS_PROMPT_PATH',help='Path to agent prompt file (relative to task dir or absolute). Empty disables.'"`
+	AgentsPromptPath string `kong:"default='README.md',env='CLOD_BOT_AGENTS_PROMPT_PATH',help='Path to per-task agent prompt file (relative to task dir or absolute). Empty disables.'"`
+
+	AgentsSharedPromptPath string `kong:"default='AGENTS.md',env='CLOD_BOT_AGENTS_SHARED_PROMPT_PATH',help='Path to workspace-wide agent prompt file (relative to the agents base dir or absolute). Copied into every task alongside the per-task prompt. Empty disables.'"`
 
 	ClodTimeout time.Duration `kong:"default='24h',env='CLOD_BOT_TIMEOUT',help='Timeout for clod execution'"`
 
@@ -77,7 +80,14 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		Str("path", cli.SessionStorePath).
 		Msg("loaded sessions from storage")
 
-	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, cli.AgentsPromptPath, logger)
+	// Resolve the shared prompt path relative to the agents base
+	// dir when it isn't already absolute, so `AGENTS.md` (the
+	// default) lands at `<AgentsPath>/AGENTS.md`.
+	sharedPromptPath := cli.AgentsSharedPromptPath
+	if sharedPromptPath != "" && !filepath.IsAbs(sharedPromptPath) && cli.AgentsPath != "" {
+		sharedPromptPath = filepath.Join(cli.AgentsPath, sharedPromptPath)
+	}
+	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, cli.AgentsPromptPath, sharedPromptPath, logger)
 
 	// Create and start the bot
 	bot, err := NewBot(

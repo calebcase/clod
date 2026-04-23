@@ -72,8 +72,12 @@ type PermissionFIFO struct {
 // Docker container where .clod/runtime is mounted read-write.
 // If runtimeSuffix is provided, it will be used to create a unique runtime directory.
 // If empty, generates a random suffix for concurrent instances.
-// If agentsPromptPath is provided and not empty, the file will be copied to AGENT.md in the runtime directory.
-func NewPermissionFIFO(taskPath string, runtimeSuffix string, agentsPromptPath string, logger zerolog.Logger) (*PermissionFIFO, error) {
+// If agentsPromptPath is provided and not empty, that file's content is
+// copied into the runtime directory as AGENT.md (the per-task prompt).
+// If agentsSharedPromptPath is provided and not empty, that file's
+// content is copied as AGENTS.md (the workspace-wide prompt). Either
+// may be missing on disk; missing files are silently skipped.
+func NewPermissionFIFO(taskPath string, runtimeSuffix string, agentsPromptPath string, agentsSharedPromptPath string, logger zerolog.Logger) (*PermissionFIFO, error) {
 	// Generate random suffix if not provided (for concurrent mode)
 	if runtimeSuffix == "" {
 		// Generate 6 random hex characters
@@ -113,6 +117,28 @@ func NewPermissionFIFO(taskPath string, runtimeSuffix string, agentsPromptPath s
 				return nil, oops.Trace(err)
 			}
 			logger.Debug().Str("src", srcPath).Str("dst", agentMDPath).Msg("copied agent prompt file")
+		}
+	}
+
+	// Copy the workspace-wide (shared) prompt. Resolved absolutely
+	// upstream in cli.go, so we don't attempt task-relative
+	// interpretation here — a relative path reaching this point would
+	// resolve against the bot's working directory, which isn't
+	// meaningful for this feature.
+	if agentsSharedPromptPath != "" {
+		sharedContent, err := os.ReadFile(agentsSharedPromptPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				logger.Debug().Str("path", agentsSharedPromptPath).Msg("shared agent prompt file not found, skipping")
+			} else {
+				return nil, oops.Trace(err)
+			}
+		} else if len(sharedContent) > 0 {
+			sharedMDPath := filepath.Join(runtimeDir, "AGENTS.md")
+			if err := os.WriteFile(sharedMDPath, sharedContent, 0644); err != nil {
+				return nil, oops.Trace(err)
+			}
+			logger.Debug().Str("src", agentsSharedPromptPath).Str("dst", sharedMDPath).Msg("copied shared agent prompt file")
 		}
 	}
 
@@ -316,6 +342,18 @@ func (p *PermissionFIFO) AgentPromptPath() string {
 	agentPath := filepath.Join(filepath.Dir(p.requestPath), "AGENT.md")
 	if _, err := os.Stat(agentPath); err == nil {
 		return agentPath
+	}
+	return ""
+}
+
+// SharedPromptPath returns the path to AGENTS.md (the workspace-wide
+// prompt materialized into the runtime dir) if it exists, empty string
+// otherwise. Companion to AgentPromptPath — the runner uses both to
+// decide which --append-system-prompt directives to emit.
+func (p *PermissionFIFO) SharedPromptPath() string {
+	sharedPath := filepath.Join(filepath.Dir(p.requestPath), "AGENTS.md")
+	if _, err := os.Stat(sharedPath); err == nil {
+		return sharedPath
 	}
 	return ""
 }
