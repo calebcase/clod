@@ -214,7 +214,25 @@ type pendingInit struct {
 	SelModel     string   // currently-selected model (value from initModelOptions)
 	SelTemplate  string   // currently-selected template (sibling task name) or "" for none
 	SelPackages  []string // currently-selected package indices (as strings)
+	// Phase tracks which step of the two-step init flow is currently
+	// rendered. "template_picker" = step 1 (template-or-custom
+	// chooser); "custom_detail" = step 2 (image/ssh/model/packages).
+	// Freshly-created prompts start at "template_picker" when any
+	// templates exist for the base dir, otherwise skip directly to
+	// "custom_detail".
+	Phase string
 }
+
+const (
+	initPhaseTemplatePicker = "template_picker"
+	initPhaseCustomDetail   = "custom_detail"
+
+	// customSetupSentinel is the radio `value` for the "Custom setup"
+	// option on the Step 1 template picker. Slack rejects empty
+	// option values with invalid_blocks; this non-empty sentinel is
+	// translated back to "go to Step 2" in the action handler.
+	customSetupSentinel = "__custom__"
+)
 
 // slackMaxOptionCount is the per-element cap Slack enforces on
 // radio_buttons and checkboxes option lists. Exceed it and the whole
@@ -229,14 +247,92 @@ const slackMaxOptionCount = 10
 // writeInitFiles before it's used as a real template name.
 const noneTemplateSentinel = "__none__"
 
-// buildInitPromptBlocks renders the setup prompt: header, image radio,
-// ssh radio, package checkboxes, Create/Cancel buttons.
-func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
+// buildInitStep1Blocks renders Step 1 of the two-step setup flow: a
+// radio picker over available templates plus a "Custom setup"
+// escape, and a pair of Next/Cancel buttons. Selecting a template
+// and clicking Next materializes the task immediately; selecting
+// "Custom setup" transitions the same message to Step 2.
+func buildInitStep1Blocks(p *pendingInit, progressKey string) []slack.Block {
 	var headerText string
 	if p.CreateDir {
-		headerText = fmt.Sprintf(":sparkles: *Set up new task* `%s`\n_The directory `%s` doesn't exist yet. I'll create it and initialize a default `.clod/` setup._", p.TaskName, p.TaskPath)
+		headerText = fmt.Sprintf(":sparkles: *Set up new task* `%s`\n_Pick a template to clone, or choose Custom setup to configure from scratch._", p.TaskName)
 	} else {
-		headerText = fmt.Sprintf(":sparkles: *Initialize task* `%s`\n_The directory exists but isn't set up for clod. I'll create `.clod/` with the options below._", p.TaskName)
+		headerText = fmt.Sprintf(":sparkles: *Initialize task* `%s`\n_Pick a template to clone, or choose Custom setup to configure from scratch._", p.TaskName)
+	}
+
+	blocks := []slack.Block{
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", headerText, false, false),
+			nil, nil,
+		),
+	}
+
+	// Leave one slot for the Custom option so the total stays under
+	// Slack's 10-option radio cap.
+	templates := p.Templates
+	if len(templates) > slackMaxOptionCount-1 {
+		templates = templates[:slackMaxOptionCount-1]
+	}
+	tplOpts := make([]*slack.OptionBlockObject, 0, len(templates)+1)
+	var initialOpt *slack.OptionBlockObject
+	for _, t := range templates {
+		label := truncateForSlackText(t, 75)
+		desc := truncateForSlackText(fmt.Sprintf("Copy `%s` as a starting point (config + files).", t), 75)
+		opt := slack.NewOptionBlockObject(
+			t,
+			slack.NewTextBlockObject("plain_text", label, false, false),
+			slack.NewTextBlockObject("plain_text", desc, false, false),
+		)
+		tplOpts = append(tplOpts, opt)
+		if initialOpt == nil && t == p.SelTemplate {
+			initialOpt = opt
+		}
+	}
+	customOpt := slack.NewOptionBlockObject(
+		customSetupSentinel,
+		slack.NewTextBlockObject("plain_text", "Custom setup", false, false),
+		slack.NewTextBlockObject("plain_text", "Pick image, SSH, model, and packages manually.", false, false),
+	)
+	tplOpts = append(tplOpts, customOpt)
+	if initialOpt == nil {
+		initialOpt = customOpt
+	}
+
+	tplRadio := slack.NewRadioButtonsBlockElement("init_step1_choice", tplOpts...)
+	tplRadio.InitialOption = initialOpt
+	blocks = append(blocks, slack.NewActionBlock("init_step1_row", tplRadio))
+
+	nextValue := fmt.Sprintf(`{"k":%q,"b":"allow"}`, progressKey)
+	cancelValue := fmt.Sprintf(`{"k":%q,"b":"deny"}`, progressKey)
+	nextBtn := slack.NewButtonBlockElement(
+		"init_step1_next",
+		nextValue,
+		slack.NewTextBlockObject("plain_text", "Next", false, false),
+	)
+	nextBtn.Style = "primary"
+	cancelBtn := slack.NewButtonBlockElement(
+		"init_cancel",
+		cancelValue,
+		slack.NewTextBlockObject("plain_text", "Cancel", false, false),
+	)
+	cancelBtn.Style = "danger"
+	blocks = append(blocks, slack.NewActionBlock("init_step1_submit_row", nextBtn, cancelBtn))
+
+	return blocks
+}
+
+// buildInitPromptBlocks renders Step 2 of the setup prompt (custom
+// detail): base image, SSH, model, packages, Create/Cancel. Step 1
+// (template-or-custom) is rendered by buildInitStep1Blocks; the two
+// share the same pendingInit state so transitioning between them is a
+// chat.update of the same message.
+func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
+	var headerText string
+	switch {
+	case p.CreateDir:
+		headerText = fmt.Sprintf(":sparkles: *Set up new task* `%s` — custom configuration\n_The directory `%s` doesn't exist yet. I'll create it and write a fresh `.clod/` from the options below._", p.TaskName, p.TaskPath)
+	default:
+		headerText = fmt.Sprintf(":sparkles: *Initialize task* `%s` — custom configuration\n_The directory exists but isn't set up for clod. I'll create `.clod/` with the options below._", p.TaskName)
 	}
 
 	blocks := []slack.Block{
@@ -334,49 +430,6 @@ func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
 	modelRadio := slack.NewRadioButtonsBlockElement("init_model", modelOpts...)
 	modelRadio.InitialOption = initialModel
 	blocks = append(blocks, slack.NewActionBlock("init_model_row", modelRadio))
-
-	// Template (radio). If there are sibling tasks, offer them as a
-	// starting point — picking one copies that directory's contents
-	// (excluding per-instance `.clod/` state) before the .clod config
-	// files below are written from the other pickers.
-	if len(p.Templates) > 0 {
-		// Leave one slot for the "(none)" option so total options stay
-		// inside Slack's radio_buttons cap.
-		templates := p.Templates
-		if len(templates) > slackMaxOptionCount-1 {
-			templates = templates[:slackMaxOptionCount-1]
-		}
-		tplOpts := make([]*slack.OptionBlockObject, 0, len(templates)+1)
-		noneOpt := slack.NewOptionBlockObject(
-			noneTemplateSentinel,
-			slack.NewTextBlockObject("plain_text", "(none)", false, false),
-			slack.NewTextBlockObject("plain_text", "Start from an empty directory.", false, false),
-		)
-		tplOpts = append(tplOpts, noneOpt)
-		var initialTpl *slack.OptionBlockObject = noneOpt
-		for _, t := range templates {
-			label := truncateForSlackText(t, 75)
-			desc := truncateForSlackText(fmt.Sprintf("Copy contents of `%s` as a starting point.", t), 75)
-			opt := slack.NewOptionBlockObject(
-				t,
-				slack.NewTextBlockObject("plain_text", label, false, false),
-				slack.NewTextBlockObject("plain_text", desc, false, false),
-			)
-			tplOpts = append(tplOpts, opt)
-			if t == p.SelTemplate {
-				initialTpl = opt
-			}
-		}
-		blocks = append(blocks,
-			slack.NewSectionBlock(
-				slack.NewTextBlockObject("mrkdwn", "*Template* (optional)\n_Copies the chosen task's files into the new directory. Per-task `.clod/` state is regenerated._", false, false),
-				nil, nil,
-			),
-		)
-		tplRadio := slack.NewRadioButtonsBlockElement("init_template", tplOpts...)
-		tplRadio.InitialOption = initialTpl
-		blocks = append(blocks, slack.NewActionBlock("init_template_row", tplRadio))
-	}
 
 	// Packages (checkboxes). Values are indices into p.Packages so the
 	// label length doesn't blow past the 75-char option-text cap.
@@ -545,6 +598,34 @@ func writeInitFiles(p *pendingInit, image, sshMode string, packages []string) er
 		}
 	}
 
+	return nil
+}
+
+// materializeFromTemplate clones src into dst the way copyTaskTemplate
+// does, then patches the minimum `.clod/` state needed to make the
+// new task runnable on its own. Specifically:
+//
+//   - Rewrites `.clod/name` to newTaskName (otherwise the new task's
+//     container would identify as the template's name).
+//   - Ensures `.clod/claude` exists empty so clod's runtime doesn't
+//     error on the missing directory; per-instance claude state is
+//     intentionally regenerated.
+//
+// All other `.clod/` config (Dockerfile_*, image, ssh, etc.) is
+// inherited as-is. No user-dialog selections are overlaid because
+// this path is used by the `<template>::` shortcut, where the user
+// has already committed to the template's setup verbatim.
+func materializeFromTemplate(src, dst, newTaskName string) error {
+	if err := copyTaskTemplate(src, dst); err != nil {
+		return err
+	}
+	clodDir := filepath.Join(dst, ".clod")
+	if err := os.MkdirAll(filepath.Join(clodDir, "claude"), 0o755); err != nil {
+		return fmt.Errorf("create .clod/claude in templated task: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(clodDir, "name"), []byte(newTaskName+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write .clod/name in templated task: %w", err)
+	}
 	return nil
 }
 
