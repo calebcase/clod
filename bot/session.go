@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/calebcase/oops"
+	"github.com/rs/zerolog"
 )
 
 // SessionMapping represents a Slack thread to clod session mapping.
@@ -91,6 +94,7 @@ type SessionStore struct {
 	sessions              map[string]*SessionMapping // key: "channelID:threadTS"
 	mu                    sync.RWMutex
 	defaultVerbosityLevel int
+	logger                zerolog.Logger
 }
 
 // Count returns the number of stored sessions.
@@ -115,11 +119,12 @@ func (s *SessionStore) AllSessions() []*SessionMapping {
 }
 
 // NewSessionStore creates a new SessionStore and loads existing sessions.
-func NewSessionStore(path string, defaultVerbosityLevel int) (*SessionStore, error) {
+func NewSessionStore(path string, defaultVerbosityLevel int, logger zerolog.Logger) (*SessionStore, error) {
 	s := &SessionStore{
 		path:                  path,
 		sessions:              make(map[string]*SessionMapping),
 		defaultVerbosityLevel: defaultVerbosityLevel,
+		logger:                logger.With().Str("component", "session_store").Logger(),
 	}
 
 	if err := s.Load(); err != nil && !os.IsNotExist(err) {
@@ -177,6 +182,12 @@ func (s *SessionStore) SetVerbosityLevel(channelID, threadTS string, level int) 
 // drive resume-on-restart: callers set Active=true when a task starts and
 // clear it only on clean completion. Touches UpdatedAt so the caller can
 // treat this as a heartbeat too.
+//
+// Every transition is logged with caller file:line so stale-Active or
+// prematurely-cleared-Active bugs are self-diagnosing on the next
+// occurrence. The log level is info only when the value actually
+// changes; redundant writes stay at debug so the signal-to-noise stays
+// reasonable under heartbeat churn.
 func (s *SessionStore) SetActive(channelID, threadTS string, active bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -191,8 +202,35 @@ func (s *SessionStore) SetActive(channelID, threadTS string, active bool) {
 		}
 		s.sessions[k] = session
 	}
+	prev := session.Active
 	session.Active = active
 	session.UpdatedAt = time.Now()
+
+	var evt *zerolog.Event
+	if prev != active {
+		evt = s.logger.Info()
+	} else {
+		evt = s.logger.Debug()
+	}
+	caller := "?"
+	if _, file, line, ok := runtime.Caller(1); ok {
+		caller = shortCaller(file, line)
+	}
+	evt.
+		Str("channel", channelID).
+		Str("thread_ts", threadTS).
+		Str("task", session.TaskName).
+		Bool("prev", prev).
+		Bool("active", active).
+		Str("caller", caller).
+		Msg("session active flag")
+}
+
+// shortCaller trims a full file path down to "<basename>:<line>" for
+// compact log lines. A full path carries no extra information past
+// the basename since this is a single-package project.
+func shortCaller(file string, line int) string {
+	return filepath.Base(file) + ":" + strconv.Itoa(line)
 }
 
 // Touch bumps UpdatedAt so the session's "last seen alive" timestamp stays

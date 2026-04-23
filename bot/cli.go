@@ -11,7 +11,7 @@ import (
 )
 
 // Version is the bot version. Update this when releasing.
-const Version = "0.14.0"
+const Version = "0.15.0"
 
 type Flags struct {
 	Log struct {
@@ -42,7 +42,7 @@ type Flags struct {
 
 	GracefulShutdownTTL time.Duration `kong:"default='30s',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
 
-	ResumeStaleAfter time.Duration `kong:"default='10m',env='CLOD_BOT_RESUME_STALE_AFTER',help='Active sessions older than this are treated as stale on startup (flag cleared, no auto-resume). Set to 0 to disable auto-resume entirely.'"`
+	ResumeStaleAfter time.Duration `kong:"default='30m',env='CLOD_BOT_RESUME_STALE_AFTER',help='Active sessions older than this are treated as stale on startup (flag cleared, no auto-resume). Set to 0 to disable auto-resume entirely.'"`
 }
 
 type CLI struct {
@@ -68,7 +68,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	taskNames := tasks.List()
 	logger.Info().Strs("tasks", taskNames).Msg("discovered tasks")
 
-	sessions, err := NewSessionStore(cli.SessionStorePath, cli.VerbosityLevel)
+	sessions, err := NewSessionStore(cli.SessionStorePath, cli.VerbosityLevel, logger)
 	if err != nil {
 		return err
 	}

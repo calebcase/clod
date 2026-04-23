@@ -2985,10 +2985,12 @@ func (h *Handler) finalizeTask(
 		session.SessionID = result.SessionID
 		session.TaskName = taskName
 		session.TaskPath = taskPath
-		if cleanExit {
-			session.Active = false
-		}
 		h.bot.sessions.Set(session)
+		if cleanExit {
+			// Route through SetActive so the transition is logged
+			// alongside every other clear of the Active flag.
+			h.bot.sessions.SetActive(channelID, threadTS, false)
+		}
 		if err := h.bot.sessions.Save(); err != nil {
 			logger.Error().Err(err).Msg("failed to save sessions")
 		}
