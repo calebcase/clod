@@ -65,10 +65,11 @@ var progressStderrPattern = regexp.MustCompile(`^(\[clod\]|#\d+ (\[|DONE))`)
 
 // Runner executes clod processes.
 type Runner struct {
-	timeout          time.Duration
-	permissionMode   string
-	agentsPromptPath string
-	logger           zerolog.Logger
+	timeout                time.Duration
+	permissionMode         string
+	agentsPromptPath       string // per-task prompt (default README.md in task dir)
+	agentsSharedPromptPath string // workspace-wide prompt (default <AgentsPath>/AGENTS.md, absolute)
+	logger                 zerolog.Logger
 }
 
 // NewRunner creates a new Runner.
@@ -76,13 +77,15 @@ func NewRunner(
 	timeout time.Duration,
 	permissionMode string,
 	agentsPromptPath string,
+	agentsSharedPromptPath string,
 	logger zerolog.Logger,
 ) *Runner {
 	return &Runner{
-		timeout:          timeout,
-		permissionMode:   permissionMode,
-		agentsPromptPath: agentsPromptPath,
-		logger:           logger.With().Str("component", "runner").Logger(),
+		timeout:                timeout,
+		permissionMode:         permissionMode,
+		agentsPromptPath:       agentsPromptPath,
+		agentsSharedPromptPath: agentsSharedPromptPath,
+		logger:                 logger.With().Str("component", "runner").Logger(),
 	}
 }
 
@@ -546,7 +549,7 @@ func (r *Runner) Start(
 
 	// Create permission FIFO for MCP communication (must be done before building args).
 	// Pass empty string to generate a unique runtime suffix for concurrent instances.
-	permFIFO, err := NewPermissionFIFO(taskPath, "", r.agentsPromptPath, r.logger)
+	permFIFO, err := NewPermissionFIFO(taskPath, "", r.agentsPromptPath, r.agentsSharedPromptPath, r.logger)
 	if err != nil {
 		cancel()
 		return nil, oops.Trace(err)
@@ -586,9 +589,34 @@ func (r *Runner) Start(
 		args = append(args, "--append-system-prompt", runtimeNotice)
 	}
 
-	// Add the agent system prompt flag if AGENT.md was copied to the runtime directory.
-	if agentPromptPath := permFIFO.AgentPromptPath(); agentPromptPath != "" {
-		runtimeDirName := filepath.Join(".clod", "runtime-"+permFIFO.RuntimeSuffix())
+	// Point the agent at the workspace-wide + per-task prompt files
+	// that were copied into the runtime dir. Layered: AGENTS.md
+	// applies to every task; AGENT.md adds task-specific context on
+	// top. Either (or both) may be missing and we skip whichever
+	// isn't present.
+	runtimeDirName := filepath.Join(".clod", "runtime-"+permFIFO.RuntimeSuffix())
+	sharedPresent := permFIFO.SharedPromptPath() != ""
+	taskPresent := permFIFO.AgentPromptPath() != ""
+	switch {
+	case sharedPresent && taskPresent:
+		args = append(
+			args,
+			"--append-system-prompt",
+			fmt.Sprintf(
+				"You are an agent. Read %s/AGENTS.md (workspace-wide guidance) AND %s/AGENT.md (task-specific guidance) as soon as possible and treat both as part of your system prompt. The task-specific guidance overrides the workspace-wide guidance when they conflict.",
+				runtimeDirName, runtimeDirName,
+			),
+		)
+	case sharedPresent:
+		args = append(
+			args,
+			"--append-system-prompt",
+			fmt.Sprintf(
+				"You are an agent. Read %s/AGENTS.md (workspace-wide guidance) as soon as possible and treat it as part of your system prompt.",
+				runtimeDirName,
+			),
+		)
+	case taskPresent:
 		args = append(
 			args,
 			"--append-system-prompt",
