@@ -409,16 +409,31 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 	}
 }
 
-// HandleMessage processes regular message events (for thread replies).
+// HandleMessage processes regular message events. In channels we only
+// act on thread replies (top-level posts need an explicit @-mention
+// to route through HandleAppMention); in DMs — both 1:1 (`im`) and
+// group (`mpim`) — we also act on top-level messages by treating the
+// whole DM as an implicit @bot conversation. First top-level DM
+// message starts a new auto-named task rooted at that message; thread
+// replies underneath continue the session.
 func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEvent) {
-	// Ignore bot messages
+	// Ignore bot messages (ours and other bots').
 	if ev.BotID != "" {
 		return
 	}
+	// Skip edits/deletes/file-shares/joins/leaves. The base shape we
+	// want has no SubType. Extending to file_share is worth
+	// considering later so a DM with just an attached file starts a
+	// task.
+	if ev.SubType != "" {
+		return
+	}
 
-	// Only handle thread replies
 	threadTS := ev.ThreadTimeStamp
-	if threadTS == "" {
+	isDM := ev.ChannelType == "im" || ev.ChannelType == "mpim"
+	// Non-DM top-level messages go through HandleAppMention only. DM
+	// top-level messages fall through to the new-task path below.
+	if threadTS == "" && !isDM {
 		return
 	}
 
@@ -427,6 +442,7 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		Str("thread_ts", threadTS).
 		Str("user", ev.User).
 		Str("text", ev.Text).
+		Bool("dm", isDM).
 		Logger()
 
 	// Check if message is @mentioning someone (let app_mention handle those)
@@ -435,6 +451,14 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		logger.Debug().
 			Str("mentioned_user", mentionedUser).
 			Msg("message mentions a user, ignoring (app_mention will handle if it's the bot)")
+		return
+	}
+
+	// DM top-level message: no thread → start a new auto-named task.
+	// Channel top-levels were filtered out above; reaching here with
+	// empty threadTS implies DM.
+	if threadTS == "" {
+		h.handleDMNewTask(ctx, ev, logger)
 		return
 	}
 
@@ -1693,6 +1717,78 @@ func (h *Handler) handleNewTask(
 	}
 
 	h.runNewTask(ctx, ev, threadTS, parsed.TaskName, taskPath, parsed.Instructions, logger)
+}
+
+// handleDMNewTask is the top-level-DM equivalent of HandleAppMention's
+// `@bot :: <text>` (auto-named new task) path. No explicit mention is
+// required because the user is already in a 1:1 / group DM with the
+// bot — the whole conversation is implicitly directed at it. Thread
+// replies underneath the resulting message continue the session
+// through HandleMessage's existing flow.
+func (h *Handler) handleDMNewTask(
+	ctx context.Context,
+	ev *slackevents.MessageEvent,
+	logger zerolog.Logger,
+) {
+	// Authorization: only bot-wide allowlist applies at this point —
+	// there's no per-thread allowlist yet (no session exists).
+	if !h.bot.auth.IsAuthorized(ev.User) {
+		logger.Warn().Msg("unauthorized user DMed the bot")
+		if _, err := h.bot.PostMessage(ev.Channel, h.bot.auth.RejectMessage(), ev.TimeStamp); err != nil {
+			logger.Debug().Err(err).Msg("failed to post DM auth rejection")
+		}
+		return
+	}
+
+	text := strings.TrimSpace(ev.Text)
+	if text == "" {
+		return
+	}
+
+	base := h.bot.tasks.BasePath()
+	if base == "" {
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":warning: Can't start — `CLOD_BOT_AGENTS_PATH` isn't set.",
+			ev.TimeStamp); err != nil {
+			logger.Debug().Err(err).Msg("failed to post DM base-missing error")
+		}
+		return
+	}
+
+	name, err := generateTaskName(base)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to generate task name for DM")
+		if _, perr := h.bot.PostMessage(ev.Channel,
+			fmt.Sprintf(":warning: Couldn't generate a unique task name: %v", err),
+			ev.TimeStamp); perr != nil {
+			logger.Debug().Err(perr).Msg("failed to post DM auto-name error")
+		}
+		return
+	}
+	if _, err := h.bot.PostMessage(ev.Channel,
+		fmt.Sprintf(":label: Auto-generated task name: `%s`", name),
+		ev.TimeStamp); err != nil {
+		logger.Debug().Err(err).Msg("failed to post DM auto-name notice")
+	}
+
+	// Synthesize an AppMentionEvent so handleNewTask / the init-prompt
+	// path work unchanged. The `<@BOT>` placeholder is purely so
+	// ParseMention's regex matches — downstream code doesn't inspect
+	// the bot user id here. ThreadTimeStamp=TimeStamp roots the
+	// task's thread at this top-level DM so follow-up replies are
+	// handled as continuations by the existing HandleMessage logic.
+	synthetic := &slackevents.AppMentionEvent{
+		Channel:         ev.Channel,
+		User:            ev.User,
+		TimeStamp:       ev.TimeStamp,
+		ThreadTimeStamp: ev.TimeStamp,
+		Text:            fmt.Sprintf("<@BOT> %s: %s", name, text),
+	}
+	logger = logger.With().
+		Str("task", name).
+		Bool("dm_implicit_mention", true).
+		Logger()
+	h.handleNewTask(ctx, synthetic, ev.TimeStamp, logger)
 }
 
 // handleRootTask runs a task directly in the agents base directory

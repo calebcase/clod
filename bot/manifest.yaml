@@ -43,6 +43,8 @@ settings:
       - app_mention
       - message.channels
       - message.groups
+      - message.im
+      - message.mpim
       - reaction_added
       - reaction_removed
   interactivity:
