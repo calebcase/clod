@@ -60,6 +60,10 @@ func buildHomeTabView(
 		blocks = append(blocks, buildSessionRows(sessions, now, true)...)
 	}
 
+	// "How to use" reference.
+	blocks = append(blocks, slack.NewDividerBlock())
+	blocks = append(blocks, buildHomeHelpBlocks()...)
+
 	// Footer.
 	blocks = append(blocks, slack.NewDividerBlock())
 	blocks = append(blocks, slack.NewContextBlock(
@@ -191,4 +195,60 @@ func filterByUser(sessions []*SessionMapping, userID string) []*SessionMapping {
 		}
 	}
 	return out
+}
+
+// buildHomeHelpBlocks returns the "How to use" reference rendered as
+// a sequence of section blocks. Split into multiple sections so each
+// stays under Slack's 3000-char per-block cap and so the renderer can
+// reflow them individually as the catalog grows. Mrkdwn formatting
+// (bold headers, code spans, bullet lists) renders the same way as
+// thread messages elsewhere in the bot.
+func buildHomeHelpBlocks() []slack.Block {
+	starting := "*Starting tasks*\n" +
+		"• `@bot <task>: <instructions>` — run an existing task; opens an init dialog when the task dir doesn't have `.clod/` yet\n" +
+		"• `@bot <template>:: <instructions>` — auto-named task using `<template>` as the starting point (no dialog)\n" +
+		"• `@bot :: <instructions>` — auto-named task; pick a template or Custom setup in the two-step init dialog\n" +
+		"• `@bot *: <instructions>` — run in the agents base dir itself (no per-task subdirectory). Filesync and plan mode default off.\n" +
+		"• `@bot !: <instructions>` — run claude directly on the host (no docker sandbox; confirmation required)"
+
+	perThread := "*Per-thread commands* (any active session)\n" +
+		"• `@bot close` — stop the running task and close the session. Auto-resume on bot restart is disabled until you @-mention again.\n" +
+		"• `@bot allow @user` / `@bot disallow @user` — manage who else can drive this thread\n" +
+		"• `@bot set model=opus|sonnet|haiku` — switch model. `+` / `-` to cycle, or send 🎼 / 📜 / 🌸\n" +
+		"• `@bot set verbosity=0|1|-1` — silent / summary / full. Or 🙈 / 💬\n" +
+		"• `@bot set plan=on|off` — toggle plan mode. Or `+` / `-` / 💭\n" +
+		"• `@bot set filesync=on|off` — toggle file syncing for the task dir back to Slack"
+
+	dms := "*DMs with the bot*\n" +
+		"• In a DM the `@bot` prefix is implicit on top-level messages — just type the command or instructions\n" +
+		"• First top-level DM starts a new task; subsequent top-level DMs continue the most-recent session\n" +
+		"• Use `:: <text>` (or `*:` / `!:`) inside a DM to start a fresh task instead of continuing\n" +
+		"• Bot commands (`close`, `set ...`, `allow @user`) work in DM thread replies via `<@bot> <command>`"
+
+	refs := "*Slack references*\n" +
+		"• Paste a Slack permalink (channel or thread link) and the bot will expand the referenced thread into the prompt\n" +
+		"• Public channels: bot auto-joins if it isn't a member and posts a notice in the active thread\n" +
+		"• Private channels: invite the bot first with `/invite @<bot>` — no scope can grant private-channel access without an invite\n" +
+		"• Large or private references trigger a confirmation dialog before inclusion (Include inline, Save as asset, Skip, Cancel)"
+
+	prompts := "*Per-task agent prompt*\n" +
+		"• Each task's `README.md` is appended to claude's system prompt as `AGENT.md` on every run — edit it to give the agent persistent task context\n" +
+		"• A workspace-wide `AGENTS.md` at the agents base dir applies to every task. Task-specific guidance overrides workspace-wide on conflict.\n" +
+		"• File names are configurable via `CLOD_BOT_AGENTS_PROMPT_PATH` and `CLOD_BOT_AGENTS_SHARED_PROMPT_PATH`"
+
+	mkSec := func(text string) slack.Block {
+		return slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", text, false, false),
+			nil, nil,
+		)
+	}
+
+	return []slack.Block{
+		mkSec(":books: *How to use this bot*"),
+		mkSec(starting),
+		mkSec(perThread),
+		mkSec(dms),
+		mkSec(refs),
+		mkSec(prompts),
+	}
 }
