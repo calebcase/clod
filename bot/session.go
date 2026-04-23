@@ -100,6 +100,20 @@ func (s *SessionStore) Count() int {
 	return len(s.sessions)
 }
 
+// AllSessions returns a snapshot of every session as a fresh slice.
+// Used by the Home tab renderer to build usage aggregates; avoids
+// exposing the underlying map to callers who might forget to hold
+// the lock.
+func (s *SessionStore) AllSessions() []*SessionMapping {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*SessionMapping, 0, len(s.sessions))
+	for _, m := range s.sessions {
+		out = append(out, m)
+	}
+	return out
+}
+
 // NewSessionStore creates a new SessionStore and loads existing sessions.
 func NewSessionStore(path string, defaultVerbosityLevel int) (*SessionStore, error) {
 	s := &SessionStore{
