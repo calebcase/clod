@@ -727,17 +727,47 @@ func (h *Handler) HandleAppHomeOpened(ctx context.Context, ev *slackevents.AppHo
 		Str("tab", ev.Tab).
 		Logger()
 
-	h.publishHomeView(ev.User, logger)
+	var hash string
+	if ev.View != nil {
+		hash = ev.View.Hash
+	}
+	h.publishHomeView(ev.User, hash, logger)
 }
 
 // publishHomeView renders and publishes the Home tab for a user.
 // Shared by the app_home_opened event handler and the in-view
 // Refresh button so both entry points build the view identically.
-func (h *Handler) publishHomeView(userID string, logger zerolog.Logger) {
+//
+// knownHash is the hash of the view the caller currently believes is
+// published (from the AppHomeOpenedEvent or the click callback).
+// Slack uses it to guard against races between concurrent publishes.
+// We always retry on hash_conflict by republishing WITHOUT a hash —
+// Slack's docs treat an absent hash as "I don't care about prior
+// state, just publish this", which is the right behavior for our
+// idempotent re-renders. (slack-go's PublishView would have sent
+// `"hash": ""` literally and Slack treats that as a stale-state
+// assertion, hence the direct PublishViewContext call with the
+// pointer left nil on the retry.)
+func (h *Handler) publishHomeView(userID string, knownHash string, logger zerolog.Logger) {
 	sessions := h.bot.sessions.AllSessions()
 	includeWorkspace := h.bot.auth.IsAuthorized(userID)
 	view := buildHomeTabView(sessions, userID, includeWorkspace, Version)
-	if _, err := h.bot.client.PublishView(userID, view, ""); err != nil {
+
+	req := slack.PublishViewContextRequest{
+		UserID: userID,
+		View:   view,
+	}
+	if knownHash != "" {
+		hashCopy := knownHash
+		req.Hash = &hashCopy
+	}
+	_, err := h.bot.client.PublishViewContext(context.Background(), req)
+	if err != nil && strings.Contains(err.Error(), "hash_conflict") && req.Hash != nil {
+		logger.Debug().Str("hash", knownHash).Msg("home view hash conflict; retrying without hash")
+		req.Hash = nil
+		_, err = h.bot.client.PublishViewContext(context.Background(), req)
+	}
+	if err != nil {
 		logger.Error().Err(err).Msg("failed to publish home tab view")
 		return
 	}
@@ -756,7 +786,8 @@ func (h *Handler) handleHomeRefresh(ctx context.Context, callback *slack.Interac
 		Str("user", callback.User.ID).
 		Str("action", "home_refresh").
 		Logger()
-	h.publishHomeView(callback.User.ID, logger)
+	hash := callback.View.Hash
+	h.publishHomeView(callback.User.ID, hash, logger)
 }
 
 // augmentInputWithAttachments downloads any Slack files attached to a
