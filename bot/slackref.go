@@ -119,7 +119,7 @@ func resolveSlackRef(client *slack.Client, ref SlackRef, logger zerolog.Logger) 
 	})
 	if err != nil {
 		res.Err = err
-		res.ErrReason = humanizeSlackErr(err, "")
+		res.ErrReason = humanizeSlackErr(err, "", scopeHintForInfo(ref.ChannelID))
 		logger.Warn().Err(err).Str("channel", ref.ChannelID).Msg("failed to load channel info for ref")
 		return res
 	}
@@ -144,7 +144,7 @@ func resolveSlackRef(client *slack.Client, ref SlackRef, logger zerolog.Logger) 
 	})
 	if err != nil {
 		res.Err = err
-		res.ErrReason = humanizeSlackErr(err, res.ChannelName)
+		res.ErrReason = humanizeSlackErr(err, res.ChannelName, scopeHintForHistory(ref.ChannelID, res.IsDM, info.IsMpIM))
 		logger.Warn().Err(err).Str("channel", ref.ChannelID).Msg("failed to load thread replies for ref")
 		return res
 	}
@@ -158,8 +158,13 @@ func resolveSlackRef(client *slack.Client, ref SlackRef, logger zerolog.Logger) 
 }
 
 // humanizeSlackErr turns a slack-go error into a short user-friendly
-// sentence suitable for a thread post.
-func humanizeSlackErr(err error, channelName string) string {
+// sentence suitable for a thread post. scopeHint, when non-empty,
+// names the OAuth scope the failing call requires — we derive it
+// from the channel ID prefix (public / private / im / mpim) plus
+// which call failed (info vs history). slack-go's error type doesn't
+// surface the `needed:` field from the raw Slack response, so the
+// hint is based on our own table rather than Slack's self-report.
+func humanizeSlackErr(err error, channelName, scopeHint string) string {
 	msg := err.Error()
 	ch := channelName
 	if ch != "" {
@@ -174,9 +179,49 @@ func humanizeSlackErr(err error, channelName string) string {
 	case strings.Contains(msg, "thread_not_found"), strings.Contains(msg, "message_not_found"):
 		return "message not found (deleted or moved?)"
 	case strings.Contains(msg, "missing_scope"):
-		return "bot is missing a scope required to read that channel"
+		if scopeHint != "" {
+			return fmt.Sprintf("bot is missing the `%s` OAuth scope (reinstall the app after adding it in the Slack app config)", scopeHint)
+		}
+		return "bot is missing an OAuth scope required to read that channel"
 	default:
 		return msg
+	}
+}
+
+// scopeHintForInfo returns the conversations.info scope required for a
+// channel, inferred from the ID prefix. `C` = public, `G` = private
+// channel or group-DM, `D` = 1:1 DM. `G` is ambiguous so we name both
+// options; the caller can't distinguish mpim vs legacy-private before
+// conversations.info returns.
+func scopeHintForInfo(channelID string) string {
+	switch {
+	case strings.HasPrefix(channelID, "C"):
+		return "channels:read"
+	case strings.HasPrefix(channelID, "D"):
+		return "im:read"
+	case strings.HasPrefix(channelID, "G"):
+		return "groups:read (or mpim:read for group DMs)"
+	default:
+		return ""
+	}
+}
+
+// scopeHintForHistory returns the conversations.replies / history scope
+// required for a channel. At this call site we already have
+// conversations.info output, so the caller can distinguish mpim from
+// legacy-private and pass the correct flags.
+func scopeHintForHistory(channelID string, isIM, isMpIM bool) string {
+	switch {
+	case isIM:
+		return "im:history"
+	case isMpIM:
+		return "mpim:history"
+	case strings.HasPrefix(channelID, "C"):
+		return "channels:history"
+	case strings.HasPrefix(channelID, "G"):
+		return "groups:history"
+	default:
+		return ""
 	}
 }
 
