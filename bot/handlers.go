@@ -2227,18 +2227,32 @@ func (h *Handler) handleContinuation(
 		logger.Error().Err(err).Msg("failed to post continue task message")
 	}
 
-	// Run clod with existing session
-	h.runClod(
-		ctx,
-		ev.Channel,
-		ev.User,
-		session.TaskPath,
-		session.TaskName,
-		instructions,
-		session.SessionID,
-		threadTS,
-		logger,
+	launch := func(finalPrompt string) {
+		h.runClod(
+			ctx,
+			ev.Channel,
+			ev.User,
+			session.TaskPath,
+			session.TaskName,
+			finalPrompt,
+			session.SessionID,
+			threadTS,
+			logger,
+		)
+	}
+	cancel := func() {
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":x: Continuation cancelled — referenced content couldn't be confirmed.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post slackref-cancel notice")
+		}
+	}
+	finalPrompt, proceed := h.resolveAndRouteRefs(
+		ev.Channel, threadTS, session.TaskPath, instructions, ev.User, launch, cancel, logger,
 	)
+	if proceed {
+		launch(finalPrompt)
+	}
 }
 
 // ResumeActiveSessions is called once at bot startup. Any session still
@@ -3968,17 +3982,33 @@ func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger
 		}
 	}
 
-	h.runClod(
-		ctx,
-		p.ChannelID,
-		p.UserID,
-		p.TaskPath,
-		p.TaskName,
-		p.Instructions,
-		"",
-		p.ThreadTS,
-		logger,
+	launch := func(finalPrompt string) {
+		h.runClod(
+			ctx,
+			p.ChannelID,
+			p.UserID,
+			p.TaskPath,
+			p.TaskName,
+			finalPrompt,
+			"",
+			p.ThreadTS,
+			logger,
+		)
+	}
+	cancel := func() {
+		if _, err := h.bot.PostMessage(p.ChannelID,
+			":x: Task cancelled — referenced content couldn't be confirmed.",
+			p.ThreadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post slackref-cancel notice")
+		}
+	}
+	finalPrompt, proceed := h.resolveAndRouteRefs(
+		p.ChannelID, p.ThreadTS, p.TaskPath, p.Instructions, p.UserID, launch, cancel, logger,
 	)
+	if !proceed {
+		return
+	}
+	launch(finalPrompt)
 }
 
 // handleAskQuestionFinal resolves an AskUserQuestion prompt on Submit or
