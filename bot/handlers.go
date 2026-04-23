@@ -2761,14 +2761,40 @@ func (h *Handler) runClod(
 				// waiting for task completion. Long-running tasks used to
 				// leave the thread orphaned if the bot restarted mid-task
 				// (sessions.json only got written on task.Done()).
-				session := &SessionMapping{
-					ChannelID: channelID,
-					ThreadTS:  threadTS,
-					TaskName:  taskName,
-					TaskPath:  taskPath,
-					SessionID: sid,
-					UserID:    userID,
-					CreatedAt: time.Now(),
+				//
+				// runNewTask has already populated the session with
+				// per-thread preferences (FileSyncDisabled,
+				// PermissionMode, Model, ReactionAnchorTS, etc.); only
+				// the session_id is new here, so we patch the existing
+				// record rather than replace it. Early versions of this
+				// branch constructed a fresh SessionMapping and
+				// wrote-overwrote those preferences back to defaults
+				// — specifically, that's how root-task defaults like
+				// "filesync off" and "plan off" kept silently
+				// disappearing a few seconds after task start.
+				session := h.bot.sessions.Get(channelID, threadTS)
+				if session == nil {
+					session = &SessionMapping{
+						ChannelID: channelID,
+						ThreadTS:  threadTS,
+						TaskName:  taskName,
+						TaskPath:  taskPath,
+						UserID:    userID,
+						CreatedAt: time.Now(),
+					}
+				}
+				session.SessionID = sid
+				// Backfill any fields that might be missing on a
+				// session predating the field; preserve any values
+				// the session already has.
+				if session.TaskName == "" {
+					session.TaskName = taskName
+				}
+				if session.TaskPath == "" {
+					session.TaskPath = taskPath
+				}
+				if session.UserID == "" {
+					session.UserID = userID
 				}
 				h.bot.sessions.Set(session)
 				if err := h.bot.sessions.Save(); err != nil {

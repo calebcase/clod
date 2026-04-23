@@ -407,11 +407,13 @@ func (f *FileHandler) WatchOutputs(
 }
 
 // inlineSyncMaxBytes caps the size at which a file's content is
-// posted inline as a code-block message (editable) rather than
-// uploaded as a file-share (not editable). Slack's per-message hard
-// limit is ~4000 chars; we leave headroom for the code-fence +
-// comment text.
-const inlineSyncMaxBytes = 3000
+// posted inline as a code-block message (editable via chat.update)
+// rather than uploaded as a file-share (not editable). Slack's
+// chat.postMessage text limit is 40,000 chars; 16 KiB leaves ample
+// headroom for the code fence, header, and any mrkdwn expansion
+// while still covering the vast majority of scripts / configs /
+// small JSON files that users tend to iterate on.
+const inlineSyncMaxBytes = 16 * 1024
 
 // uploadNewFiles checks for and uploads any new or modified files in the task directory.
 //
