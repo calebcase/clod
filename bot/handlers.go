@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/calebcase/oops"
 	"github.com/rs/zerolog"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -73,6 +74,18 @@ type Handler struct {
 	// the original instructions so the button handler can invoke the
 	// task without re-parsing the event text.
 	pendingDangerous sync.Map
+
+	// Track in-flight Slack-reference confirmation dialogs (permalink
+	// expansion). Keyed by progressKey; value is *pendingSlackRefState.
+	// Only one dialog per thread at a time — additional refs queue
+	// naturally because the caller doesn't advance until this resolves.
+	pendingSlackRefs sync.Map
+
+	// userNameCache memoizes Slack user_id → display name lookups for
+	// the session. Slack's team/users.info is rate-limited and we call
+	// it once per distinct author when formatting referenced threads.
+	// sync.Map keyed by user id, value is string.
+	userNameCache sync.Map
 
 	// Track the per-thread rolling progress message used to surface docker
 	// build + SSH agent lines while clod boots. key (progressKey) ->
@@ -140,6 +153,29 @@ type pendingDangerous struct {
 	ThreadTS     string
 	MentionTS    string // TS of the user's @-mention (anchor for reactions)
 	RequesterID  string // user who typed `@bot !:` (only they can confirm)
+}
+
+// pendingSlackRefState tracks a posted Slack-permalink-expansion dialog
+// while we wait for the user's inclusion choice. PromptBase is the
+// user's input with ref URLs left as-is; once the choice is resolved
+// the button handler rebuilds the final prompt (inline-always refs +
+// whatever the user chose for the confirm-needed ones) and invokes
+// OnFinalize. OnFinalize is the deferred launch/SendInput — wrapping
+// the caller's forward path in a closure lets this flow work
+// identically for new tasks, running-task mentions, thread replies,
+// and session resumes.
+type pendingSlackRefState struct {
+	ChannelID   string
+	ThreadTS    string
+	TaskPath    string
+	MessageTS   string // TS of the dialog message (updated on click)
+	RequesterID string // only they can Proceed
+	PromptBase  string // original user input (URLs left in place)
+	InlineRefs  []*SlackRefResult
+	ConfirmRefs []*SlackRefResult
+	HasOverCap  bool
+	OnFinalize  func(finalPrompt string)
+	OnCancel    func() // invoked on the Cancel button so callers can clean up
 }
 
 const (
@@ -338,9 +374,24 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 			input, false, logger,
 		)
 		if input != "" {
-			logger.Debug().Str("input", input).Msg("sending input to running task")
-			if err := task.SendInput(input); err != nil {
-				logger.Error().Err(err).Msg("failed to send input to task")
+			send := func(finalInput string) {
+				logger.Debug().Str("input", finalInput).Msg("sending input to running task")
+				if err := task.SendInput(finalInput); err != nil {
+					logger.Error().Err(err).Msg("failed to send input to task")
+				}
+			}
+			cancel := func() {
+				if _, err := h.bot.PostMessage(ev.Channel,
+					":x: Message not forwarded — referenced content couldn't be confirmed.",
+					threadTS); err != nil {
+					logger.Debug().Err(err).Msg("failed to post slackref-cancel notice")
+				}
+			}
+			finalInput, proceed := h.resolveAndRouteRefs(
+				ev.Channel, threadTS, task.taskPath, input, ev.User, send, cancel, logger,
+			)
+			if proceed {
+				send(finalInput)
 			}
 		}
 		return
@@ -446,11 +497,26 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 			ev.Channel, threadTS, ev.TimeStamp, task.taskPath,
 			ev.Text, true, logger,
 		)
-		logger.Debug().Str("input", input).Msg("sending thread reply to running task")
 		// Clear output message consolidation since user sent a message.
 		h.lastOutputMsg.Delete(key(ev.Channel, threadTS))
-		if err := task.SendInput(input); err != nil {
-			logger.Error().Err(err).Msg("failed to send input to task")
+		send := func(finalInput string) {
+			logger.Debug().Str("input", finalInput).Msg("sending thread reply to running task")
+			if err := task.SendInput(finalInput); err != nil {
+				logger.Error().Err(err).Msg("failed to send input to task")
+			}
+		}
+		cancel := func() {
+			if _, err := h.bot.PostMessage(ev.Channel,
+				":x: Message not forwarded — referenced content couldn't be confirmed.",
+				threadTS); err != nil {
+				logger.Debug().Err(err).Msg("failed to post slackref-cancel notice")
+			}
+		}
+		finalInput, proceed := h.resolveAndRouteRefs(
+			ev.Channel, threadTS, task.taskPath, input, ev.User, send, cancel, logger,
+		)
+		if proceed {
+			send(finalInput)
 		}
 		return
 	}
@@ -497,18 +563,32 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		logger.Error().Err(err).Msg("failed to post resume task message")
 	}
 
-	// Run clod with existing session
-	h.runClod(
-		ctx,
-		ev.Channel,
-		ev.User,
-		session.TaskPath,
-		session.TaskName,
-		prompt,
-		session.SessionID,
-		threadTS,
-		logger,
+	launch := func(finalPrompt string) {
+		h.runClod(
+			ctx,
+			ev.Channel,
+			ev.User,
+			session.TaskPath,
+			session.TaskName,
+			finalPrompt,
+			session.SessionID,
+			threadTS,
+			logger,
+		)
+	}
+	cancelResume := func() {
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":x: Resume cancelled — referenced content couldn't be confirmed.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post slackref-cancel notice")
+		}
+	}
+	finalPrompt, proceed := h.resolveAndRouteRefs(
+		ev.Channel, threadTS, session.TaskPath, prompt, ev.User, launch, cancelResume, logger,
 	)
+	if proceed {
+		launch(finalPrompt)
+	}
 }
 
 // HandleReactionAdded is intentionally a no-op. Thread-level state
@@ -587,6 +667,260 @@ func (h *Handler) augmentInputWithAttachments(
 		input += fmt.Sprintf("- %s\n", p)
 	}
 	return input
+}
+
+// userCacheMap pulls the cached {user_id → display name} map out of the
+// concurrent sync.Map. Safe to call from any goroutine; returns a fresh
+// local map each time.
+func (h *Handler) userCacheMap() map[string]string {
+	out := make(map[string]string)
+	h.userNameCache.Range(func(k, v any) bool {
+		ks, _ := k.(string)
+		vs, _ := v.(string)
+		out[ks] = vs
+		return true
+	})
+	return out
+}
+
+// mergeUserCache writes any newly-resolved names back into the shared
+// cache so subsequent formats hit it.
+func (h *Handler) mergeUserCache(cache map[string]string) {
+	for k, v := range cache {
+		h.userNameCache.Store(k, v)
+	}
+}
+
+// resolveAndRouteRefs finds any Slack permalinks in `input`, resolves
+// each one, splits them into "auto-include inline" (public + under cap)
+// and "needs confirmation" (private or over cap), and either (a)
+// returns the finalized prompt synchronously when no confirmation is
+// needed, or (b) posts a dialog and returns empty + proceed=false. On
+// (b) the caller must NOT proceed; `onFinalize` will be invoked from
+// the button handler once the user chooses. `onCancel` fires if the
+// user clicks Cancel.
+//
+// taskPath is used to materialize conversation assets under the task
+// directory. requesterID is the user who originated the mention — only
+// they can click the confirmation buttons.
+//
+// Error cases are surfaced as thread posts ("bot isn't in #foo — ...")
+// and the offending ref is dropped from the output. The caller still
+// proceeds with whatever refs resolved successfully.
+func (h *Handler) resolveAndRouteRefs(
+	channelID, threadTS, taskPath, input, requesterID string,
+	onFinalize func(finalPrompt string),
+	onCancel func(),
+	logger zerolog.Logger,
+) (finalized string, proceed bool) {
+	refs := FindSlackRefs(input)
+	if len(refs) == 0 {
+		return input, true
+	}
+
+	cache := h.userCacheMap()
+	var inline []*SlackRefResult
+	var confirm []*SlackRefResult
+	hasOverCap := false
+	for _, ref := range refs {
+		res := resolveSlackRef(h.bot.client, ref, logger)
+		if res.Err != nil {
+			h.postRefError(channelID, threadTS, res, logger)
+			continue
+		}
+		if res.NeedsConfirm() {
+			if res.OverCap() {
+				hasOverCap = true
+			}
+			confirm = append(confirm, res)
+		} else {
+			inline = append(inline, res)
+		}
+	}
+	h.mergeUserCache(cache)
+
+	// Fast path: nothing needs confirmation — splice inline refs and
+	// return immediately.
+	if len(confirm) == 0 {
+		return buildPromptWithRefs(input, inline, nil, h.userCacheMap(), h.bot.client, logger), true
+	}
+
+	// Post dialog and park the state. OnFinalize fires from the button
+	// handler once the user resolves.
+	progressKey := key(channelID, threadTS)
+	if _, already := h.pendingSlackRefs.Load(progressKey); already {
+		// Shouldn't happen in practice — the caller only advances after
+		// resolution — but stay safe rather than stacking dialogs.
+		if _, err := h.bot.PostMessage(channelID,
+			":warning: A reference confirmation is already pending on this thread.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post duplicate-slackref warning")
+		}
+		return "", false
+	}
+
+	messageTS, err := h.postSlackRefDialog(channelID, threadTS, progressKey, confirm, hasOverCap, logger)
+	if err != nil {
+		// Posting the dialog failed — best effort: fall through with just
+		// the inline refs and skip the confirm-needed ones.
+		logger.Error().Err(err).Msg("failed to post slackref confirmation dialog")
+		return buildPromptWithRefs(input, inline, nil, h.userCacheMap(), h.bot.client, logger), true
+	}
+	h.pendingSlackRefs.Store(progressKey, &pendingSlackRefState{
+		ChannelID:   channelID,
+		ThreadTS:    threadTS,
+		TaskPath:    taskPath,
+		MessageTS:   messageTS,
+		RequesterID: requesterID,
+		PromptBase:  input,
+		InlineRefs:  inline,
+		ConfirmRefs: confirm,
+		HasOverCap:  hasOverCap,
+		OnFinalize:  onFinalize,
+		OnCancel:    onCancel,
+	})
+	return "", false
+}
+
+// postRefError writes a short thread note explaining why a referenced
+// message couldn't be read, so the user knows to invite the bot / fix
+// the permalink rather than wondering why the agent didn't use it.
+func (h *Handler) postRefError(channelID, threadTS string, res *SlackRefResult, logger zerolog.Logger) {
+	body := fmt.Sprintf(
+		":warning: Couldn't read the referenced Slack thread (<%s>): %s",
+		res.Ref.Permalink,
+		res.ErrReason,
+	)
+	if _, err := h.bot.PostMessage(channelID, body, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post slackref error notice")
+	}
+}
+
+// postSlackRefDialog builds and posts the confirmation block message
+// for a set of confirm-needed refs. Returns the message TS so the
+// caller can update it when the user clicks a button.
+func (h *Handler) postSlackRefDialog(
+	channelID, threadTS, progressKey string,
+	confirm []*SlackRefResult,
+	hasOverCap bool,
+	logger zerolog.Logger,
+) (string, error) {
+	actionValue := fmt.Sprintf(`{"k":%q}`, progressKey)
+
+	var lines []string
+	for _, r := range confirm {
+		badges := []string{}
+		if r.IsPrivate {
+			if r.IsDM {
+				badges = append(badges, ":lock: DM")
+			} else {
+				badges = append(badges, ":lock: private")
+			}
+		}
+		if r.OverCap() {
+			badges = append(badges, fmt.Sprintf(":bookmark_tabs: %d msgs / %d chars (over cap)", r.MsgCount, r.CharCount))
+		} else {
+			badges = append(badges, fmt.Sprintf("%d msgs / %d chars", r.MsgCount, r.CharCount))
+		}
+		tag := "#" + r.ChannelName
+		if r.IsDM {
+			tag = r.ChannelName
+		}
+		lines = append(lines, fmt.Sprintf("• %s — %s — <%s|permalink>", strings.Join(badges, " · "), tag, r.Ref.Permalink))
+	}
+
+	header := slack.NewSectionBlock(
+		slack.NewTextBlockObject(
+			"mrkdwn",
+			":eyes: *Referenced Slack content needs confirmation*",
+			false, false,
+		),
+		nil, nil,
+	)
+	var noteText string
+	switch {
+	case hasOverCap:
+		noteText = "One or more referenced threads are too large to inline into the prompt. Save them as conversation assets (a directory under the task dir) so the agent can read the content on disk, or skip them."
+	default:
+		noteText = "One or more referenced threads come from a private conversation. Confirm you want their contents included in the agent's context."
+	}
+	body := slack.NewSectionBlock(
+		slack.NewTextBlockObject(
+			"mrkdwn",
+			noteText+"\n\n"+strings.Join(lines, "\n"),
+			false, false,
+		),
+		nil, nil,
+	)
+
+	var buttons []slack.BlockElement
+	if !hasOverCap {
+		inlineBtn := slack.NewButtonBlockElement(
+			"slackref_inline",
+			actionValue,
+			slack.NewTextBlockObject("plain_text", "Include inline", false, false),
+		)
+		inlineBtn.Style = "primary"
+		buttons = append(buttons, inlineBtn)
+	}
+	assetBtn := slack.NewButtonBlockElement(
+		"slackref_asset",
+		actionValue,
+		slack.NewTextBlockObject("plain_text", "Save as asset", false, false),
+	)
+	if hasOverCap {
+		assetBtn.Style = "primary"
+	}
+	buttons = append(buttons, assetBtn)
+
+	skipBtn := slack.NewButtonBlockElement(
+		"slackref_skip",
+		actionValue,
+		slack.NewTextBlockObject("plain_text", "Skip references", false, false),
+	)
+	cancelBtn := slack.NewButtonBlockElement(
+		"slackref_cancel",
+		actionValue,
+		slack.NewTextBlockObject("plain_text", "Cancel", false, false),
+	)
+	cancelBtn.Style = "danger"
+	buttons = append(buttons, skipBtn, cancelBtn)
+
+	actions := slack.NewActionBlock("slackref_actions", buttons...)
+
+	ts, err := h.bot.PostMessageBlocks(channelID, []slack.Block{header, body, actions}, threadTS)
+	if err != nil {
+		return "", oops.Trace(err)
+	}
+	return ts, nil
+}
+
+// buildPromptWithRefs splices resolved refs into the user's input. For
+// refs with AssetPath set, the splice is a short pointer at the
+// on-disk path rather than the inline content.
+func buildPromptWithRefs(
+	input string,
+	inline []*SlackRefResult,
+	assetNotes []string,
+	userCache map[string]string,
+	client *slack.Client,
+	logger zerolog.Logger,
+) string {
+	if len(inline) == 0 && len(assetNotes) == 0 {
+		return input
+	}
+	var b strings.Builder
+	for _, r := range inline {
+		b.WriteString(FormatRefInline(r, userCache, client, logger))
+		b.WriteString("\n")
+	}
+	for _, note := range assetNotes {
+		b.WriteString(note)
+		b.WriteString("\n")
+	}
+	b.WriteString("---\n\n")
+	b.WriteString(input)
+	return b.String()
 }
 
 // authorizedInThread reports whether userID can drive the bot in this
@@ -1639,18 +1973,38 @@ func (h *Handler) runNewTask(
 		}
 	}
 
-	// Run clod
-	h.runClod(
-		ctx,
-		ev.Channel,
-		ev.User,
-		taskPath,
-		taskName,
-		prompt,
-		"",
-		threadTS,
-		logger,
+	// Resolve any Slack permalinks in the prompt. If a confirmation
+	// dialog is needed (private or over-cap refs) the launch is
+	// deferred until the user clicks a button; otherwise we splice
+	// the referenced content and start immediately.
+	launch := func(finalPrompt string) {
+		h.runClod(
+			ctx,
+			ev.Channel,
+			ev.User,
+			taskPath,
+			taskName,
+			finalPrompt,
+			"",
+			threadTS,
+			logger,
+		)
+	}
+	cancel := func() {
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":x: Task cancelled — referenced content couldn't be confirmed.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post slackref-cancel notice")
+		}
+	}
+	finalPrompt, proceed := h.resolveAndRouteRefs(
+		ev.Channel, threadTS, taskPath, prompt, ev.User, launch, cancel, logger,
 	)
+	if !proceed {
+		// Dialog posted; button handler will take over.
+		return
+	}
+	launch(finalPrompt)
 }
 
 // monitorStartPattern pulls the task id out of Monitor's success text
@@ -2906,7 +3260,11 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "init_cancel"
 	isDangerousFinal := action.ActionID == "dangerous_proceed" ||
 		action.ActionID == "dangerous_cancel"
-	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal {
+	isSlackRefFinal := action.ActionID == "slackref_inline" ||
+		action.ActionID == "slackref_asset" ||
+		action.ActionID == "slackref_skip" ||
+		action.ActionID == "slackref_cancel"
+	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal {
 		logger.Debug().Msg("ignoring non-permission action")
 		return
 	}
@@ -2951,6 +3309,11 @@ func (h *Handler) HandleBlockAction(
 
 	if isDangerousFinal {
 		h.handleDangerousFinal(ctx, callback, action, actionValue, logger)
+		return
+	}
+
+	if isSlackRefFinal {
+		h.handleSlackRefFinal(callback, action, actionValue, logger)
 		return
 	}
 
@@ -3435,6 +3798,123 @@ func (h *Handler) handleDangerousFinal(
 		Bool("claude_direct", true).
 		Logger()
 	h.runNewTask(ctx, synthetic, state.ThreadTS, taskName, base, state.Instructions, logger)
+}
+
+// handleSlackRefFinal resolves a slack-permalink-expansion dialog. The
+// four button variants:
+//
+//   - slackref_inline — splice the confirm-needed refs' text into the
+//     prompt (like auto-inline public refs).
+//   - slackref_asset — save each confirm-needed ref as a conversation
+//     asset under the task dir and splice a pointer into the prompt.
+//   - slackref_skip — drop the confirm-needed refs entirely (leave the
+//     URLs in the prompt as plain text).
+//   - slackref_cancel — cancel the whole turn; calls state.OnCancel.
+//
+// Only the original requester can click Proceed-style buttons; anyone
+// authorized in the thread can Cancel.
+func (h *Handler) handleSlackRefFinal(
+	callback *slack.InteractionCallback,
+	action *slack.BlockAction,
+	actionValue PermissionActionValue,
+	logger zerolog.Logger,
+) {
+	stateVal, ok := h.pendingSlackRefs.LoadAndDelete(actionValue.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no pending slackref dialog found; button is stale")
+		if err := h.bot.UpdateMessage(
+			callback.Channel.ID, callback.Message.Timestamp,
+			":warning: This reference confirmation is no longer active.",
+		); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale slackref message")
+		}
+		return
+	}
+	state := stateVal.(*pendingSlackRefState)
+
+	// Only the requester can take a Proceed-style action; anyone can Cancel.
+	if action.ActionID != "slackref_cancel" && callback.User.ID != state.RequesterID {
+		logger.Warn().
+			Str("clicked_by", callback.User.ID).
+			Str("requester", state.RequesterID).
+			Msg("non-requester tried to resolve slackref dialog")
+		h.pendingSlackRefs.Store(actionValue.ThreadKey, state)
+		return
+	}
+
+	switch action.ActionID {
+	case "slackref_cancel":
+		outcome := fmt.Sprintf(":x: Reference handling cancelled by <@%s>.", callback.User.ID)
+		if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+			logger.Error().Err(err).Msg("failed to update cancelled slackref message")
+		}
+		if state.OnCancel != nil {
+			state.OnCancel()
+		}
+		return
+
+	case "slackref_skip":
+		outcome := fmt.Sprintf(":arrow_right: References skipped by <@%s>.", callback.User.ID)
+		if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+			logger.Debug().Err(err).Msg("failed to update skipped slackref message")
+		}
+		finalPrompt := buildPromptWithRefs(state.PromptBase, state.InlineRefs, nil, h.userCacheMap(), h.bot.client, logger)
+		state.OnFinalize(finalPrompt)
+		return
+
+	case "slackref_inline":
+		// Per the dialog construction, Include-inline is only offered
+		// when nothing is over-cap — merge the confirm refs with the
+		// auto-inline set.
+		allInline := append([]*SlackRefResult{}, state.InlineRefs...)
+		allInline = append(allInline, state.ConfirmRefs...)
+		outcome := fmt.Sprintf(":eyes: References included inline by <@%s>.", callback.User.ID)
+		if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+			logger.Debug().Err(err).Msg("failed to update inline slackref message")
+		}
+		finalPrompt := buildPromptWithRefs(state.PromptBase, allInline, nil, h.userCacheMap(), h.bot.client, logger)
+		state.OnFinalize(finalPrompt)
+		return
+
+	case "slackref_asset":
+		cache := h.userCacheMap()
+		var assetNotes []string
+		for _, r := range state.ConfirmRefs {
+			assetDir, err := SaveConversationAsset(
+				state.TaskPath, r, cache, h.bot.client, logger,
+			)
+			if err != nil {
+				logger.Error().Err(err).Str("permalink", r.Ref.Permalink).Msg("failed to save conversation asset")
+				if _, perr := h.bot.PostMessage(state.ChannelID,
+					fmt.Sprintf(":warning: Couldn't save conversation asset for <%s>: %v", r.Ref.Permalink, err),
+					state.ThreadTS); perr != nil {
+					logger.Debug().Err(perr).Msg("failed to post asset-save error")
+				}
+				continue
+			}
+			relDir, relErr := filepath.Rel(state.TaskPath, assetDir)
+			if relErr != nil {
+				relDir = assetDir
+			}
+			assetNotes = append(assetNotes, fmt.Sprintf(
+				"Referenced Slack conversation saved to `%s` (permalink: %s). Read `%s/thread.md` and any files in `%s/files/` for the full content.",
+				relDir, r.Ref.Permalink, relDir, relDir,
+			))
+			if _, perr := h.bot.PostMessage(state.ChannelID,
+				fmt.Sprintf(":floppy_disk: Saved referenced thread to `%s` (<%s|permalink>).", relDir, r.Ref.Permalink),
+				state.ThreadTS); perr != nil {
+				logger.Debug().Err(perr).Msg("failed to post asset-saved confirmation")
+			}
+		}
+		h.mergeUserCache(cache)
+		outcome := fmt.Sprintf(":floppy_disk: References saved as conversation assets by <@%s>.", callback.User.ID)
+		if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+			logger.Debug().Err(err).Msg("failed to update asset slackref message")
+		}
+		finalPrompt := buildPromptWithRefs(state.PromptBase, state.InlineRefs, assetNotes, h.userCacheMap(), h.bot.client, logger)
+		state.OnFinalize(finalPrompt)
+		return
+	}
 }
 
 // startTaskAfterInit posts the normal "Starting a task" message, anchors the
