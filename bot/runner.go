@@ -530,10 +530,16 @@ func readAllowedTools(taskPath string, logger zerolog.Logger) []string {
 // mode on/off per-thread without spinning up a new Runner. Like --model,
 // this takes effect at process-start only; switches across turns require
 // the next Start() call (typically via resume-after-finish).
+// If useClaudeDirect is true, `claude` is invoked directly on the host
+// instead of going through `clod` (which bind-mounts into a docker
+// container). Per-task state isolation is preserved by redirecting HOME
+// to `<taskPath>/.clod/direct-home`, which symlinks `.claude` and
+// `.claude.json` into the same `.clod/claude/` tree clod uses.
 // Returns a RunningTask that can be used to send input and receive output.
 func (r *Runner) Start(
 	ctx context.Context,
 	taskPath, prompt, sessionID, model, permissionMode string,
+	useClaudeDirect bool,
 ) (*RunningTask, error) {
 	// Create command with timeout context.
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
@@ -623,15 +629,22 @@ func (r *Runner) Start(
 		args = append(args, "--model", model)
 	}
 
+	exe := "clod"
+	if useClaudeDirect {
+		exe = "claude"
+	}
+
 	r.logger.Debug().
 		Str("task_path", taskPath).
 		Str("session_id", sessionID).
 		Str("model", model).
 		Strs("args", args).
-		Msg("starting clod with pty")
+		Str("exe", exe).
+		Bool("claude_direct", useClaudeDirect).
+		Msg("starting runtime with pty")
 
 	//nolint:gosec
-	cmd := exec.CommandContext(runCtx, "clod", args...)
+	cmd := exec.CommandContext(runCtx, exe, args...)
 	cmd.Dir = taskPath
 
 	// Set MCP tool timeout generously so permission prompts waiting on a
@@ -651,6 +664,23 @@ func (r *Runner) Start(
 		"CLOD_CONCURRENT=true",
 		"CLOD_NONINTERACTIVE=true",
 	)
+
+	// In claude-direct mode, isolate per-task state by redirecting HOME
+	// to `<taskPath>/.clod/direct-home/`. The directory is materialized
+	// lazily with symlinks into `.clod/claude/` so claude reads/writes
+	// the same `~/.claude/` + `~/.claude.json` tree clod would have
+	// bind-mounted inside the container. Without this, every task would
+	// share the bot process's real HOME and stomp each other's state.
+	if useClaudeDirect {
+		homeDir, herr := prepareDirectHome(taskPath)
+		if herr != nil {
+			cancel()
+			permFIFO.Close()
+			return nil, oops.Trace(herr)
+		}
+		cmd.Env = append(cmd.Env, "HOME="+homeDir)
+		r.logger.Debug().Str("HOME", homeDir).Msg("claude-direct home redirected")
+	}
 
 	r.logger.Debug().
 		Str("MCP_TOOL_TIMEOUT", mcpToolTimeout).
@@ -1249,6 +1279,47 @@ func (r *Runner) Start(
 	}()
 
 	return task, nil
+}
+
+// prepareDirectHome materializes `<taskPath>/.clod/direct-home/` with
+// symlinks into `<taskPath>/.clod/claude/` so claude sees its normal
+// `~/.claude/` + `~/.claude.json` layout. Idempotent — safe to call on
+// every Start(). Returns the absolute HOME path to set in the child's
+// environment.
+func prepareDirectHome(taskPath string) (string, error) {
+	absTask, err := filepath.Abs(taskPath)
+	if err != nil {
+		return "", oops.Trace(err)
+	}
+	homeDir := filepath.Join(absTask, ".clod", "direct-home")
+	if err := os.MkdirAll(homeDir, 0700); err != nil {
+		return "", oops.Trace(err)
+	}
+
+	claudeDir := filepath.Join(absTask, ".clod", "claude")
+	if err := os.MkdirAll(claudeDir, 0700); err != nil {
+		return "", oops.Trace(err)
+	}
+
+	targets := []struct {
+		link, target string
+	}{
+		{filepath.Join(homeDir, ".claude"), claudeDir},
+		{filepath.Join(homeDir, ".claude.json"), filepath.Join(claudeDir, "claude.json")},
+	}
+	for _, t := range targets {
+		// If the link already points at the right place, leave it alone.
+		if existing, err := os.Readlink(t.link); err == nil && existing == t.target {
+			continue
+		}
+		// Remove whatever is there (stale symlink or wrong target) before
+		// recreating. os.Remove tolerates a missing file.
+		_ = os.Remove(t.link)
+		if err := os.Symlink(t.target, t.link); err != nil {
+			return "", oops.Trace(err)
+		}
+	}
+	return homeDir, nil
 }
 
 // Kill terminates a running process by its PID.

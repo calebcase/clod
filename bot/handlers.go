@@ -17,6 +17,22 @@ import (
 	"github.com/slack-go/slack/slackevents"
 )
 
+// startMsgTemplate is the ":rocket: Starting a task" banner shown at the
+// top of every new task thread. Settings help is a fixed-width table so
+// fields / values / notes line up. Emojis in the "notes" column may
+// render slightly wider than a monospace glyph on some clients — that's
+// fine because nothing to their right depends on alignment.
+const startMsgTemplate = ":rocket: Starting a `%s` task...\n\n" +
+	"_Settings are controlled with `@bot set FIELD=VALUE`:_\n" +
+	"```\n" +
+	"field      | values                             | notes\n" +
+	"-----------+------------------------------------+--------------------------------\n" +
+	"verbosity  | +/- or 0/1/-1 (or 💬 / 🙈)         | 🙈 silent · summary · 💬 full\n" +
+	"model      | opus|sonnet|haiku (+/- cycles)     | 🎼 · 📜 · 🌸\n" +
+	"plan       | on|off (or +/-)                    | 💭 on by default\n" +
+	"filesync   | on|off                             | sync project dir (non-recursive)\n" +
+	"```"
+
 // PendingPermission tracks a permission request waiting for user response.
 type PendingPermission struct {
 	MessageTS          string // Timestamp of the permission prompt message (for updating)
@@ -51,6 +67,12 @@ type Handler struct {
 	// Track in-flight init prompts (setup dialogs for tasks whose
 	// directory or .clod/ is missing). key (progressKey) -> *pendingInit
 	pendingInits sync.Map
+
+	// Track in-flight `@bot !:` confirmation dialogs. Keyed by
+	// progressKey; value is *pendingDangerous. The pending state holds
+	// the original instructions so the button handler can invoke the
+	// task without re-parsing the event text.
+	pendingDangerous sync.Map
 
 	// Track the per-thread rolling progress message used to surface docker
 	// build + SSH agent lines while clod boots. key (progressKey) ->
@@ -104,6 +126,20 @@ type pendingAmbiguous struct {
 	ChannelID string
 	ThreadTS  string
 	UserID    string
+}
+
+// pendingDangerous tracks a posted `@bot !:` confirmation dialog while
+// we wait for the user to click Proceed or Cancel. Instructions are
+// stored server-side so the button value stays small (Slack caps
+// action values at 2000 chars); on Proceed the button handler runs
+// the task using this state.
+type pendingDangerous struct {
+	Instructions string
+	MessageTS    string
+	ChannelID    string
+	ThreadTS     string
+	MentionTS    string // TS of the user's @-mention (anchor for reactions)
+	RequesterID  string // user who typed `@bot !:` (only they can confirm)
 }
 
 const (
@@ -204,6 +240,16 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 		if _, err := h.bot.PostMessage(ev.Channel, h.bot.auth.RejectMessage(), threadTS); err != nil {
 			logger.Error().Err(err).Msg("failed to post authorization rejection message")
 		}
+		return
+	}
+
+	// `@bot !: <instructions>` — run claude DIRECTLY on the host
+	// (outside the clod/docker sandbox) in the agents base directory.
+	// Checked before `*:` so the two syntaxes don't fight; the `!:`
+	// form posts a confirmation dialog first because the user is
+	// opting out of container isolation.
+	if instructions := ParseDangerousRootMention(ev.Text); instructions != "" {
+		h.handleDangerousRootTask(ev, threadTS, instructions, logger)
 		return
 	}
 
@@ -761,9 +807,11 @@ func (h *Handler) handleSetCommand(
 		h.applyModelSet(ev.Channel, threadTS, session, cmd.Value, logger)
 	case "plan", "plan_mode", "p":
 		h.applyPlanSet(ev.Channel, threadTS, session, cmd.Value, logger)
+	case "filesync", "sync", "files":
+		h.applyFileSyncSet(ev.Channel, threadTS, session, cmd.Value, logger)
 	default:
 		if _, err := h.bot.PostMessage(ev.Channel,
-			fmt.Sprintf(":warning: Unknown setting `%s`. Valid: `verbosity`, `model`, `plan`.", cmd.Field),
+			fmt.Sprintf(":warning: Unknown setting `%s`. Valid: `verbosity`, `model`, `plan`, `filesync`.", cmd.Field),
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post unknown-field warning")
 		}
@@ -932,6 +980,51 @@ func cycleModel(cycle []string, current string, step int) string {
 		next += len(cycle)
 	}
 	return cycle[next]
+}
+
+// applyFileSyncSet toggles the thread's file-sync preference. File sync
+// is the watcher that uploads files from the task's top-level directory
+// to Slack as they get created/modified; default is ON. Takes effect
+// within ~2s (the watcher's poll interval).
+func (h *Handler) applyFileSyncSet(channelID, threadTS string, session *SessionMapping, value string, logger zerolog.Logger) {
+	var enable bool
+	switch normalizeEmojiToken(value) {
+	case "on", "+", "true", "yes", "enabled":
+		enable = true
+	case "off", "-", "false", "no", "disabled":
+		enable = false
+	default:
+		if _, err := h.bot.PostMessage(channelID,
+			fmt.Sprintf(":warning: Unknown filesync value `%s`. Use `on`/`off` or `+`/`-`.", value),
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post filesync-value warning")
+		}
+		return
+	}
+	disabled := !enable
+	if session.FileSyncDisabled == disabled {
+		if _, err := h.bot.PostMessage(channelID,
+			fmt.Sprintf(":information_source: File sync is already %s.",
+				map[bool]string{true: "on", false: "off"}[enable]),
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post filesync already-set notice")
+		}
+		return
+	}
+	h.bot.sessions.SetFileSyncDisabled(channelID, threadTS, disabled)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("save after filesync set")
+	}
+
+	var msg string
+	if enable {
+		msg = ":outbox_tray: *File sync ON* — files created or modified in the project directory will be uploaded to this thread."
+	} else {
+		msg = ":mute: *File sync OFF* — new or modified files in the project directory will NOT be uploaded. The watcher still tracks their state so re-enabling won't flood the thread."
+	}
+	if _, err := h.bot.PostMessage(channelID, msg, threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post filesync confirmation")
+	}
 }
 
 // applyPlanSet accepts on/off/+/-/emoji and toggles the thread's plan mode.
@@ -1317,6 +1410,105 @@ func (h *Handler) handleRootTask(
 	}
 }
 
+// handleDangerousRootTask posts a confirmation dialog for `@bot !:` and
+// stashes the pending state. Actual task launch happens in
+// handleDangerousFinal after the user clicks Proceed. Cancel simply
+// updates the dialog and drops the state.
+//
+// The `!:` form differs from `*:` only in that claude runs on the HOST
+// rather than through clod (which would run it inside a docker
+// container). Everything else — permissions, reactions, settings,
+// file sync, MCP bridge — stays identical. The warning exists because
+// losing container isolation means the agent can touch anything the
+// bot process can touch.
+func (h *Handler) handleDangerousRootTask(
+	ev *slackevents.AppMentionEvent,
+	threadTS string,
+	instructions string,
+	logger zerolog.Logger,
+) {
+	base := h.bot.tasks.BasePath()
+	if base == "" {
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":warning: Can't run a host-direct task — `CLOD_BOT_AGENTS_PATH` isn't set.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post dangerous-root error")
+		}
+		return
+	}
+
+	progressKey := key(ev.Channel, threadTS)
+	if _, already := h.pendingDangerous.Load(progressKey); already {
+		if _, err := h.bot.PostMessage(ev.Channel,
+			":warning: A confirmation dialog for this thread is already open — click Proceed or Cancel on it first.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post duplicate-dangerous warning")
+		}
+		return
+	}
+
+	allowValue := fmt.Sprintf(`{"k":%q,"b":"allow"}`, progressKey)
+	denyValue := fmt.Sprintf(`{"k":%q,"b":"deny"}`, progressKey)
+
+	header := slack.NewSectionBlock(
+		slack.NewTextBlockObject(
+			"mrkdwn",
+			":rotating_light: *Run claude outside the container?*",
+			false, false,
+		),
+		nil, nil,
+	)
+	// Truncate the echoed instructions so a runaway paste can't push the
+	// section text past Slack's 3000-char block cap.
+	preview := instructions
+	const maxPreview = 1500
+	if len(preview) > maxPreview {
+		preview = preview[:maxPreview] + "…"
+	}
+	body := slack.NewSectionBlock(
+		slack.NewTextBlockObject(
+			"mrkdwn",
+			fmt.Sprintf(
+				"The `!:` form runs `claude` directly on the host in `%s`, "+
+					"*without* the clod docker sandbox. The agent will have "+
+					"the same filesystem / network / credential access the "+
+					"bot process itself has.\n\nInstructions:\n>%s",
+				base, strings.ReplaceAll(preview, "\n", "\n>"),
+			),
+			false, false,
+		),
+		nil, nil,
+	)
+	proceedBtn := slack.NewButtonBlockElement(
+		"dangerous_proceed",
+		allowValue,
+		slack.NewTextBlockObject("plain_text", "Proceed (no container)", false, false),
+	)
+	proceedBtn.Style = "danger"
+	cancelBtn := slack.NewButtonBlockElement(
+		"dangerous_cancel",
+		denyValue,
+		slack.NewTextBlockObject("plain_text", "Cancel", false, false),
+	)
+	actions := slack.NewActionBlock("dangerous_actions", proceedBtn, cancelBtn)
+
+	msgTS, err := h.bot.PostMessageBlocks(ev.Channel, []slack.Block{header, body, actions}, threadTS)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to post dangerous confirmation dialog")
+		return
+	}
+
+	h.pendingDangerous.Store(progressKey, &pendingDangerous{
+		Instructions: instructions,
+		MessageTS:    msgTS,
+		ChannelID:    ev.Channel,
+		ThreadTS:     threadTS,
+		MentionTS:    ev.TimeStamp,
+		RequesterID:  ev.User,
+	})
+	logger.Info().Str("instructions", instructions).Msg("posted !: confirmation dialog")
+}
+
 // runNewTask performs the actual task start once taskName + taskPath are
 // resolved: it downloads any attached files into the task dir, gathers
 // prior thread context, posts the starting-a-task status, anchors the
@@ -1395,12 +1587,7 @@ func (h *Handler) runNewTask(
 	}
 
 	// Post initial status with verbosity + model info
-	startMsg := fmt.Sprintf(":rocket: Starting a `%s` task...\n\n"+
-		"_Settings are controlled with `@bot set FIELD=VALUE`:_\n"+
-		"• `verbosity=+`/`-` or `0`/`1`/`-1` (or `:speech_balloon:` / `:see_no_evil:`) — 🙈 silent · summary · 💬 full\n"+
-		"• `model=opus|sonnet|haiku` (or `+`/`-` to cycle, or the emoji) — 🎼 · 📜 · 🌸\n"+
-		"• `plan=on|off` (or `+`/`-`) — 💭 plan mode is on by default",
-		taskName)
+	startMsg := fmt.Sprintf(startMsgTemplate, taskName)
 	if _, err := h.bot.PostMessage(
 		ev.Channel,
 		startMsg,
@@ -1851,8 +2038,12 @@ func (h *Handler) runClod(
 	// Runner's bot-wide default inside Start().
 	permissionMode := h.bot.sessions.GetPermissionMode(channelID, threadTS)
 
+	// Sticky `@bot !:` flag — keeps resumes and continuations in the
+	// same execution mode the user originally confirmed.
+	useClaudeDirect := h.bot.sessions.IsUseClaudeDirect(channelID, threadTS)
+
 	// Start the task
-	task, err := h.bot.runner.Start(ctx, taskPath, prompt, sessionID, model, permissionMode)
+	task, err := h.bot.runner.Start(ctx, taskPath, prompt, sessionID, model, permissionMode, useClaudeDirect)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to start clod")
 		if _, postErr := h.bot.PostMessage(channelID, fmt.Sprintf(":x: Failed to start task: %v", err), threadTS); postErr != nil {
@@ -1877,7 +2068,13 @@ func (h *Handler) runClod(
 
 	// Start watching for output files to upload to Slack.
 	outputWatchDone := make(chan struct{})
-	go h.bot.files.WatchOutputs(taskPath, channelID, threadTS, outputWatchDone)
+	// shouldSync is polled every ~2s inside the watcher; honoring the
+	// thread preference live means `@bot set filesync=off/on` takes
+	// effect immediately without requiring a task restart.
+	shouldSync := func() bool {
+		return !h.bot.sessions.IsFileSyncDisabled(channelID, threadTS)
+	}
+	go h.bot.files.WatchOutputs(taskPath, channelID, threadTS, outputWatchDone, shouldSync)
 	defer close(outputWatchDone)
 
 	// Output batching
@@ -2707,7 +2904,9 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "init_packages"
 	isInitFinal := action.ActionID == "init_create" ||
 		action.ActionID == "init_cancel"
-	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal {
+	isDangerousFinal := action.ActionID == "dangerous_proceed" ||
+		action.ActionID == "dangerous_cancel"
+	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal {
 		logger.Debug().Msg("ignoring non-permission action")
 		return
 	}
@@ -2747,6 +2946,11 @@ func (h *Handler) HandleBlockAction(
 
 	if isInitFinal {
 		h.handleInitFinal(ctx, callback, action, actionValue, logger)
+		return
+	}
+
+	if isDangerousFinal {
+		h.handleDangerousFinal(ctx, callback, action, actionValue, logger)
 		return
 	}
 
@@ -3141,17 +3345,104 @@ func (h *Handler) handleInitFinal(
 	h.startTaskAfterInit(ctx, state, logger)
 }
 
+// handleDangerousFinal resolves a `@bot !:` confirmation dialog. On
+// Proceed it marks the session as "run claude directly", rewrites the
+// prompt message, and kicks off the task through runNewTask — the same
+// path `@bot *:` uses, just with UseClaudeDirect sticky. On Cancel it
+// updates the message and drops the pending state.
+func (h *Handler) handleDangerousFinal(
+	ctx context.Context,
+	callback *slack.InteractionCallback,
+	action *slack.BlockAction,
+	actionValue PermissionActionValue,
+	logger zerolog.Logger,
+) {
+	stateVal, ok := h.pendingDangerous.LoadAndDelete(actionValue.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no pending dangerous prompt found; button is stale")
+		if err := h.bot.UpdateMessage(
+			callback.Channel.ID, callback.Message.Timestamp,
+			":warning: This confirmation is no longer active.",
+		); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale dangerous message")
+		}
+		return
+	}
+	state := stateVal.(*pendingDangerous)
+
+	// Only the user who asked for `!:` can confirm — a different person
+	// clicking Proceed shouldn't authorize a sandbox bypass on someone
+	// else's behalf. Anyone can Cancel (including the requester
+	// themselves).
+	if action.ActionID == "dangerous_proceed" && callback.User.ID != state.RequesterID {
+		logger.Warn().
+			Str("clicked_by", callback.User.ID).
+			Str("requester", state.RequesterID).
+			Msg("non-requester tried to proceed on dangerous prompt")
+		// Put the state back so the requester can still confirm.
+		h.pendingDangerous.Store(actionValue.ThreadKey, state)
+		return
+	}
+
+	if action.ActionID == "dangerous_cancel" {
+		outcome := fmt.Sprintf(":x: Host-direct run cancelled by <@%s>.", callback.User.ID)
+		if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+			logger.Error().Err(err).Msg("failed to update cancelled dangerous message")
+		}
+		return
+	}
+
+	// Proceed. Update the prompt to reflect the decision, mark the
+	// session as claude-direct, then run through the normal root-task
+	// path.
+	outcome := fmt.Sprintf(
+		":rotating_light: Host-direct run approved by <@%s>. Running claude without the container sandbox.",
+		callback.User.ID,
+	)
+	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+		logger.Error().Err(err).Msg("failed to update dangerous message after proceed")
+	}
+
+	base := h.bot.tasks.BasePath()
+	if base == "" {
+		if _, err := h.bot.PostMessage(state.ChannelID,
+			":warning: Can't run a host-direct task — `CLOD_BOT_AGENTS_PATH` isn't set.",
+			state.ThreadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post dangerous-final base-missing error")
+		}
+		return
+	}
+	taskName := filepath.Base(base)
+
+	h.bot.sessions.SetUseClaudeDirect(state.ChannelID, state.ThreadTS, true)
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("failed to persist UseClaudeDirect flag")
+	}
+
+	// Synthesize an AppMentionEvent so we can reuse runNewTask verbatim.
+	// Only the fields runNewTask reads are populated (Channel, TimeStamp,
+	// User); ThreadTimeStamp is set to the real threadTS so any stray
+	// read is consistent.
+	synthetic := &slackevents.AppMentionEvent{
+		Channel:         state.ChannelID,
+		User:            state.RequesterID,
+		TimeStamp:       state.MentionTS,
+		ThreadTimeStamp: state.ThreadTS,
+	}
+	logger = logger.With().
+		Str("task", taskName).
+		Str("task_path", base).
+		Bool("claude_direct", true).
+		Logger()
+	h.runNewTask(ctx, synthetic, state.ThreadTS, taskName, base, state.Instructions, logger)
+}
+
 // startTaskAfterInit posts the normal "Starting a task" message, anchors the
 // model reaction on the user's mention, and runs clod with the instructions
 // the user originally sent. Mirrors the tail of handleNewTask (post-registry
 // lookup).
 func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger zerolog.Logger) {
-	startMsg := fmt.Sprintf(":rocket: Starting a `%s` task...\n\n"+
-		"_Settings are controlled with `@bot set FIELD=VALUE`:_\n"+
-		"• `verbosity=+`/`-` or `0`/`1`/`-1` (or `:speech_balloon:` / `:see_no_evil:`) — 🙈 silent · summary · 💬 full\n"+
-		"• `model=opus|sonnet|haiku` (or `+`/`-` to cycle, or the emoji) — 🎼 · 📜 · 🌸\n"+
-		"• `plan=on|off` (or `+`/`-`) — 💭 plan mode is on by default",
-		p.TaskName)
+	startMsg := fmt.Sprintf(startMsgTemplate, p.TaskName)
 	if _, err := h.bot.PostMessage(p.ChannelID, startMsg, p.ThreadTS); err != nil {
 		logger.Error().Err(err).Msg("failed to post task start message after init")
 	}
