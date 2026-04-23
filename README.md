@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] in a modestly more secure way.
 
-**Version 0.22.0**
+**Version 0.23.0**
 
 ## Features
 

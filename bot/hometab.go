@@ -30,13 +30,22 @@ func buildHomeTabView(
 
 	var blocks []slack.Block
 
+	// Header + refresh button in a single row. Action is
+	// `home_refresh`; the value field is unused (handler reads the
+	// caller's user id straight from the callback).
+	refreshBtn := slack.NewButtonBlockElement(
+		"home_refresh",
+		"refresh",
+		slack.NewTextBlockObject("plain_text", "Refresh", false, false),
+	)
 	blocks = append(blocks, slack.NewSectionBlock(
 		slack.NewTextBlockObject(
 			"mrkdwn",
 			fmt.Sprintf(":wave: *Clod usage* — hi <@%s>", userID),
 			false, false,
 		),
-		nil, nil,
+		nil,
+		slack.NewAccessory(refreshBtn),
 	))
 
 	// Personal section.
