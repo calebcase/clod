@@ -500,9 +500,32 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		Bool("dm", isDM).
 		Logger()
 
-	// Check if message is @mentioning someone (let app_mention handle those)
+	// Check if message is @mentioning someone.
+	//
+	// In channels, Slack emits a separate `app_mention` event for
+	// bot mentions — we drop the duplicate `message.channels` /
+	// `message.groups` copy here and let HandleAppMention process
+	// it. In DMs, Slack does NOT emit `app_mention` (every DM
+	// message is implicitly "to the bot"), so dropping the mention
+	// here would silently ignore commands like `<@bot> close` in a
+	// thread reply. Synthesize the AppMentionEvent ourselves and
+	// route through HandleAppMention instead.
 	if matches := otherMentionPattern.FindStringSubmatch(ev.Text); matches != nil {
 		mentionedUser := matches[1]
+		if isDM {
+			logger.Debug().
+				Str("mentioned_user", mentionedUser).
+				Msg("DM message has leading mention; dispatching via HandleAppMention")
+			synthetic := &slackevents.AppMentionEvent{
+				Channel:         ev.Channel,
+				User:            ev.User,
+				TimeStamp:       ev.TimeStamp,
+				ThreadTimeStamp: threadTS,
+				Text:            ev.Text,
+			}
+			h.HandleAppMention(ctx, synthetic)
+			return
+		}
 		logger.Debug().
 			Str("mentioned_user", mentionedUser).
 			Msg("message mentions a user, ignoring (app_mention will handle if it's the bot)")
