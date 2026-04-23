@@ -1804,6 +1804,7 @@ func (h *Handler) dispatchDMAsMention(
 	}
 
 	latest := h.latestChannelSession(ev.Channel)
+	shortcut := hasStartShortcut(text)
 
 	// Construct the mention text. When the user used an explicit
 	// shortcut we route it verbatim so `*:` etc. still work; when
@@ -1812,15 +1813,19 @@ func (h *Handler) dispatchDMAsMention(
 	// text goes through verbatim so it's treated as a continuation
 	// by HandleAppMention's running-task / saved-session branches.
 	mentionText := text
-	if latest == nil && !hasStartShortcut(text) {
+	if latest == nil && !shortcut {
 		mentionText = ":: " + text
 	}
 
-	// Target the prior session's thread when one exists so
-	// continuations land on that session's `(channel, threadTS)`
-	// key. Otherwise root the task at this message's TS.
+	// Thread routing. Continuations land on the prior session's
+	// thread so free-form text and commands like `@bot close`
+	// target that session. Start shortcuts (`*:`, `!:`, `::`)
+	// always root a fresh thread at the user's current message —
+	// grafting a new root/host-direct/auto-named task onto the old
+	// session's anchor would pull its (often long) thread context
+	// into the new task and scope reactions to the wrong message.
 	threadTS := ev.TimeStamp
-	if latest != nil {
+	if latest != nil && !shortcut {
 		threadTS = latest.ThreadTS
 	}
 
