@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/calebcase/oops"
@@ -27,6 +28,15 @@ type Bot struct {
 	files         *FileHandler
 	logger        zerolog.Logger
 	handler       *Handler
+	// latestPostTS tracks the TS of the most-recent bot post per
+	// (channel, thread). Updated by every helper that posts a new
+	// message (PostMessage, PostMessageBlocks, file uploads); NOT
+	// updated by UpdateMessage (edits don't change a message's
+	// position in the thread). Consulted by the file sync watcher
+	// to decide whether to edit its previous file-sync message in
+	// place (still the latest) or post a new one (something else
+	// was posted after).
+	latestPostTS sync.Map // key "channel:thread" -> string messageTS
 }
 
 // NewBot creates a new Bot instance.
@@ -68,6 +78,7 @@ func NewBot(
 	}
 
 	bot.handler = NewHandler(bot, verboseTools, verbosityLevel, defaultModel)
+	bot.files.AttachBot(bot)
 
 	// Register event handlers using the socketmode handler pattern
 	bot.registerEventHandlers()
@@ -212,7 +223,34 @@ func (b *Bot) PostMessage(channelID, text string, threadTS string) (string, erro
 	if err != nil {
 		return "", oops.Trace(err)
 	}
+	b.recordPost(channelID, threadTS, ts)
 	return ts, nil
+}
+
+// recordPost stores ts as the latest bot-originated post for
+// (channel, thread). The file sync watcher reads this back to decide
+// whether its previous sync message is still "at the end" of the
+// thread (edit-eligible) or was superseded (post-new-required). A
+// zero thread argument is normalized to the root-post ts so top-
+// level posts and their thread replies share the same bucket.
+func (b *Bot) recordPost(channelID, threadTS, messageTS string) {
+	if messageTS == "" {
+		return
+	}
+	k := channelID + ":" + threadTS
+	if threadTS == "" {
+		k = channelID + ":" + messageTS
+	}
+	b.latestPostTS.Store(k, messageTS)
+}
+
+// LatestPostTS returns the TS of the most-recent post tracked for
+// (channel, thread). Empty string if the bot has posted nothing in
+// this bucket yet.
+func (b *Bot) LatestPostTS(channelID, threadTS string) string {
+	v, _ := b.latestPostTS.Load(channelID + ":" + threadTS)
+	s, _ := v.(string)
+	return s
 }
 
 // UpdateMessage updates an existing message.
@@ -289,6 +327,7 @@ func (b *Bot) PostMessageBlocks(channelID string, blocks []slack.Block, threadTS
 	if err != nil {
 		return "", oops.Trace(err)
 	}
+	b.recordPost(channelID, threadTS, ts)
 	return ts, nil
 }
 
