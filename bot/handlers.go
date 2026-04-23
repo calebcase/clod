@@ -727,11 +727,17 @@ func (h *Handler) HandleAppHomeOpened(ctx context.Context, ev *slackevents.AppHo
 		Str("tab", ev.Tab).
 		Logger()
 
-	sessions := h.bot.sessions.AllSessions()
-	includeWorkspace := h.bot.auth.IsAuthorized(ev.User)
+	h.publishHomeView(ev.User, logger)
+}
 
-	view := buildHomeTabView(sessions, ev.User, includeWorkspace, Version)
-	if _, err := h.bot.client.PublishView(ev.User, view, ""); err != nil {
+// publishHomeView renders and publishes the Home tab for a user.
+// Shared by the app_home_opened event handler and the in-view
+// Refresh button so both entry points build the view identically.
+func (h *Handler) publishHomeView(userID string, logger zerolog.Logger) {
+	sessions := h.bot.sessions.AllSessions()
+	includeWorkspace := h.bot.auth.IsAuthorized(userID)
+	view := buildHomeTabView(sessions, userID, includeWorkspace, Version)
+	if _, err := h.bot.client.PublishView(userID, view, ""); err != nil {
 		logger.Error().Err(err).Msg("failed to publish home tab view")
 		return
 	}
@@ -739,6 +745,18 @@ func (h *Handler) HandleAppHomeOpened(ctx context.Context, ev *slackevents.AppHo
 		Int("session_count", len(sessions)).
 		Bool("workspace", includeWorkspace).
 		Msg("published home tab view")
+}
+
+// handleHomeRefresh handles clicks on the in-view Refresh button.
+// Re-renders the view for the clicking user using current
+// sessions.json state, so active sessions' counts and timestamps
+// advance without the user having to leave and re-enter the tab.
+func (h *Handler) handleHomeRefresh(ctx context.Context, callback *slack.InteractionCallback, logger zerolog.Logger) {
+	logger = logger.With().
+		Str("user", callback.User.ID).
+		Str("action", "home_refresh").
+		Logger()
+	h.publishHomeView(callback.User.ID, logger)
 }
 
 // augmentInputWithAttachments downloads any Slack files attached to a
@@ -3727,8 +3745,18 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "slackref_asset" ||
 		action.ActionID == "slackref_skip" ||
 		action.ActionID == "slackref_cancel"
-	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal {
+	isHomeRefresh := action.ActionID == "home_refresh"
+	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal && !isHomeRefresh {
 		logger.Debug().Msg("ignoring non-permission action")
+		return
+	}
+
+	// Home-tab refresh is a self-contained interaction: re-render
+	// the view for the clicking user. Short-circuits before the
+	// permission-action decode since the action value is just a
+	// static string rather than our PermissionActionValue JSON.
+	if isHomeRefresh {
+		h.handleHomeRefresh(ctx, callback, logger)
 		return
 	}
 
