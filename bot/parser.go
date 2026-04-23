@@ -47,6 +47,16 @@ func ParseContinuation(text string) string {
 // "start a new task with an auto-generated memorable name".
 var autoNamePattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+::\s*(.+)`)
 
+// namedAutoPattern matches `<@BOT> <template>:: instructions` — the
+// shorthand for "auto-name a new task, copy the named sibling as the
+// template, skip the init dialog entirely". Template name must match
+// the same safe shape we accept for user-named tasks (alphanumerics
+// plus _-, up to 64 chars). `::` must sit directly after the name with
+// no separating whitespace — that's what disambiguates this form from
+// `<@BOT> <name>: instructions` (explicit task) and `<@BOT> :: ...`
+// (no template).
+var namedAutoPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})::\s*(.+)`)
+
 // rootMentionPattern matches `<@BOT> *: instructions` — the shorthand
 // for "run clod directly in the agents base directory" (rather than a
 // subdirectory task). The base dir itself is treated as the task; it
@@ -88,6 +98,29 @@ func ParseAutoNameMention(text string) string {
 		return ""
 	}
 	return strings.TrimSpace(m[1])
+}
+
+// NamedAutoMention is a parsed `@bot <template>:: <instructions>`
+// command. Template is the name of the sibling task to copy; it's
+// validated downstream (must exist, must not be the generated
+// auto-name, must not itself be an auto-named one-off).
+type NamedAutoMention struct {
+	Template     string
+	Instructions string
+}
+
+// ParseNamedAutoMention extracts (template, instructions) from a
+// `@bot <template>:: <instructions>` message. Returns nil when the
+// text doesn't match the shape.
+func ParseNamedAutoMention(text string) *NamedAutoMention {
+	m := namedAutoPattern.FindStringSubmatch(text)
+	if len(m) < 3 {
+		return nil
+	}
+	return &NamedAutoMention{
+		Template:     m[1],
+		Instructions: strings.TrimSpace(m[2]),
+	}
 }
 
 // closeMentionPattern matches `<@BOT> close` (optionally with trailing
