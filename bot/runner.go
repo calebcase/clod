@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,13 @@ import (
 	"github.com/creack/pty"
 	"github.com/rs/zerolog"
 )
+
+// clodRuntimePrompt is the runtime notice appended to every claude
+// invocation via --append-system-prompt. Kept in its own text file so it
+// reads easily and can be edited without touching Go source.
+//
+//go:embed clod_runtime_prompt.txt
+var clodRuntimePrompt string
 
 // rerunPattern matches Claude Code's [rerun: ...] control messages that shouldn't be shown to users.
 // Matches both "[rerun: b1]" (with space) and "[rerun:b1]" (without space).
@@ -562,6 +570,14 @@ func (r *Runner) Start(
 		mcpConfigPath,
 		"--permission-prompt-tool",
 		permToolName,
+	}
+
+	// Always append the embedded clod runtime notice so the agent knows
+	// it's running inside an ephemeral container that may be interrupted.
+	// --append-system-prompt can appear multiple times; later sections
+	// below may add more (e.g. the AGENT.md nudge).
+	if runtimeNotice := strings.TrimSpace(clodRuntimePrompt); runtimeNotice != "" {
+		args = append(args, "--append-system-prompt", runtimeNotice)
 	}
 
 	// Add the agent system prompt flag if AGENT.md was copied to the runtime directory.

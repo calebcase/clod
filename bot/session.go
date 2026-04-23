@@ -63,6 +63,14 @@ type SessionMapping struct {
 	// `@bot allow @user` / `@bot disallow @user`. Only users authorized
 	// in this thread (bot-wide OR per-thread) can drive the bot here.
 	ExtraAllowedUsers []string `json:"extra_allowed_users,omitempty"`
+	// CumulativeCostUSD and CumulativeTurns accumulate across every clod
+	// invocation within this thread. Claude's per-result stats cover only
+	// the current process's lifetime, so a resume (or a crash-and-respawn)
+	// would otherwise reset cost/turn counters — the user loses the big
+	// picture of what the thread is spending. These fields persist the
+	// running total so the stats block always shows lifetime numbers.
+	CumulativeCostUSD float64 `json:"cumulative_cost_usd,omitempty"`
+	CumulativeTurns   int     `json:"cumulative_turns,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 }
@@ -330,6 +338,30 @@ func (s *SessionStore) SetModel(channelID, threadTS, model string) {
 	}
 	session.Model = model
 	session.UpdatedAt = time.Now()
+}
+
+// AddStats increments the thread's cumulative cost and turn counters
+// and returns the new totals. Called after each clod invocation's
+// `result` stream message so the stats block reflects lifetime
+// numbers rather than just the current process's run.
+func (s *SessionStore) AddStats(channelID, threadTS string, costUSD float64, turns int) (float64, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := key(channelID, threadTS)
+	session := s.sessions[k]
+	if session == nil {
+		session = &SessionMapping{
+			ChannelID: channelID,
+			ThreadTS:  threadTS,
+			CreatedAt: time.Now(),
+		}
+		s.sessions[k] = session
+	}
+	session.CumulativeCostUSD += costUSD
+	session.CumulativeTurns += turns
+	session.UpdatedAt = time.Now()
+	return session.CumulativeCostUSD, session.CumulativeTurns
 }
 
 // AddExtraAllowedUser grants per-thread authorization to userID. Returns

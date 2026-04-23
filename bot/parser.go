@@ -43,6 +43,46 @@ func ParseContinuation(text string) string {
 	return strings.TrimSpace(matches[1])
 }
 
+// autoNamePattern matches `<@BOT> :: instructions` — the shorthand for
+// "start a new task with an auto-generated memorable name".
+var autoNamePattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+::\s*(.+)`)
+
+// rootMentionPattern matches `<@BOT> *: instructions` — the shorthand
+// for "run clod directly in the agents base directory" (rather than a
+// subdirectory task). The base dir itself is treated as the task; it
+// gets its own `.clod/` that clod initializes when missing.
+var rootMentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+\*:\s*(.+)`)
+
+// ParseRootMention returns the instructions from a `@bot *: ...`
+// message, or empty string when the text doesn't match.
+func ParseRootMention(text string) string {
+	m := rootMentionPattern.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// ParseAutoNameMention extracts the instructions from a `@bot :: ...`
+// message. Returns an empty string when the message doesn't match.
+func ParseAutoNameMention(text string) string {
+	m := autoNamePattern.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// closeMentionPattern matches `<@BOT> close` (optionally with trailing
+// text we ignore). Case-insensitive.
+var closeMentionPattern = regexp.MustCompile(`(?i)<@[A-Z0-9]+>\s+close\b`)
+
+// ParseCloseCommand reports whether the mention is an explicit
+// "close this session" command.
+func ParseCloseCommand(text string) bool {
+	return closeMentionPattern.MatchString(text)
+}
+
 // AllowCommand represents a parsed `@bot allow @user` or
 // `@bot disallow @user` message. Action is "allow" or "disallow".
 // UserID is the target Slack user id (without the `<@...>` wrapping).
