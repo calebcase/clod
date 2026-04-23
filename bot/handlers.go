@@ -413,9 +413,19 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 // act on thread replies (top-level posts need an explicit @-mention
 // to route through HandleAppMention); in DMs — both 1:1 (`im`) and
 // group (`mpim`) — we also act on top-level messages by treating the
-// whole DM as an implicit @bot conversation. First top-level DM
-// message starts a new auto-named task rooted at that message; thread
-// replies underneath continue the session.
+// whole DM as an implicit @bot conversation.
+//
+// DM semantics:
+//   - First top-level DM with no prior session for this channel →
+//     starts a new auto-named task rooted at that message.
+//   - Subsequent top-level DMs → treated as continuations of the
+//     most-recently-updated session in this DM channel. This means
+//     bot commands like `close`, `stop`, `set ...`, `allow @user`,
+//     and free-form text all route to the active session, mirroring
+//     the experience of @-mentioning the bot in a channel thread.
+//   - Shortcut prefixes (`*:`, `!:`, `::`) are preserved so the user
+//     can still start a new root / host-direct / auto-named task
+//     mid-DM without re-prefixing.
 func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEvent) {
 	// Ignore bot messages (ours and other bots').
 	if ev.BotID != "" {
@@ -454,11 +464,14 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		return
 	}
 
-	// DM top-level message: no thread → start a new auto-named task.
+	// DM top-level message: no thread → route as an implicit @bot
+	// mention. If a prior session exists for this channel, target its
+	// thread (so `close`/`set`/free-form all continue that session);
+	// otherwise start fresh through the auto-name flow.
 	// Channel top-levels were filtered out above; reaching here with
 	// empty threadTS implies DM.
 	if threadTS == "" {
-		h.handleDMNewTask(ctx, ev, logger)
+		h.dispatchDMAsMention(ctx, ev, logger)
 		return
 	}
 
@@ -1759,7 +1772,18 @@ func (h *Handler) handleNewTask(
 // bot — the whole conversation is implicitly directed at it. Thread
 // replies underneath the resulting message continue the session
 // through HandleMessage's existing flow.
-func (h *Handler) handleDMNewTask(
+// dispatchDMAsMention is the top-level-DM dispatcher. It looks up the
+// most-recently-updated session for this DM channel (if any), rewrites
+// the event into a synthetic @-mention targeting that session's
+// thread, and hands off to HandleAppMention. Net effect: every DM
+// command that works via @-mention in a channel (`close`, `set ...`,
+// `allow @user`, free-form continuation text, shortcut prefixes) also
+// works in a DM with no explicit @-mention.
+//
+// When no prior DM session exists for the channel, the event is
+// synthesized with `:: <text>` (auto-name) unless the user typed an
+// explicit shortcut — matching the first-message experience.
+func (h *Handler) dispatchDMAsMention(
 	ctx context.Context,
 	ev *slackevents.MessageEvent,
 	logger zerolog.Logger,
@@ -1779,50 +1803,79 @@ func (h *Handler) handleDMNewTask(
 		return
 	}
 
-	base := h.bot.tasks.BasePath()
-	if base == "" {
-		if _, err := h.bot.PostMessage(ev.Channel,
-			":warning: Can't start — `CLOD_BOT_AGENTS_PATH` isn't set.",
-			ev.TimeStamp); err != nil {
-			logger.Debug().Err(err).Msg("failed to post DM base-missing error")
-		}
-		return
+	latest := h.latestChannelSession(ev.Channel)
+
+	// Construct the mention text. When the user used an explicit
+	// shortcut we route it verbatim so `*:` etc. still work; when
+	// they didn't AND there's no prior session, we wrap in `:: ` to
+	// trigger the auto-name flow. If there IS a prior session, the
+	// text goes through verbatim so it's treated as a continuation
+	// by HandleAppMention's running-task / saved-session branches.
+	mentionText := text
+	if latest == nil && !hasStartShortcut(text) {
+		mentionText = ":: " + text
 	}
 
-	name, err := generateTaskName(base)
-	if err != nil {
-		logger.Error().Err(err).Msg("failed to generate task name for DM")
-		if _, perr := h.bot.PostMessage(ev.Channel,
-			fmt.Sprintf(":warning: Couldn't generate a unique task name: %v", err),
-			ev.TimeStamp); perr != nil {
-			logger.Debug().Err(perr).Msg("failed to post DM auto-name error")
-		}
-		return
-	}
-	if _, err := h.bot.PostMessage(ev.Channel,
-		fmt.Sprintf(":label: Auto-generated task name: `%s`", name),
-		ev.TimeStamp); err != nil {
-		logger.Debug().Err(err).Msg("failed to post DM auto-name notice")
+	// Target the prior session's thread when one exists so
+	// continuations land on that session's `(channel, threadTS)`
+	// key. Otherwise root the task at this message's TS.
+	threadTS := ev.TimeStamp
+	if latest != nil {
+		threadTS = latest.ThreadTS
 	}
 
-	// Synthesize an AppMentionEvent so handleNewTask / the init-prompt
-	// path work unchanged. The `<@BOT>` placeholder is purely so
-	// ParseMention's regex matches — downstream code doesn't inspect
-	// the bot user id here. ThreadTimeStamp=TimeStamp roots the
-	// task's thread at this top-level DM so follow-up replies are
-	// handled as continuations by the existing HandleMessage logic.
 	synthetic := &slackevents.AppMentionEvent{
 		Channel:         ev.Channel,
 		User:            ev.User,
 		TimeStamp:       ev.TimeStamp,
-		ThreadTimeStamp: ev.TimeStamp,
-		Text:            fmt.Sprintf("<@BOT> %s: %s", name, text),
+		ThreadTimeStamp: threadTS,
+		Text:            "<@BOT> " + mentionText,
 	}
 	logger = logger.With().
-		Str("task", name).
 		Bool("dm_implicit_mention", true).
+		Bool("dm_continuation", latest != nil).
 		Logger()
-	h.handleNewTask(ctx, synthetic, ev.TimeStamp, logger)
+	if latest != nil {
+		logger = logger.With().
+			Str("continuation_task", latest.TaskName).
+			Str("continuation_thread_ts", latest.ThreadTS).
+			Logger()
+	}
+	h.HandleAppMention(ctx, synthetic)
+}
+
+// latestChannelSession returns the most-recently-updated session in
+// the given channel, or nil if none exist. Used by the DM dispatcher
+// to route top-level DMs to the current ongoing session.
+func (h *Handler) latestChannelSession(channelID string) *SessionMapping {
+	var best *SessionMapping
+	for _, s := range h.bot.sessions.AllSessions() {
+		if s.ChannelID != channelID {
+			continue
+		}
+		if best == nil || s.UpdatedAt.After(best.UpdatedAt) {
+			best = s
+		}
+	}
+	return best
+}
+
+// dmStartShortcuts are the mention prefixes that, when typed as the
+// first bytes of a top-level DM, should be routed through the normal
+// dispatcher rather than wrapped in an auto-name synthesis. Order
+// doesn't matter; longest match wins naturally.
+var dmStartShortcuts = []string{"*:", "!:", "::"}
+
+// hasStartShortcut reports whether text begins with one of the
+// recognized DM-shortcut prefixes. Used to decide whether to auto-
+// prepend `:: ` (for auto-name) when a DM has no explicit shortcut.
+func hasStartShortcut(text string) bool {
+	for _, p := range dmStartShortcuts {
+		if strings.HasPrefix(text, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleRootTask runs a task directly in the agents base directory
