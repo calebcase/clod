@@ -190,6 +190,8 @@ func (b *Bot) handleCallbackEvent(ctx context.Context, innerEvent slackevents.Ev
 		b.handler.HandleReactionAdded(ctx, ev)
 	case *slackevents.ReactionRemovedEvent:
 		b.handler.HandleReactionRemoved(ctx, ev)
+	case *slackevents.AppHomeOpenedEvent:
+		b.handler.HandleAppHomeOpened(ctx, ev)
 	default:
 		b.logger.Debug().
 			Str("type", innerEvent.Type).

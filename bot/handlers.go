@@ -626,6 +626,40 @@ func (h *Handler) HandleReactionAdded(ctx context.Context, ev *slackevents.React
 	// Intentionally blank — see comment above.
 }
 
+// HandleAppHomeOpened republishes the Home tab view for the user who
+// just opened it. The view always includes a personal section
+// (sessions where SessionMapping.UserID == ev.User) and — when the
+// user is on the bot-wide allowlist — a workspace section
+// aggregating across all sessions. We always republish on every
+// open rather than caching because sessions.json changes frequently
+// (stats accumulate on each turn) and the tab should reflect the
+// latest numbers the moment the user looks at it.
+func (h *Handler) HandleAppHomeOpened(ctx context.Context, ev *slackevents.AppHomeOpenedEvent) {
+	// Slack fires this event for every tab open, including "messages".
+	// We only care about the actual Home tab.
+	if ev.Tab != "home" {
+		return
+	}
+
+	logger := h.logger.With().
+		Str("user", ev.User).
+		Str("tab", ev.Tab).
+		Logger()
+
+	sessions := h.bot.sessions.AllSessions()
+	includeWorkspace := h.bot.auth.IsAuthorized(ev.User)
+
+	view := buildHomeTabView(sessions, ev.User, includeWorkspace, Version)
+	if _, err := h.bot.client.PublishView(ev.User, view, ""); err != nil {
+		logger.Error().Err(err).Msg("failed to publish home tab view")
+		return
+	}
+	logger.Debug().
+		Int("session_count", len(sessions)).
+		Bool("workspace", includeWorkspace).
+		Msg("published home tab view")
+}
+
 // augmentInputWithAttachments downloads any Slack files attached to a
 // message and appends their local paths to `input` in the same
 // "Attached files have been saved to:" shape that the initial prompt
