@@ -2124,7 +2124,8 @@ func (h *Handler) runNewTask(
 		initialModel = fallbackModel
 	}
 	session := h.bot.sessions.Get(ev.Channel, threadTS)
-	if session == nil {
+	newSession := session == nil
+	if newSession {
 		session = &SessionMapping{
 			ChannelID: ev.Channel,
 			ThreadTS:  threadTS,
@@ -2137,10 +2138,23 @@ func (h *Handler) runNewTask(
 	session.ReactionAnchorTS = ev.TimeStamp
 	session.Model = initialModel
 	session.ModelReactionEmoji = emojiForModel(initialModel)
-	// New tasks start in plan mode by default so the agent proposes
-	// before doing; user can drop the reaction to switch to the bot's
-	// configured default permission mode.
-	if session.PermissionMode == "" {
+	// Root tasks (`*:` / `!:` — taskPath is the agents base dir)
+	// touch every subdirectory; their defaults differ from subdir
+	// tasks in two ways:
+	//   1. filesync defaults OFF — the agent's churn across
+	//      unrelated dirs would flood Slack with snippet uploads.
+	//   2. plan mode defaults OFF — root-task use cases (status
+	//      sweeps, multi-task orchestration) are usually
+	//      exploratory / read-heavy and the ExitPlanMode round-
+	//      trip is friction. Subdir tasks still default to plan on.
+	// Both only apply to freshly-created sessions; existing sessions
+	// keep whatever the user explicitly set. Toggle back via
+	// `@bot set filesync=on` / `@bot set plan=on`.
+	isRootTask := taskPath == h.bot.tasks.BasePath()
+	if newSession && isRootTask {
+		session.FileSyncDisabled = true
+	}
+	if session.PermissionMode == "" && !isRootTask {
 		session.PermissionMode = "plan"
 	}
 	h.bot.sessions.Set(session)
