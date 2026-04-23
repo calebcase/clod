@@ -228,7 +228,43 @@ func emojiForModel(model string) string {
 	if e, ok := modelEmojis[model]; ok {
 		return e
 	}
+	// Normalize model ids with context-window suffixes or full
+	// claude-NAME-X-Y forms to their family. Covers what claude-
+	// code writes into `.clod/claude/settings.json` when you run
+	// `/model` in a session: `opus[1m]`, `sonnet[1m]`,
+	// `claude-opus-4-7`, `claude-haiku-4-5`, etc.
+	lower := strings.ToLower(model)
+	switch {
+	case strings.Contains(lower, "opus"):
+		return opusEmoji
+	case strings.Contains(lower, "sonnet"):
+		return sonnetEmoji
+	case strings.Contains(lower, "haiku"):
+		return haikuEmoji
+	}
 	return sonnetEmoji
+}
+
+// readTaskClaudeSettingsModel reads `.clod/claude/settings.json`
+// from the task directory (the same file claude-code writes when a
+// user runs `/model` inside the container) and returns the `model`
+// field. Empty string when the file is missing, malformed, or the
+// field isn't set. claude-code is the authoritative writer; the bot
+// only reads to inherit the choice — e.g. for templated tasks where
+// the template's model preference carries over.
+func readTaskClaudeSettingsModel(taskPath string) string {
+	settingsPath := filepath.Join(taskPath, ".clod", "claude", "settings.json")
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return ""
+	}
+	var s struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(data, &s); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(s.Model)
 }
 
 // NewHandler creates a new Handler.
@@ -2256,7 +2292,20 @@ func (h *Handler) runNewTask(
 	// Anchor the model-indicator reaction on the user's @-mention — that's
 	// the message that actually kicked off the task — rather than on the
 	// bot's "Starting..." status post.
+	//
+	// Resolution order for the initial model:
+	//   1. Existing session preference (already set via @bot set model=X
+	//      or a prior ingestion from claude's settings).
+	//   2. Task-level claude settings (`.clod/claude/settings.json`'s
+	//      `model` field) — claude-code writes this when the user runs
+	//      `/model` inside claude. For templated tasks this carries the
+	//      template's preference over to the new session automatically.
+	//   3. Bot-wide default from the CLI flag.
+	//   4. `fallbackModel` ("sonnet") if nothing else set.
 	initialModel := h.bot.sessions.GetModel(ev.Channel, threadTS)
+	if initialModel == "" {
+		initialModel = readTaskClaudeSettingsModel(taskPath)
+	}
 	if initialModel == "" {
 		initialModel = h.defaultModel
 	}
@@ -4396,7 +4445,12 @@ func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger
 		logger.Error().Err(err).Msg("failed to post task start message after init")
 	}
 
+	// Same resolution order as runNewTask — see that function's
+	// comment for rationale.
 	initialModel := h.bot.sessions.GetModel(p.ChannelID, p.ThreadTS)
+	if initialModel == "" {
+		initialModel = readTaskClaudeSettingsModel(p.TaskPath)
+	}
 	if initialModel == "" {
 		initialModel = h.defaultModel
 	}

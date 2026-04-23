@@ -610,6 +610,13 @@ func writeInitFiles(p *pendingInit, image, sshMode string, packages []string) er
 //   - Ensures `.clod/claude` exists empty so clod's runtime doesn't
 //     error on the missing directory; per-instance claude state is
 //     intentionally regenerated.
+//   - Copies `.clod/claude/settings.json` from the template when
+//     present. claude-code writes this file on `/model` inside a
+//     session, so it carries the user's model preference across —
+//     and the bot reads it via readTaskClaudeSettingsModel to set
+//     the initial reaction emoji on the new thread's anchor. The
+//     rest of `.clod/claude/` (auth tokens, session history,
+//     projects cache) is intentionally NOT copied.
 //
 // All other `.clod/` config (Dockerfile_*, image, ssh, etc.) is
 // inherited as-is. No user-dialog selections are overlaid because
@@ -620,11 +627,21 @@ func materializeFromTemplate(src, dst, newTaskName string) error {
 		return err
 	}
 	clodDir := filepath.Join(dst, ".clod")
-	if err := os.MkdirAll(filepath.Join(clodDir, "claude"), 0o755); err != nil {
+	claudeDir := filepath.Join(clodDir, "claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		return fmt.Errorf("create .clod/claude in templated task: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(clodDir, "name"), []byte(newTaskName+"\n"), 0o644); err != nil {
 		return fmt.Errorf("write .clod/name in templated task: %w", err)
+	}
+	// Selectively copy just the settings.json out of the template's
+	// .clod/claude/ so the model preference survives the template
+	// copy without bringing over auth tokens or session history.
+	srcSettings := filepath.Join(src, ".clod", "claude", "settings.json")
+	if data, err := os.ReadFile(srcSettings); err == nil {
+		if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), data, 0o644); err != nil {
+			return fmt.Errorf("copy claude settings.json into templated task: %w", err)
+		}
 	}
 	return nil
 }
