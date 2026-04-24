@@ -15,6 +15,21 @@ import (
 // keeping the list short also keeps the tab scannable.
 const homeTabMaxSessions = 10
 
+// usageRollupWindows is the set of time windows the Workspace
+// section rolls usage up over. Must stay in ascending order —
+// UsageRollup aligns its result slices with this order.
+var usageRollupWindows = []time.Duration{
+	24 * time.Hour,
+	7 * 24 * time.Hour,
+	30 * 24 * time.Hour,
+	90 * 24 * time.Hour,
+	365 * 24 * time.Hour,
+}
+
+// usageRollupWindowLabels are the short labels rendered in the
+// Workspace table, aligned with usageRollupWindows.
+var usageRollupWindowLabels = []string{"24h", "7d", "30d", "90d", "365d"}
+
 // buildHomeTabView assembles the Block Kit view the app's Home tab
 // will show for `userID`. The personal section always appears;
 // the workspace-wide section is appended only when
@@ -22,6 +37,7 @@ const homeTabMaxSessions = 10
 // allowlist).
 func buildHomeTabView(
 	sessions []*SessionMapping,
+	rollup map[string][]UsageTotals,
 	userID string,
 	includeWorkspace bool,
 	botVersion string,
@@ -56,8 +72,7 @@ func buildHomeTabView(
 
 	if includeWorkspace {
 		blocks = append(blocks, slack.NewDividerBlock())
-		blocks = append(blocks, buildUsageHeader("Workspace", sessions))
-		blocks = append(blocks, buildSessionRows(sessions, now, true)...)
+		blocks = append(blocks, buildWorkspaceRollupBlocks(rollup)...)
 	}
 
 	// "How to use" reference.
@@ -195,6 +210,103 @@ func filterByUser(sessions []*SessionMapping, userID string) []*SessionMapping {
 		}
 	}
 	return out
+}
+
+// buildWorkspaceRollupBlocks renders the Workspace usage rollup: one
+// row per user who has any activity in the last 365d, showing cost
+// and turn totals for each of the standard windows (24h, 7d, 30d,
+// 90d, 365d). Users are ordered by 30-day cost descending so the
+// most active show up first.
+//
+// When no user has any activity, renders a context block noting the
+// empty state rather than a bare header.
+func buildWorkspaceRollupBlocks(rollup map[string][]UsageTotals) []slack.Block {
+	var blocks []slack.Block
+	blocks = append(blocks, slack.NewSectionBlock(
+		slack.NewTextBlockObject(
+			"mrkdwn",
+			"*Workspace — per-user usage*\n_Totals over the last 24h · 7d · 30d · 90d · 365d. Only counts activity recorded on or after 2026-04-24 when sample tracking began._",
+			false, false,
+		),
+		nil, nil,
+	))
+
+	if len(rollup) == 0 {
+		blocks = append(blocks, slack.NewContextBlock(
+			"",
+			slack.NewTextBlockObject("mrkdwn", "_No activity recorded yet._", false, false),
+		))
+		return blocks
+	}
+
+	// Sort users by their 30-day cost (index 2 in usageRollupWindows)
+	// descending, with total 365d cost as a tiebreaker. Stable order
+	// so refreshes don't shuffle the list when the user-level totals
+	// haven't changed.
+	type userRow struct {
+		UserID string
+		Totals []UsageTotals
+	}
+	rows := make([]userRow, 0, len(rollup))
+	for u, t := range rollup {
+		rows = append(rows, userRow{UserID: u, Totals: t})
+	}
+	sortKey := func(r userRow) (float64, float64) {
+		if len(r.Totals) >= 3 {
+			var last float64
+			if n := len(r.Totals); n > 0 {
+				last = r.Totals[n-1].CostUSD
+			}
+			return r.Totals[2].CostUSD, last
+		}
+		return 0, 0
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, aa := sortKey(rows[i])
+		b, bb := sortKey(rows[j])
+		if a != b {
+			return a > b
+		}
+		return aa > bb
+	})
+
+	// Render one section block per user. Row text is built as a
+	// dot-separated sequence `<label> $X.XX (Y turns)` so each
+	// window's cost + turn-count stays visually paired. Users who
+	// have zero totals across every window are omitted — they'd
+	// appear only if they had activity once long ago that expired
+	// out of the 365d window between rollups.
+	for _, r := range rows {
+		if allZero(r.Totals) {
+			continue
+		}
+		parts := make([]string, 0, len(usageRollupWindowLabels))
+		for i, label := range usageRollupWindowLabels {
+			if i >= len(r.Totals) {
+				break
+			}
+			t := r.Totals[i]
+			parts = append(parts, fmt.Sprintf("%s $%.2f (%d)", label, t.CostUSD, t.Turns))
+		}
+		blocks = append(blocks, slack.NewSectionBlock(
+			slack.NewTextBlockObject(
+				"mrkdwn",
+				fmt.Sprintf("*<@%s>* — %s", r.UserID, strings.Join(parts, " · ")),
+				false, false,
+			),
+			nil, nil,
+		))
+	}
+	return blocks
+}
+
+func allZero(totals []UsageTotals) bool {
+	for _, t := range totals {
+		if t.CostUSD != 0 || t.Turns != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // buildHomeHelpBlocks returns the "How to use" reference rendered as
