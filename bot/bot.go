@@ -260,6 +260,21 @@ func (b *Bot) LatestPostTS(channelID, threadTS string) string {
 	return s
 }
 
+// LatestPermalinkFor returns a clickable Slack permalink to the
+// most-recent bot post the bot is aware of for (channel, thread).
+// Combines LatestPostTS + PermalinkFor in one call so the Home tab
+// renderer can ask "where's the latest activity here?" without
+// plumbing both lookups separately. Returns empty string when no
+// post has been tracked yet (older sessions predating the tracker,
+// freshly-resumed sessions before the first new post).
+func (b *Bot) LatestPermalinkFor(channelID, threadTS string) string {
+	ts := b.LatestPostTS(channelID, threadTS)
+	if ts == "" {
+		return ""
+	}
+	return b.PermalinkFor(channelID, ts)
+}
+
 // PermalinkFor returns a clickable Slack permalink for a specific
 // message, memoized in-process so repeated Home-tab renders don't
 // repeatedly hit chat.getPermalink. Permalinks for a given
