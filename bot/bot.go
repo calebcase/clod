@@ -37,6 +37,13 @@ type Bot struct {
 	// place (still the latest) or post a new one (something else
 	// was posted after).
 	latestPostTS sync.Map // key "channel:thread" -> string messageTS
+
+	// permalinkCache memoizes chat.getPermalink lookups so the
+	// Home-tab renderer doesn't re-hit the API on every publish.
+	// Key: "channel:ts". Value: string url. Permalinks for a
+	// given (channel, ts) are stable forever, so the cache is
+	// append-only.
+	permalinkCache sync.Map
 }
 
 // NewBot creates a new Bot instance.
@@ -251,6 +258,33 @@ func (b *Bot) LatestPostTS(channelID, threadTS string) string {
 	v, _ := b.latestPostTS.Load(channelID + ":" + threadTS)
 	s, _ := v.(string)
 	return s
+}
+
+// PermalinkFor returns a clickable Slack permalink for a specific
+// message, memoized in-process so repeated Home-tab renders don't
+// repeatedly hit chat.getPermalink. Permalinks for a given
+// (channel, ts) never change, so the cache is append-only. Returns
+// empty string on any failure — callers render a plain label in
+// that case.
+func (b *Bot) PermalinkFor(channelID, messageTS string) string {
+	if channelID == "" || messageTS == "" {
+		return ""
+	}
+	k := channelID + ":" + messageTS
+	if v, ok := b.permalinkCache.Load(k); ok {
+		s, _ := v.(string)
+		return s
+	}
+	url, err := b.client.GetPermalink(&slack.PermalinkParameters{
+		Channel: channelID,
+		Ts:      messageTS,
+	})
+	if err != nil {
+		b.logger.Debug().Err(err).Str("channel", channelID).Str("ts", messageTS).Msg("failed to fetch permalink")
+		return ""
+	}
+	b.permalinkCache.Store(k, url)
+	return url
 }
 
 // UpdateMessage updates an existing message.

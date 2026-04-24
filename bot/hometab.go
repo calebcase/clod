@@ -42,9 +42,15 @@ var usageRollupWindowLabels = []string{"24h", "7d", "30d", "90d", "365d"}
 // the workspace-wide section is appended only when
 // `includeWorkspace` is true (i.e. the user is on the bot-wide
 // allowlist).
+//
+// permalinkFor resolves a (channel, message-ts) into a Slack
+// permalink string — used to turn session task names into
+// clickable links back to each thread's anchor message. Nil or a
+// resolver returning empty string renders plain text instead.
 func buildHomeTabView(
 	sessions []*SessionMapping,
 	rollup map[string][]UsageTotals,
+	permalinkFor func(channelID, messageTS string) string,
 	userID string,
 	includeWorkspace bool,
 	botVersion string,
@@ -80,7 +86,7 @@ func buildHomeTabView(
 	recent := filterRecent(mine, now, personalSectionRecency)
 	blocks = append(blocks, slack.NewDividerBlock())
 	blocks = append(blocks, buildUsageHeader("Your recent sessions (active in the last 7 days)", recent))
-	blocks = append(blocks, buildSessionRows(recent, now, false)...)
+	blocks = append(blocks, buildSessionRows(recent, now, false, permalinkFor)...)
 
 	if includeWorkspace {
 		blocks = append(blocks, slack.NewDividerBlock())
@@ -148,7 +154,7 @@ func buildUsageHeader(title string, sessions []*SessionMapping) slack.Block {
 // -session blocks, most-recently-updated first. When `showUser` is
 // true each row prefixes the owner with <@UID>, for the workspace
 // section where rows span users.
-func buildSessionRows(sessions []*SessionMapping, now time.Time, showUser bool) []slack.Block {
+func buildSessionRows(sessions []*SessionMapping, now time.Time, showUser bool, permalinkFor func(channelID, messageTS string) string) []slack.Block {
 	sorted := append([]*SessionMapping(nil), sessions...)
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].UpdatedAt.After(sorted[j].UpdatedAt)
@@ -167,7 +173,7 @@ func buildSessionRows(sessions []*SessionMapping, now time.Time, showUser bool) 
 	rows := make([]slack.Block, 0, len(sorted))
 	for _, s := range sorted {
 		rows = append(rows, slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", formatSessionLine(s, now, showUser), false, false),
+			slack.NewTextBlockObject("mrkdwn", formatSessionLine(s, now, showUser, permalinkFor), false, false),
 			nil, nil,
 		))
 	}
@@ -175,13 +181,41 @@ func buildSessionRows(sessions []*SessionMapping, now time.Time, showUser bool) 
 }
 
 // formatSessionLine renders the mrkdwn text for a single session row.
-func formatSessionLine(s *SessionMapping, now time.Time, showUser bool) string {
+// When permalinkFor yields a URL for the session's anchor message,
+// the task name becomes a clickable link to that message in Slack;
+// otherwise it falls back to a plain bold label.
+func formatSessionLine(s *SessionMapping, now time.Time, showUser bool, permalinkFor func(channelID, messageTS string) string) string {
 	status := ":white_circle: idle"
 	if s.Active {
 		status = ":large_green_circle: active"
 	}
+
+	// Prefer the reaction anchor (the user's @-mention that kicked
+	// off the task) as the link target. For older sessions that
+	// predate ReactionAnchorTS, fall back to the thread root.
+	anchor := s.ReactionAnchorTS
+	if anchor == "" {
+		anchor = s.ThreadTS
+	}
+	var label string
+	var url string
+	if permalinkFor != nil {
+		url = permalinkFor(s.ChannelID, anchor)
+	}
+	if url != "" {
+		// Slack mrkdwn doesn't render code spans inside a link
+		// label, so we drop the backticks and keep the outer
+		// asterisks for bold weight. `\| escapes the separator;
+		// task names are validated as [a-zA-Z0-9_-] by
+		// safeTaskNamePattern so they don't contain pipes, but
+		// belt-and-suspenders.
+		label = fmt.Sprintf("*<%s|%s>*", url, strings.ReplaceAll(s.TaskName, "|", `\|`))
+	} else {
+		label = fmt.Sprintf("*`%s`*", s.TaskName)
+	}
+
 	var parts []string
-	parts = append(parts, fmt.Sprintf("*`%s`*", s.TaskName))
+	parts = append(parts, label)
 	parts = append(parts, status)
 	if showUser && s.UserID != "" {
 		parts = append(parts, fmt.Sprintf("by <@%s>", s.UserID))
