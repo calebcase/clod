@@ -220,10 +220,9 @@ func buildHomeHelpBlocks() []slack.Block {
 		"• `@bot set filesync=on|off` — toggle file syncing for the task dir back to Slack"
 
 	dms := "*DMs with the bot*\n" +
-		"• In a DM the `@bot` prefix is implicit on top-level messages — just type the command or instructions\n" +
-		"• First top-level DM starts a new task; subsequent top-level DMs continue the most-recent session\n" +
-		"• Use `:: <text>` (or `*:` / `!:`) inside a DM to start a fresh task instead of continuing\n" +
-		"• Bot commands (`close`, `set ...`, `allow @user`) work in DM thread replies via `<@bot> <command>`"
+		"• Top-level DMs need an explicit prefix (`*:`, `!:`, `::`, `<template>::`, or `<task>:`) — the `@bot` mention is implicit. Anything else returns this usage info instead of starting or continuing a task.\n" +
+		"• Inside an active session's thread, just type to send input to the running task. No prefix needed.\n" +
+		"• Bot commands inside a thread (`close`, `set ...`, `allow @user`) need an explicit `<@bot> <command>` so they reach the command router rather than the agent."
 
 	refs := "*Slack references*\n" +
 		"• Paste a Slack permalink (channel or thread link) and the bot will expand the referenced thread into the prompt\n" +
