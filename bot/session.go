@@ -88,6 +88,31 @@ type SessionMapping struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+// UsageSample records a per-result stats event so the Home tab can
+// render per-user usage rollups over time windows (24h, 7d, 30d,
+// 90d, 365d). Keys are short to keep the sidecar file small: u =
+// userID, c = cost (USD), t = turns, at = timestamp. Samples older
+// than 365 days are pruned at append time.
+type UsageSample struct {
+	UserID  string    `json:"u"`
+	CostUSD float64   `json:"c"`
+	Turns   int       `json:"t"`
+	At      time.Time `json:"at"`
+}
+
+// UsageTotals aggregates cost + turns over a time window. Returned
+// by UsageRollup, one per (user, window) pair.
+type UsageTotals struct {
+	CostUSD float64
+	Turns   int
+}
+
+// usageTTL bounds how long samples live in memory / on disk. Matches
+// the longest window UsageRollup is ever asked about; samples older
+// than this can never contribute to a rollup so there's no reason to
+// keep them. Kept as a var rather than const so tests can override.
+var usageTTL = 365 * 24 * time.Hour
+
 // SessionStore manages thread-to-session mappings with JSON persistence.
 type SessionStore struct {
 	path                  string
@@ -95,6 +120,14 @@ type SessionStore struct {
 	mu                    sync.RWMutex
 	defaultVerbosityLevel int
 	logger                zerolog.Logger
+
+	// Usage samples (per-result cost + turns events). Stored in a
+	// sidecar `usage.json` next to the session path so the regular
+	// session Save() doesn't re-serialize a growing array of
+	// samples on every heartbeat. Appended under `mu` (write lock)
+	// alongside the AddStats mutation that triggers them.
+	usagePath string
+	usage     []*UsageSample
 }
 
 // Count returns the number of stored sessions.
@@ -122,6 +155,7 @@ func (s *SessionStore) AllSessions() []*SessionMapping {
 func NewSessionStore(path string, defaultVerbosityLevel int, logger zerolog.Logger) (*SessionStore, error) {
 	s := &SessionStore{
 		path:                  path,
+		usagePath:             deriveUsagePath(path),
 		sessions:              make(map[string]*SessionMapping),
 		defaultVerbosityLevel: defaultVerbosityLevel,
 		logger:                logger.With().Str("component", "session_store").Logger(),
@@ -130,8 +164,130 @@ func NewSessionStore(path string, defaultVerbosityLevel int, logger zerolog.Logg
 	if err := s.Load(); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
+	if err := s.LoadUsage(); err != nil && !os.IsNotExist(err) {
+		s.logger.Warn().Err(err).Msg("failed to load usage samples; starting empty")
+	}
 
 	return s, nil
+}
+
+// deriveUsagePath places the usage sidecar alongside sessions.json,
+// using a fixed `usage.json` name. Separate file so session saves
+// (which fire on heartbeats + every flag mutation) don't pay the
+// cost of re-serializing a growing sample array.
+func deriveUsagePath(sessionsPath string) string {
+	dir := filepath.Dir(sessionsPath)
+	return filepath.Join(dir, "usage.json")
+}
+
+// AppendUsageSample records a single cost/turns event. Thread-safe;
+// callers don't need to hold s.mu. Opportunistic pruning drops
+// samples older than usageTTL so the in-memory slice stays bounded.
+// Does NOT persist — callers handle that via SaveUsage so multiple
+// samples (e.g. a result + the cumulative update path) can batch.
+func (s *SessionStore) AppendUsageSample(userID string, costUSD float64, turns int) {
+	if userID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.usage = append(s.usage, &UsageSample{
+		UserID:  userID,
+		CostUSD: costUSD,
+		Turns:   turns,
+		At:      time.Now(),
+	})
+	s.pruneUsageLocked()
+}
+
+// pruneUsageLocked drops samples older than usageTTL. Must be called
+// with s.mu held. Slice is assumed to be (approximately) time-sorted
+// since samples are appended in order; we scan from the front until
+// we find one that's fresh enough and cut everything before it.
+func (s *SessionStore) pruneUsageLocked() {
+	if len(s.usage) == 0 {
+		return
+	}
+	cutoff := time.Now().Add(-usageTTL)
+	i := 0
+	for i < len(s.usage) && s.usage[i].At.Before(cutoff) {
+		i++
+	}
+	if i > 0 {
+		s.usage = s.usage[i:]
+	}
+}
+
+// UsageRollup returns per-user totals bucketed into each of the
+// supplied time windows. Windows must be in ascending order; the
+// result for each user is aligned with windows so result[user][i]
+// covers `windows[i]` back from now. Samples contribute to every
+// window that contains them (a sample from 2 hours ago lands in
+// 24h, 7d, 30d, 90d, and 365d buckets).
+func (s *SessionStore) UsageRollup(windows []time.Duration) map[string][]UsageTotals {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	result := make(map[string][]UsageTotals)
+	for _, sample := range s.usage {
+		age := now.Sub(sample.At)
+		per, ok := result[sample.UserID]
+		if !ok {
+			per = make([]UsageTotals, len(windows))
+			result[sample.UserID] = per
+		}
+		for i, w := range windows {
+			if age <= w {
+				per[i].CostUSD += sample.CostUSD
+				per[i].Turns += sample.Turns
+			}
+		}
+	}
+	return result
+}
+
+// LoadUsage reads the sidecar file. Missing file is not an error
+// (first-run condition); callers coalesce os.IsNotExist and start
+// fresh.
+func (s *SessionStore) LoadUsage() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(s.usagePath)
+	if err != nil {
+		return err
+	}
+	var wrapped struct {
+		Samples []*UsageSample `json:"samples"`
+	}
+	if err := json.Unmarshal(data, &wrapped); err != nil {
+		return oops.Trace(err)
+	}
+	s.usage = wrapped.Samples
+	s.pruneUsageLocked()
+	return nil
+}
+
+// SaveUsage serializes samples to the sidecar. Wrapped in an object
+// so we can add schema fields (e.g. a version marker) later without
+// breaking the reader.
+func (s *SessionStore) SaveUsage() error {
+	s.mu.RLock()
+	wrapped := struct {
+		Samples []*UsageSample `json:"samples"`
+	}{Samples: s.usage}
+	data, err := json.MarshalIndent(wrapped, "", "  ")
+	s.mu.RUnlock()
+	if err != nil {
+		return oops.Trace(err)
+	}
+	tmp := s.usagePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return oops.Trace(err)
+	}
+	if err := os.Rename(tmp, s.usagePath); err != nil {
+		return oops.Trace(err)
+	}
+	return nil
 }
 
 // key generates the map key for a channel/thread pair.
@@ -408,8 +564,6 @@ func (s *SessionStore) SetModel(channelID, threadTS, model string) {
 // numbers rather than just the current process's run.
 func (s *SessionStore) AddStats(channelID, threadTS string, costUSD float64, turns int) (float64, int) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	k := key(channelID, threadTS)
 	session := s.sessions[k]
 	if session == nil {
@@ -423,7 +577,25 @@ func (s *SessionStore) AddStats(channelID, threadTS string, costUSD float64, tur
 	session.CumulativeCostUSD += costUSD
 	session.CumulativeTurns += turns
 	session.UpdatedAt = time.Now()
-	return session.CumulativeCostUSD, session.CumulativeTurns
+	cumulativeCost := session.CumulativeCostUSD
+	cumulativeTurns := session.CumulativeTurns
+	// Append a usage sample under the same lock so readers see a
+	// consistent cumulative-plus-sample pair. UserID must be set on
+	// the session for the sample to count toward the per-user
+	// Workspace rollup; anonymous sessions contribute to lifetime
+	// cumulatives but not to the windowed rollup.
+	userID := session.UserID
+	if userID != "" {
+		s.usage = append(s.usage, &UsageSample{
+			UserID:  userID,
+			CostUSD: costUSD,
+			Turns:   turns,
+			At:      time.Now(),
+		})
+		s.pruneUsageLocked()
+	}
+	s.mu.Unlock()
+	return cumulativeCost, cumulativeTurns
 }
 
 // AddExtraAllowedUser grants per-thread authorization to userID. Returns

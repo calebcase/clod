@@ -751,7 +751,11 @@ func (h *Handler) HandleAppHomeOpened(ctx context.Context, ev *slackevents.AppHo
 func (h *Handler) publishHomeView(userID string, knownHash string, logger zerolog.Logger) {
 	sessions := h.bot.sessions.AllSessions()
 	includeWorkspace := h.bot.auth.IsAuthorized(userID)
-	view := buildHomeTabView(sessions, userID, includeWorkspace, Version)
+	var rollup map[string][]UsageTotals
+	if includeWorkspace {
+		rollup = h.bot.sessions.UsageRollup(usageRollupWindows)
+	}
+	view := buildHomeTabView(sessions, rollup, userID, includeWorkspace, Version)
 
 	req := slack.PublishViewContextRequest{
 		UserID: userID,
@@ -5027,6 +5031,12 @@ func (h *Handler) postStatsMessage(channelID, threadTS, statsJSON string) {
 	cumulativeCost, cumulativeTurns := h.bot.sessions.AddStats(channelID, threadTS, stats.CostUSD, stats.NumTurns)
 	if err := h.bot.sessions.Save(); err != nil {
 		h.logger.Debug().Err(err).Msg("save after AddStats")
+	}
+	// Persist the just-appended usage sample to the sidecar. Cheap
+	// — the file only grows with `result` events, not with
+	// heartbeats.
+	if err := h.bot.sessions.SaveUsage(); err != nil {
+		h.logger.Debug().Err(err).Msg("save usage sidecar after AddStats")
 	}
 
 	// Format duration (this turn only — duration is not aggregated).
