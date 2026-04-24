@@ -15,6 +15,13 @@ import (
 // keeping the list short also keeps the tab scannable.
 const homeTabMaxSessions = 10
 
+// personalSectionRecency is the staleness threshold for the "Your
+// recent sessions" list. Sessions whose UpdatedAt is older than
+// this are hidden so the view focuses on active work. They aren't
+// deleted — sessions.json keeps them and @-mentioning in the
+// thread still resumes.
+const personalSectionRecency = 7 * 24 * time.Hour
+
 // usageRollupWindows is the set of time windows the Workspace
 // section rolls usage up over. Must stay in ascending order —
 // UsageRollup aligns its result slices with this order.
@@ -64,11 +71,16 @@ func buildHomeTabView(
 		slack.NewAccessory(refreshBtn),
 	))
 
-	// Personal section.
+	// Personal section — recent sessions only. "Recent" means touched
+	// within the last 7 days; stale sessions (idle >7d) roll off
+	// this list so the view doesn't become a lifetime archive. They
+	// still exist in sessions.json and resume normally if the user
+	// @-mentions in the thread.
 	mine := filterByUser(sessions, userID)
+	recent := filterRecent(mine, now, personalSectionRecency)
 	blocks = append(blocks, slack.NewDividerBlock())
-	blocks = append(blocks, buildUsageHeader("Your sessions", mine))
-	blocks = append(blocks, buildSessionRows(mine, now, false)...)
+	blocks = append(blocks, buildUsageHeader("Your recent sessions (active in the last 7 days)", recent))
+	blocks = append(blocks, buildSessionRows(recent, now, false)...)
 
 	if includeWorkspace {
 		blocks = append(blocks, slack.NewDividerBlock())
@@ -206,6 +218,22 @@ func filterByUser(sessions []*SessionMapping, userID string) []*SessionMapping {
 	out := make([]*SessionMapping, 0, len(sessions))
 	for _, s := range sessions {
 		if s.UserID == userID {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// filterRecent returns only sessions whose UpdatedAt falls within
+// the window back from now. Used to hide stale sessions from the
+// personal list so the Home tab doesn't turn into a lifetime
+// archive — stale entries still exist in sessions.json and resume
+// on @-mention.
+func filterRecent(sessions []*SessionMapping, now time.Time, window time.Duration) []*SessionMapping {
+	cutoff := now.Add(-window)
+	out := make([]*SessionMapping, 0, len(sessions))
+	for _, s := range sessions {
+		if s.UpdatedAt.After(cutoff) {
 			out = append(out, s)
 		}
 	}
