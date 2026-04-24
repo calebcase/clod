@@ -1930,66 +1930,84 @@ func (h *Handler) dispatchDMAsMention(
 		return
 	}
 
-	latest := h.latestChannelSession(ev.Channel)
-	shortcut := hasStartShortcut(text)
-
-	// Construct the mention text. When the user used an explicit
-	// shortcut we route it verbatim so `*:` etc. still work; when
-	// they didn't AND there's no prior session, we wrap in `:: ` to
-	// trigger the auto-name flow. If there IS a prior session, the
-	// text goes through verbatim so it's treated as a continuation
-	// by HandleAppMention's running-task / saved-session branches.
-	mentionText := text
-	if latest == nil && !shortcut {
-		mentionText = ":: " + text
+	// Top-level DMs only act on recognized commands now. A bare
+	// "do thing X" message used to be auto-wrapped as `:: do thing X`
+	// (new task) or routed as a continuation of the most-recent DM
+	// session, which surprised users — they'd type a quick aside
+	// and accidentally restart or extend a session. Instead, show
+	// the usage info and let the user pick their next move with an
+	// explicit prefix.
+	if !hasDMCommandShape(text) {
+		h.postDMUsageHint(ev, text, logger)
+		return
 	}
 
-	// Thread routing. Continuations land on the prior session's
-	// thread so free-form text and commands like `@bot close`
-	// target that session. Start shortcuts (`*:`, `!:`, `::`)
-	// always root a fresh thread at the user's current message —
-	// grafting a new root/host-direct/auto-named task onto the old
-	// session's anchor would pull its (often long) thread context
-	// into the new task and scope reactions to the wrong message.
-	threadTS := ev.TimeStamp
-	if latest != nil && !shortcut {
-		threadTS = latest.ThreadTS
-	}
-
+	// Recognized command: synthesize an AppMentionEvent and dispatch
+	// through the normal mention router. Start shortcuts (`*:`,
+	// `!:`, `::`, `<name>::`) always root a fresh thread at the
+	// user's message; named-task `<name>:` commands also start
+	// fresh since they target a specific task identity rather than
+	// continuing a prior session.
 	synthetic := &slackevents.AppMentionEvent{
 		Channel:         ev.Channel,
 		User:            ev.User,
 		TimeStamp:       ev.TimeStamp,
-		ThreadTimeStamp: threadTS,
-		Text:            "<@BOT> " + mentionText,
+		ThreadTimeStamp: ev.TimeStamp,
+		Text:            "<@BOT> " + text,
 	}
-	logger = logger.With().
-		Bool("dm_implicit_mention", true).
-		Bool("dm_continuation", latest != nil).
-		Logger()
-	if latest != nil {
-		logger = logger.With().
-			Str("continuation_task", latest.TaskName).
-			Str("continuation_thread_ts", latest.ThreadTS).
-			Logger()
-	}
+	logger = logger.With().Bool("dm_implicit_mention", true).Logger()
 	h.HandleAppMention(ctx, synthetic)
 }
 
-// latestChannelSession returns the most-recently-updated session in
-// the given channel, or nil if none exist. Used by the DM dispatcher
-// to route top-level DMs to the current ongoing session.
-func (h *Handler) latestChannelSession(channelID string) *SessionMapping {
-	var best *SessionMapping
-	for _, s := range h.bot.sessions.AllSessions() {
-		if s.ChannelID != channelID {
-			continue
-		}
-		if best == nil || s.UpdatedAt.After(best.UpdatedAt) {
-			best = s
-		}
+// hasDMCommandShape reports whether a DM text is recognizable as a
+// bot command worth dispatching. Recognized shapes:
+//   - start shortcuts (`*:`, `!:`, `::`) — covered by hasStartShortcut
+//   - `<template>:: <text>` (named-template auto-name)
+//   - `<task>: <text>` (existing task or new-task init)
+//
+// Anything else (greetings, free-form questions, accidental DMs)
+// triggers the usage hint instead of auto-creating / auto-resuming.
+func hasDMCommandShape(text string) bool {
+	if hasStartShortcut(text) {
+		return true
 	}
-	return best
+	// Both ParseNamedAutoMention and ParseMention require a
+	// `<@BOT>` prefix in their regexes, so synthesize one for the
+	// shape check. The actual dispatch synthesizes the same prefix
+	// downstream.
+	probe := "<@BOT> " + text
+	if ParseNamedAutoMention(probe) != nil {
+		return true
+	}
+	if ParseMention(probe) != nil {
+		return true
+	}
+	return false
+}
+
+// postDMUsageHint posts the workspace help blocks (the same content
+// rendered at the bottom of the Home tab) into the DM as a thread
+// reply rooted at the user's message. Lets users discover the
+// command vocabulary without interrupting any active session.
+func (h *Handler) postDMUsageHint(ev *slackevents.MessageEvent, userText string, logger zerolog.Logger) {
+	preview := userText
+	const maxPreview = 200
+	if len(preview) > maxPreview {
+		preview = preview[:maxPreview] + "…"
+	}
+	intro := slack.NewSectionBlock(
+		slack.NewTextBlockObject(
+			"mrkdwn",
+			fmt.Sprintf(":raised_hand: I didn't recognize `%s` as a bot command. Here's what I understand — pick a prefix and try again:",
+				strings.ReplaceAll(preview, "`", "ʼ")),
+			false, false,
+		),
+		nil, nil,
+	)
+	blocks := append([]slack.Block{intro}, buildHomeHelpBlocks()...)
+	if _, err := h.bot.PostMessageBlocks(ev.Channel, blocks, ev.TimeStamp); err != nil {
+		logger.Debug().Err(err).Msg("failed to post DM usage hint")
+	}
 }
 
 // dmStartShortcuts are the mention prefixes that, when typed as the
