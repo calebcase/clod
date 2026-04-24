@@ -755,7 +755,7 @@ func (h *Handler) publishHomeView(userID string, knownHash string, logger zerolo
 	if includeWorkspace {
 		rollup = h.bot.sessions.UsageRollup(usageRollupWindows)
 	}
-	view := buildHomeTabView(sessions, rollup, h.bot.PermalinkFor, userID, includeWorkspace, Version)
+	view := buildHomeTabView(sessions, rollup, h.bot.PermalinkFor, h.bot.LatestPermalinkFor, userID, includeWorkspace, Version)
 
 	req := slack.PublishViewContextRequest{
 		UserID: userID,
