@@ -29,6 +29,14 @@ const uploadZipThreshold = 5
 // either succeeds or fails.
 const uploadZipDir = "/tmp"
 
+// uploadLargeZipBytes is the size at which we pause to confirm
+// before pushing the archive to Slack. Slack's hard upload limit
+// is 1 GB; this is a friction step before crossing into
+// "this could clog the channel / take a while / cost the user
+// data" territory. Picked at 100 MB as a round, defensible
+// number — bumpable via env later if it becomes a nuisance.
+const uploadLargeZipBytes = 100 * 1024 * 1024
+
 // pendingUpload tracks an outstanding `@bot upload <dir>` dialog
 // while the user picks recursive vs top-level. Path is the
 // directory being uploaded; channel/thread/message-ts let the
@@ -40,6 +48,24 @@ type pendingUpload struct {
 	ThreadTS    string
 	MessageTS   string
 	RequesterID string
+}
+
+// pendingLargeUpload tracks the size-confirmation dialog posted
+// after a zip lands above uploadLargeZipBytes. ZipPath is the
+// already-built archive on disk; the click handler either
+// uploads + removes it (proceed) or just removes it (cancel).
+// SourcePath / FileCount / TotalBytes / CompressedBytes are
+// remembered for the upload comment / cancel notice rendering.
+type pendingLargeUpload struct {
+	ZipPath         string
+	SourcePath      string
+	FileCount       int
+	TotalBytes      int64
+	CompressedBytes int64
+	ChannelID       string
+	ThreadTS        string
+	MessageTS       string
+	RequesterID     string
 }
 
 // handleUploadCommand routes the `@bot upload <path>` mention. For
@@ -240,6 +266,20 @@ func (h *Handler) executeUpload(
 			}
 			return
 		}
+		// Always remove the staging zip on exit UNLESS ownership
+		// has been handed off to a downstream confirmation handler
+		// (the large-zip path stashes the file path on a pending
+		// state and is responsible for cleanup itself).
+		retainStagingZip := false
+		defer func() {
+			if retainStagingZip {
+				return
+			}
+			if err := os.Remove(zipPath); err != nil {
+				logger.Debug().Err(err).Str("path", zipPath).Msg("failed to remove staging zip")
+			}
+		}()
+
 		zipInfo, _ := os.Stat(zipPath)
 		var compressedBytes int64
 		if zipInfo != nil {
@@ -249,15 +289,26 @@ func (h *Handler) executeUpload(
 			fmt.Sprintf(":package: *Zipped* `%s` — %d files, %s in → %s out",
 				filepath.Base(path), len(files),
 				humanBytes(totalBytes), humanBytes(compressedBytes)), logger)
-		// Always remove the staging zip — keeping it around in /tmp
-		// would leak disk space and (more importantly) potentially
-		// be picked up by a future filesync watcher if /tmp ever
-		// gets bind-mounted or aliased.
-		defer func() {
-			if err := os.Remove(zipPath); err != nil {
-				logger.Debug().Err(err).Str("path", zipPath).Msg("failed to remove staging zip")
-			}
-		}()
+
+		// Large-zip confirmation. We don't auto-upload archives
+		// above the threshold — Slack channel notifications and
+		// download UX get noisy fast. Hand off to a dedicated
+		// dialog handler that owns the staging file's lifetime
+		// from here on; flag the deferred remove to skip.
+		if compressedBytes > uploadLargeZipBytes {
+			retainStagingZip = true
+			h.postLargeZipConfirm(channelID, threadTS, &pendingLargeUpload{
+				ZipPath:         zipPath,
+				SourcePath:      path,
+				FileCount:       len(files),
+				TotalBytes:      totalBytes,
+				CompressedBytes: compressedBytes,
+				ChannelID:       channelID,
+				ThreadTS:        threadTS,
+			}, logger)
+			return
+		}
+
 		comment := fmt.Sprintf(":outbox_tray: Upload: `%s` (%d files zipped)", filepath.Base(path), len(files))
 		h.uploadOneFile(channelID, threadTS, zipPath, comment, logger)
 		return
@@ -270,6 +321,113 @@ func (h *Handler) executeUpload(
 			rel = filepath.Base(f)
 		}
 		h.uploadOneFile(channelID, threadTS, f, fmt.Sprintf(":outbox_tray: Upload: `%s`", rel), logger)
+	}
+}
+
+// postLargeZipConfirm posts a confirmation dialog and stashes
+// pending state for a zip that exceeds uploadLargeZipBytes. Until
+// the user clicks Proceed or Cancel the staging file lives on
+// disk; the click handler is responsible for removing it on
+// either path.
+func (h *Handler) postLargeZipConfirm(channelID, threadTS string, p *pendingLargeUpload, logger zerolog.Logger) {
+	progressKey := key(channelID, threadTS)
+	if _, already := h.pendingLargeUploads.LoadOrStore(progressKey, p); already {
+		// Should not happen — we only post the confirm dialog
+		// from a freshly-completed zip, and pendingLargeUploads
+		// is cleared on the next click. Defensive: notify and
+		// drop the new staging file so we don't leak it.
+		if _, err := h.bot.PostMessage(channelID,
+			":warning: Another large-upload confirmation is pending; dropping this archive.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post duplicate-large-upload warning")
+		}
+		_ = os.Remove(p.ZipPath)
+		return
+	}
+
+	allowValue := fmt.Sprintf(`{"k":%q,"b":"allow"}`, progressKey)
+	denyValue := fmt.Sprintf(`{"k":%q,"b":"deny"}`, progressKey)
+
+	header := slack.NewSectionBlock(
+		slack.NewTextBlockObject(
+			"mrkdwn",
+			fmt.Sprintf(":rotating_light: *Large upload* — `%s`\n_The archive is %s (%d files, %s uncompressed). Slack accepts up to 1 GB but downloads, channel notifications, and re-shares all get noisy at this size. Confirm before I push it._",
+				p.SourcePath, humanBytes(p.CompressedBytes), p.FileCount, humanBytes(p.TotalBytes)),
+			false, false,
+		),
+		nil, nil,
+	)
+	procBtn := slack.NewButtonBlockElement(
+		"upload_large_proceed",
+		allowValue,
+		slack.NewTextBlockObject("plain_text", "Upload anyway", false, false),
+	)
+	procBtn.Style = "danger"
+	cancelBtn := slack.NewButtonBlockElement(
+		"upload_large_cancel",
+		denyValue,
+		slack.NewTextBlockObject("plain_text", "Cancel", false, false),
+	)
+	actions := slack.NewActionBlock("upload_large_actions", procBtn, cancelBtn)
+
+	msgTS, err := h.bot.PostMessageBlocks(channelID, []slack.Block{header, actions}, threadTS)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to post large-zip confirm dialog")
+		// Couldn't post the dialog — clean up the staging file
+		// and the pending state so we don't leak either.
+		h.pendingLargeUploads.Delete(progressKey)
+		_ = os.Remove(p.ZipPath)
+		return
+	}
+	p.MessageTS = msgTS
+	// Re-store with the message TS attached. LoadOrStore above
+	// stored the same pointer; mutate it in place is fine.
+}
+
+// handleLargeZipConfirm resolves a large-upload confirmation. On
+// proceed, uploads the staging zip and removes it after; on
+// cancel, just removes it. Either way the pending state is
+// dropped and the dialog message is updated to reflect the
+// outcome.
+func (h *Handler) handleLargeZipConfirm(
+	callback *slack.InteractionCallback,
+	action *slack.BlockAction,
+	actionValue PermissionActionValue,
+	logger zerolog.Logger,
+) {
+	stateVal, ok := h.pendingLargeUploads.LoadAndDelete(actionValue.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no pending large upload found; button is stale")
+		if err := h.bot.UpdateMessage(callback.Channel.ID, callback.Message.Timestamp,
+			":warning: This large-upload confirmation is no longer active."); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale large-upload message")
+		}
+		return
+	}
+	state := stateVal.(*pendingLargeUpload)
+
+	cleanup := func() {
+		if err := os.Remove(state.ZipPath); err != nil {
+			logger.Debug().Err(err).Str("path", state.ZipPath).Msg("failed to remove large staging zip")
+		}
+	}
+
+	switch action.ActionID {
+	case "upload_large_cancel":
+		outcome := fmt.Sprintf(":x: Large upload cancelled by <@%s>. Staging file removed.", callback.User.ID)
+		if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+			logger.Debug().Err(err).Msg("failed to update cancelled large-upload message")
+		}
+		cleanup()
+	case "upload_large_proceed":
+		outcome := fmt.Sprintf(":outbox_tray: Large upload approved by <@%s>; sending to Slack…", callback.User.ID)
+		if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
+			logger.Debug().Err(err).Msg("failed to update approved large-upload message")
+		}
+		comment := fmt.Sprintf(":outbox_tray: Upload: `%s` (%d files zipped, %s)",
+			filepath.Base(state.SourcePath), state.FileCount, humanBytes(state.CompressedBytes))
+		h.uploadOneFile(state.ChannelID, state.ThreadTS, state.ZipPath, comment, logger)
+		cleanup()
 	}
 }
 
