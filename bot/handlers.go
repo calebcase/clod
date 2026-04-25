@@ -81,6 +81,12 @@ type Handler struct {
 	// naturally because the caller doesn't advance until this resolves.
 	pendingSlackRefs sync.Map
 
+	// Track in-flight `@bot upload <dir>` confirmation dialogs.
+	// Keyed by progressKey; value is *pendingUpload. One pending
+	// dialog per thread at a time; duplicates are rejected with a
+	// "already pending" warning.
+	pendingUploads sync.Map
+
 	// userNameCache memoizes Slack user_id → display name lookups for
 	// the session. Slack's team/users.info is rate-limited and we call
 	// it once per distinct author when formatting referenced threads.
@@ -387,6 +393,16 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 	// in this thread re-opens via the normal continuation path.
 	if ParseCloseCommand(ev.Text) {
 		h.handleCloseCommand(ev, threadTS, logger)
+		return
+	}
+
+	// `@bot upload <path>` — push a host-filesystem file or
+	// directory into the thread via the same file-share mechanism
+	// the file-sync watcher uses. Directories trigger a recursive-
+	// vs-top-level confirmation; >5-file results are zipped to
+	// /tmp before upload.
+	if path := ParseUploadCommand(ev.Text); path != "" {
+		h.handleUploadCommand(ctx, ev, threadTS, path, logger)
 		return
 	}
 
@@ -3799,7 +3815,10 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "slackref_skip" ||
 		action.ActionID == "slackref_cancel"
 	isHomeRefresh := action.ActionID == "home_refresh"
-	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal && !isHomeRefresh {
+	isUploadFinal := action.ActionID == "upload_recursive" ||
+		action.ActionID == "upload_toplevel" ||
+		action.ActionID == "upload_cancel"
+	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal && !isHomeRefresh && !isUploadFinal {
 		logger.Debug().Msg("ignoring non-permission action")
 		return
 	}
@@ -3858,6 +3877,11 @@ func (h *Handler) HandleBlockAction(
 
 	if isSlackRefFinal {
 		h.handleSlackRefFinal(callback, action, actionValue, logger)
+		return
+	}
+
+	if isUploadFinal {
+		h.handleUploadFinal(callback, action, actionValue, logger)
 		return
 	}
 
