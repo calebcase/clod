@@ -87,6 +87,14 @@ type Handler struct {
 	// "already pending" warning.
 	pendingUploads sync.Map
 
+	// Track in-flight large-zip confirmation dialogs (the second
+	// dialog posted when a built archive exceeds
+	// uploadLargeZipBytes). Keyed by progressKey; value is
+	// *pendingLargeUpload. The handler owns the staging zip's
+	// disk lifetime — proceed uploads + removes; cancel just
+	// removes.
+	pendingLargeUploads sync.Map
+
 	// userNameCache memoizes Slack user_id → display name lookups for
 	// the session. Slack's team/users.info is rate-limited and we call
 	// it once per distinct author when formatting referenced threads.
@@ -3824,7 +3832,9 @@ func (h *Handler) HandleBlockAction(
 	isUploadFinal := action.ActionID == "upload_recursive" ||
 		action.ActionID == "upload_toplevel" ||
 		action.ActionID == "upload_cancel"
-	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal && !isHomeRefresh && !isUploadFinal {
+	isLargeUploadFinal := action.ActionID == "upload_large_proceed" ||
+		action.ActionID == "upload_large_cancel"
+	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal && !isHomeRefresh && !isUploadFinal && !isLargeUploadFinal {
 		logger.Debug().Msg("ignoring non-permission action")
 		return
 	}
@@ -3888,6 +3898,11 @@ func (h *Handler) HandleBlockAction(
 
 	if isUploadFinal {
 		h.handleUploadFinal(callback, action, actionValue, logger)
+		return
+	}
+
+	if isLargeUploadFinal {
+		h.handleLargeZipConfirm(callback, action, actionValue, logger)
 		return
 	}
 
