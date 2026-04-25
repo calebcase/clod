@@ -265,6 +265,46 @@ func emojiForModel(model string) string {
 	return sonnetEmoji
 }
 
+// writeTaskClaudeSettingsField sets a single key in
+// `.clod/claude/settings.json` for the task, preserving any other
+// keys claude-code (or a previous bot write) put there. Used to
+// expose the same settings the upstream `/model`, `/effort`, etc.
+// flows write — so a thread-level `@bot set <field>=<value>`
+// command persists to the same file claude reads on the next run.
+//
+// Read-modify-write is unguarded against concurrent claude-code
+// writes; the race window is short and the worst case is a
+// dropped claude-side mutation that the user can redo. JSON shape
+// is `map[string]any` so we don't need a struct definition for
+// every field claude might add over time.
+func writeTaskClaudeSettingsField(taskPath, field string, value any) error {
+	dir := filepath.Join(taskPath, ".clod", "claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return oops.Trace(err)
+	}
+	settingsPath := filepath.Join(dir, "settings.json")
+	settings := map[string]any{}
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		if err := json.Unmarshal(data, &settings); err != nil {
+			// Corrupt file — start fresh rather than refusing.
+			settings = map[string]any{}
+		}
+	}
+	settings[field] = value
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return oops.Trace(err)
+	}
+	tmp := settingsPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return oops.Trace(err)
+	}
+	if err := os.Rename(tmp, settingsPath); err != nil {
+		return oops.Trace(err)
+	}
+	return nil
+}
+
 // readTaskClaudeSettingsModel reads `.clod/claude/settings.json`
 // from the task directory (the same file claude-code writes when a
 // user runs `/model` inside the container) and returns the `model`
@@ -1371,13 +1411,15 @@ func (h *Handler) handleSetCommand(
 		h.applyVerbositySet(ev.Channel, threadTS, session, cmd.Value, logger)
 	case "model", "m":
 		h.applyModelSet(ev.Channel, threadTS, session, cmd.Value, logger)
+	case "effort", "effortLevel", "e":
+		h.applyEffortSet(ev.Channel, threadTS, session, cmd.Value, logger)
 	case "plan", "plan_mode", "p":
 		h.applyPlanSet(ev.Channel, threadTS, session, cmd.Value, logger)
 	case "filesync", "sync", "files":
 		h.applyFileSyncSet(ev.Channel, threadTS, session, cmd.Value, logger)
 	default:
 		if _, err := h.bot.PostMessage(ev.Channel,
-			fmt.Sprintf(":warning: Unknown setting `%s`. Valid: `verbosity`, `model`, `plan`, `filesync`.", cmd.Field),
+			fmt.Sprintf(":warning: Unknown setting `%s`. Valid: `verbosity`, `model`, `effort`, `plan`, `filesync`.", cmd.Field),
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post unknown-field warning")
 		}
@@ -1501,6 +1543,14 @@ func (h *Handler) applyModelSet(channelID, threadTS string, session *SessionMapp
 	if err := h.bot.sessions.Save(); err != nil {
 		logger.Debug().Err(err).Msg("save after model set")
 	}
+	// Persist to .clod/claude/settings.json so the choice survives
+	// outside the bot's --model flag (claude-cli reads this on
+	// startup) and so a templated child task inherits the
+	// preference automatically. Non-fatal if the write fails —
+	// runtime --model still wins.
+	if err := writeTaskClaudeSettingsField(session.TaskPath, "model", newModel); err != nil {
+		logger.Debug().Err(err).Str("task_path", session.TaskPath).Msg("failed to persist model to claude settings.json")
+	}
 
 	// Refresh the anchor reaction — remove any known model emoji, add
 	// the new one. Idempotent RemoveReaction on emojis we didn't add.
@@ -1528,6 +1578,124 @@ func (h *Handler) applyModelSet(channelID, threadTS string, session *SessionMapp
 		threadTS); err != nil {
 		logger.Debug().Err(err).Msg("failed to post model-set confirmation")
 	}
+}
+
+// effortLevels are the values claude-code's `/effort` command
+// accepts, in escalating order. Support varies by model — the
+// docs note that Opus 4.7 supports all five, Opus 4.6 + Sonnet
+// 4.6 support all but `xhigh`, and other models fall back to
+// their highest supported level. We don't enforce model-specific
+// validity here; if the value is bogus claude itself will
+// complain on the next run.
+var effortLevels = []string{"low", "medium", "high", "xhigh", "max"}
+
+// applyEffortSet writes the effortLevel field into the task's
+// .clod/claude/settings.json. Accepts the literal levels (low,
+// medium, high, xhigh, max), `+`/`-` to step through them, or
+// `clear`/`default`/`unset` to remove the override.
+func (h *Handler) applyEffortSet(channelID, threadTS string, session *SessionMapping, value string, logger zerolog.Logger) {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "":
+		if _, err := h.bot.PostMessage(channelID,
+			":warning: `set effort=` needs a value: `low|medium|high|xhigh|max`, `+`/`-` to cycle, or `clear` to remove.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post effort-empty warning")
+		}
+		return
+	case "clear", "default", "unset":
+		// Remove the override by writing the empty string into
+		// settings.json (claude-code treats absent / empty as
+		// "fall back to the model's default").
+		if err := writeTaskClaudeSettingsField(session.TaskPath, "effortLevel", ""); err != nil {
+			logger.Debug().Err(err).Msg("failed to clear effort in claude settings.json")
+			if _, perr := h.bot.PostMessage(channelID,
+				fmt.Sprintf(":warning: Couldn't clear effort: %v", err), threadTS); perr != nil {
+				logger.Debug().Err(perr).Msg("failed to post effort-clear-error")
+			}
+			return
+		}
+		if _, err := h.bot.PostMessage(channelID,
+			":brain: Effort cleared — falls back to the model's default on the next message.",
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post effort-clear confirmation")
+		}
+		return
+	case "+", "-":
+		// Step through effortLevels relative to the current
+		// stored value. Unknown / missing current is treated as
+		// `medium`.
+		current := readTaskClaudeSettingsEffort(session.TaskPath)
+		if current == "" {
+			current = "medium"
+		}
+		idx := -1
+		for i, e := range effortLevels {
+			if e == current {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			idx = 1 // medium
+		}
+		step := 1
+		if v == "-" {
+			step = -1
+		}
+		newIdx := (idx + step + len(effortLevels)) % len(effortLevels)
+		v = effortLevels[newIdx]
+	}
+
+	// Validate against the known set so a typo falls into the
+	// helpful warning instead of getting written verbatim.
+	known := false
+	for _, e := range effortLevels {
+		if e == v {
+			known = true
+			break
+		}
+	}
+	if !known {
+		if _, err := h.bot.PostMessage(channelID,
+			fmt.Sprintf(":warning: Unknown effort level `%s`. Valid: %s.", value, strings.Join(effortLevels, ", ")),
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post effort-unknown warning")
+		}
+		return
+	}
+
+	if err := writeTaskClaudeSettingsField(session.TaskPath, "effortLevel", v); err != nil {
+		logger.Error().Err(err).Msg("failed to persist effort to claude settings.json")
+		if _, perr := h.bot.PostMessage(channelID,
+			fmt.Sprintf(":warning: Couldn't write effort: %v", err), threadTS); perr != nil {
+			logger.Debug().Err(perr).Msg("failed to post effort-write-error")
+		}
+		return
+	}
+	if _, err := h.bot.PostMessage(channelID,
+		fmt.Sprintf(":brain: Effort set to `%s` — takes effect on the next message you send in this thread.", v),
+		threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post effort-set confirmation")
+	}
+}
+
+// readTaskClaudeSettingsEffort returns the effortLevel field from
+// .clod/claude/settings.json, or empty when missing / malformed.
+// Symmetric to readTaskClaudeSettingsModel.
+func readTaskClaudeSettingsEffort(taskPath string) string {
+	settingsPath := filepath.Join(taskPath, ".clod", "claude", "settings.json")
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return ""
+	}
+	var s struct {
+		EffortLevel string `json:"effortLevel"`
+	}
+	if err := json.Unmarshal(data, &s); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(s.EffortLevel)
 }
 
 func cycleModel(cycle []string, current string, step int) string {

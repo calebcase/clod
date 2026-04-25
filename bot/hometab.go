@@ -409,7 +409,8 @@ func buildHomeHelpBlocks() []slack.Block {
 		"• `@bot close` — stop the running task and close the session. Auto-resume on bot restart is disabled until you @-mention again.\n" +
 		"• `@bot upload <path>` — upload a host-filesystem file (or directory, with a recursive-vs-top-level prompt) into this thread. >5 files get zipped to /tmp first.\n" +
 		"• `@bot allow @user` / `@bot disallow @user` — manage who else can drive this thread\n" +
-		"• `@bot set model=opus|sonnet|haiku` — switch model. `+` / `-` to cycle, or send 🎼 / 📜 / 🌸\n" +
+		"• `@bot set model=opus|sonnet|haiku|best|default|opusplan` — switch model family. `+` / `-` to cycle, or send 🎼 / 📜 / 🌸. Specific releases also work: `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, etc., plus 1M-context variants `opus[1m]` / `sonnet[1m]`.\n" +
+		"• `@bot set effort=low|medium|high|xhigh|max` — set how long claude thinks per turn. `+` / `-` to step. `clear` removes the override (model default applies).\n" +
 		"• `@bot set verbosity=0|1|-1` — silent / summary / full. Or 🙈 / 💬\n" +
 		"• `@bot set plan=on|off` — toggle plan mode. Or `+` / `-` / 💭\n" +
 		"• `@bot set filesync=on|off` — toggle file syncing for the task dir back to Slack"
