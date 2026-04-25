@@ -132,6 +132,12 @@ type progressMsg struct {
 	// Lines is the tail of recent progress lines. We keep only the last
 	// few so the message doesn't grow unbounded on long builds.
 	Lines []string
+	// LastPushed is when we most recently called chat.update on
+	// the message. New lines arriving within the throttle window
+	// are appended to Lines but don't trigger an immediate push,
+	// so high-frequency progress sources (e.g. zipping many small
+	// files) don't blow through Slack's chat.update rate limit.
+	LastPushed time.Time
 }
 
 // pendingAmbiguous tracks an outstanding "ambiguous response" prompt — the
@@ -4022,13 +4028,39 @@ func (h *Handler) handleAskQuestionSelect(
 // last few lines so the user can see progress without scroll noise. First
 // call posts the message; subsequent calls edit it in place.
 func (h *Handler) updateProgressMessage(channelID, threadTS, line string, logger zerolog.Logger) {
+	h.updateNamedProgressMessage(channelID, threadTS, "env", ":hourglass_flowing_sand: *Preparing environment*", line, logger)
+}
+
+// clearProgressMessage finalizes the rolling progress message once real
+// claude output arrives, so the "Preparing environment" status stops
+// competing with streamed content. We leave the final line history in
+// place (with a ":white_check_mark:") as a breadcrumb rather than deleting
+// it.
+func (h *Handler) clearProgressMessage(channelID, threadTS string, logger zerolog.Logger) {
+	h.finalizeNamedProgressMessage(channelID, threadTS, "env", ":white_check_mark: *Environment ready*", logger)
+}
+
+// progressUpdateThrottle bounds how often updateNamedProgressMessage
+// pushes a chat.update for the same progress message. New lines that
+// arrive within this window are still appended to the tail buffer
+// — they just don't trigger a per-line API hit. The next call after
+// the window flushes the latest tail, and the finalize step always
+// pushes regardless of timing so the closing state is exact. 500 ms
+// keeps the visible cadence near-real-time while staying safely
+// under Slack's chat.update rate limit.
+const progressUpdateThrottle = 500 * time.Millisecond
+
+// updateNamedProgressMessage is the generic version of the
+// rolling-tail progress widget. Multiple subkeys can coexist on the
+// same thread (e.g. an "env" docker-build banner alongside a "zip"
+// upload-staging banner) without stepping on each other's message
+// timestamps.
+func (h *Handler) updateNamedProgressMessage(channelID, threadTS, subkey, header, line string, logger zerolog.Logger) {
 	const maxLines = 6
-	k := key(channelID, threadTS)
+	k := key(channelID, threadTS) + ":" + subkey
 	val, _ := h.progressMessages.LoadOrStore(k, &progressMsg{})
 	pm := val.(*progressMsg)
 
-	// Trim long lines so a single docker step with a huge RUN doesn't
-	// blow past Slack's per-message limits.
 	const maxLineLen = 300
 	if len(line) > maxLineLen {
 		line = line[:maxLineLen-1] + "…"
@@ -4038,8 +4070,7 @@ func (h *Handler) updateProgressMessage(channelID, threadTS, line string, logger
 		pm.Lines = pm.Lines[len(pm.Lines)-maxLines:]
 	}
 
-	body := ":hourglass_flowing_sand: *Preparing environment*\n```\n" +
-		strings.Join(pm.Lines, "\n") + "\n```"
+	body := header + "\n```\n" + strings.Join(pm.Lines, "\n") + "\n```"
 
 	if pm.MessageTS == "" {
 		ts, err := h.bot.PostMessage(channelID, body, threadTS)
@@ -4048,20 +4079,26 @@ func (h *Handler) updateProgressMessage(channelID, threadTS, line string, logger
 			return
 		}
 		pm.MessageTS = ts
+		pm.LastPushed = time.Now()
+		return
+	}
+	if time.Since(pm.LastPushed) < progressUpdateThrottle {
+		// Throttled: tail buffer is updated above; the next
+		// post-throttle call (or the finalize step) will push.
 		return
 	}
 	if err := h.bot.UpdateMessage(channelID, pm.MessageTS, body); err != nil {
 		logger.Debug().Err(err).Msg("failed to update progress message")
+		return
 	}
+	pm.LastPushed = time.Now()
 }
 
-// clearProgressMessage finalizes the rolling progress message once real
-// claude output arrives, so the "Preparing environment" status stops
-// competing with streamed content. We leave the final line history in
-// place (with a ":white_check_mark:") as a breadcrumb rather than deleting
-// it.
-func (h *Handler) clearProgressMessage(channelID, threadTS string, logger zerolog.Logger) {
-	k := key(channelID, threadTS)
+// finalizeNamedProgressMessage closes out a progress widget with a
+// terminal header and a final push (bypassing the throttle so the
+// last batch of lines is always visible).
+func (h *Handler) finalizeNamedProgressMessage(channelID, threadTS, subkey, header string, logger zerolog.Logger) {
+	k := key(channelID, threadTS) + ":" + subkey
 	val, ok := h.progressMessages.LoadAndDelete(k)
 	if !ok {
 		return
@@ -4070,8 +4107,7 @@ func (h *Handler) clearProgressMessage(channelID, threadTS string, logger zerolo
 	if pm.MessageTS == "" {
 		return
 	}
-	body := ":white_check_mark: *Environment ready*\n```\n" +
-		strings.Join(pm.Lines, "\n") + "\n```"
+	body := header + "\n```\n" + strings.Join(pm.Lines, "\n") + "\n```"
 	if err := h.bot.UpdateMessage(channelID, pm.MessageTS, body); err != nil {
 		logger.Debug().Err(err).Msg("failed to finalize progress message")
 	}

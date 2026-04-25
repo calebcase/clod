@@ -220,8 +220,19 @@ func (h *Handler) executeUpload(
 	}
 
 	if len(files) > uploadZipThreshold {
-		zipPath, err := zipDirForUpload(path, files)
+		// Stream progress lines through the same rolling-tail
+		// widget the docker build uses, so the user sees per-file
+		// progress as the archive is built. Header reflects the
+		// source dir so concurrent uploads (unlikely) stay
+		// distinguishable. Finalize at the end with a summary.
+		header := fmt.Sprintf(":hourglass_flowing_sand: *Zipping `%s`* (%d files)", path, len(files))
+		emit := func(line string) {
+			h.updateNamedProgressMessage(channelID, threadTS, "zip", header, line, logger)
+		}
+		zipPath, totalBytes, err := zipDirForUpload(path, files, emit)
 		if err != nil {
+			h.finalizeNamedProgressMessage(channelID, threadTS, "zip",
+				fmt.Sprintf(":x: *Zip failed* `%s`: %v", path, err), logger)
 			logger.Error().Err(err).Str("path", path).Msg("failed to zip upload directory")
 			if _, perr := h.bot.PostMessage(channelID,
 				fmt.Sprintf(":warning: Couldn't zip `%s`: %v", path, err), threadTS); perr != nil {
@@ -229,6 +240,15 @@ func (h *Handler) executeUpload(
 			}
 			return
 		}
+		zipInfo, _ := os.Stat(zipPath)
+		var compressedBytes int64
+		if zipInfo != nil {
+			compressedBytes = zipInfo.Size()
+		}
+		h.finalizeNamedProgressMessage(channelID, threadTS, "zip",
+			fmt.Sprintf(":package: *Zipped* `%s` — %d files, %s in → %s out",
+				filepath.Base(path), len(files),
+				humanBytes(totalBytes), humanBytes(compressedBytes)), logger)
 		// Always remove the staging zip — keeping it around in /tmp
 		// would leak disk space and (more importantly) potentially
 		// be picked up by a future filesync watcher if /tmp ever
@@ -305,9 +325,12 @@ func enumerateUploadFiles(root string, recursive bool) ([]string, error) {
 // zipDirForUpload writes a zip archive of `files` (which should all
 // be under `root`) to a unique path under uploadZipDir. Entries
 // inside the archive are stored relative to root so the receiver
-// gets the original layout when unzipped. Returns the absolute zip
-// path; caller is responsible for removing it after upload.
-func zipDirForUpload(root string, files []string) (string, error) {
+// gets the original layout when unzipped. The emit callback is
+// invoked once per added file with a short progress line — used by
+// the upload command's rolling Slack progress widget. Returns the
+// absolute zip path and the total uncompressed bytes written;
+// caller is responsible for removing the file after upload.
+func zipDirForUpload(root string, files []string, emit func(line string)) (string, int64, error) {
 	stamp := time.Now().UTC().Format("20060102-150405")
 	base := strings.ReplaceAll(filepath.Base(root), "/", "_")
 	if base == "" || base == "." {
@@ -317,20 +340,25 @@ func zipDirForUpload(root string, files []string) (string, error) {
 
 	out, err := os.Create(zipPath)
 	if err != nil {
-		return "", oops.Trace(err)
+		return "", 0, oops.Trace(err)
 	}
 	zw := zip.NewWriter(out)
 
-	closeAll := func(err error) (string, error) {
+	if emit != nil {
+		emit(fmt.Sprintf("[zip] target: %s", zipPath))
+	}
+
+	var totalBytes int64
+	closeAll := func(err error) (string, int64, error) {
 		_ = zw.Close()
 		_ = out.Close()
 		if err != nil {
 			_ = os.Remove(zipPath)
 		}
-		return zipPath, err
+		return zipPath, totalBytes, err
 	}
 
-	for _, f := range files {
+	for i, f := range files {
 		rel, err := filepath.Rel(root, f)
 		if err != nil {
 			return closeAll(oops.Trace(err))
@@ -356,20 +384,46 @@ func zipDirForUpload(root string, files []string) (string, error) {
 		if err != nil {
 			return closeAll(oops.Trace(err))
 		}
-		_, copyErr := io.Copy(w, src)
+		n, copyErr := io.Copy(w, src)
 		_ = src.Close()
 		if copyErr != nil {
 			return closeAll(oops.Trace(copyErr))
+		}
+		totalBytes += n
+		if emit != nil {
+			emit(fmt.Sprintf("[zip] (%d/%d) %s · %s", i+1, len(files), rel, humanBytes(n)))
 		}
 	}
 	if err := zw.Close(); err != nil {
 		_ = out.Close()
 		_ = os.Remove(zipPath)
-		return "", oops.Trace(err)
+		return "", totalBytes, oops.Trace(err)
 	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(zipPath)
-		return "", oops.Trace(err)
+		return "", totalBytes, oops.Trace(err)
 	}
-	return zipPath, nil
+	return zipPath, totalBytes, nil
+}
+
+// humanBytes renders a byte count as a short human-readable string
+// (e.g. "1.2 MB", "873 B"). Used by the zip progress lines and the
+// "zipped" finalize message.
+func humanBytes(n int64) string {
+	const (
+		_  = iota
+		kB = 1 << (10 * iota)
+		mB
+		gB
+	)
+	switch {
+	case n >= gB:
+		return fmt.Sprintf("%.1f GB", float64(n)/float64(gB))
+	case n >= mB:
+		return fmt.Sprintf("%.1f MB", float64(n)/float64(mB))
+	case n >= kB:
+		return fmt.Sprintf("%.1f KB", float64(n)/float64(kB))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
