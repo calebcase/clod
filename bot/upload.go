@@ -336,7 +336,16 @@ func zipDirForUpload(root string, files []string, emit func(line string)) (strin
 	if base == "" || base == "." {
 		base = "upload"
 	}
-	zipPath := filepath.Join(uploadZipDir, fmt.Sprintf("clod-upload-%s-%s.zip", stamp, base))
+	zipName := fmt.Sprintf("clod-upload-%s-%s", stamp, base)
+	zipPath := filepath.Join(uploadZipDir, zipName+".zip")
+
+	// rootPrefix is the single top-level directory every archive
+	// entry sits under, so unzipping always materializes one
+	// directory rather than spraying files into the current
+	// working dir (the "tarbomb" pattern). Matches the zip
+	// filename (sans extension) so the unpacked dir is
+	// self-identifying — `unzip foo.zip && ls foo/` Just Works.
+	rootPrefix := zipName
 
 	out, err := os.Create(zipPath)
 	if err != nil {
@@ -346,6 +355,7 @@ func zipDirForUpload(root string, files []string, emit func(line string)) (strin
 
 	if emit != nil {
 		emit(fmt.Sprintf("[zip] target: %s", zipPath))
+		emit(fmt.Sprintf("[zip] entries will unpack under %s/", rootPrefix))
 	}
 
 	var totalBytes int64
@@ -358,14 +368,23 @@ func zipDirForUpload(root string, files []string, emit func(line string)) (strin
 		return zipPath, totalBytes, err
 	}
 
+	// Add the top-level directory as an explicit entry so
+	// extraction tools that don't infer parents from file paths
+	// still create it.
+	if _, err := zw.Create(rootPrefix + "/"); err != nil {
+		return closeAll(oops.Trace(err))
+	}
+
 	for i, f := range files {
 		rel, err := filepath.Rel(root, f)
 		if err != nil {
 			return closeAll(oops.Trace(err))
 		}
 		// Use forward slashes inside the archive for portability,
-		// regardless of host OS.
+		// regardless of host OS, and prefix every entry with the
+		// containing directory so extraction is self-contained.
 		rel = filepath.ToSlash(rel)
+		entryName := rootPrefix + "/" + rel
 		fi, err := os.Stat(f)
 		if err != nil {
 			return closeAll(oops.Trace(err))
@@ -374,7 +393,7 @@ func zipDirForUpload(root string, files []string, emit func(line string)) (strin
 		if err != nil {
 			return closeAll(oops.Trace(err))
 		}
-		hdr.Name = rel
+		hdr.Name = entryName
 		hdr.Method = zip.Deflate
 		w, err := zw.CreateHeader(hdr)
 		if err != nil {
@@ -391,7 +410,7 @@ func zipDirForUpload(root string, files []string, emit func(line string)) (strin
 		}
 		totalBytes += n
 		if emit != nil {
-			emit(fmt.Sprintf("[zip] (%d/%d) %s · %s", i+1, len(files), rel, humanBytes(n)))
+			emit(fmt.Sprintf("[zip] (%d/%d) %s · %s", i+1, len(files), entryName, humanBytes(n)))
 		}
 	}
 	if err := zw.Close(); err != nil {
