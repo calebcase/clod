@@ -407,6 +407,7 @@ func buildHomeHelpBlocks() []slack.Block {
 
 	perThread := "*Per-thread commands* (any active session)\n" +
 		"• `@bot close` — stop the running task and close the session. Auto-resume on bot restart is disabled until you @-mention again.\n" +
+		"• `@bot upload <path>` — upload a host-filesystem file (or directory, with a recursive-vs-top-level prompt) into this thread. >5 files get zipped to /tmp first.\n" +
 		"• `@bot allow @user` / `@bot disallow @user` — manage who else can drive this thread\n" +
 		"• `@bot set model=opus|sonnet|haiku` — switch model. `+` / `-` to cycle, or send 🎼 / 📜 / 🌸\n" +
 		"• `@bot set verbosity=0|1|-1` — silent / summary / full. Or 🙈 / 💬\n" +

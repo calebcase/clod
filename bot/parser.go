@@ -133,6 +133,22 @@ func ParseCloseCommand(text string) bool {
 	return closeMentionPattern.MatchString(text)
 }
 
+// uploadCommandPattern matches `<@BOT> upload <path>`. Path can
+// contain spaces; we capture greedily and let the handler trim. The
+// path is taken verbatim — no shell-style quoting / escaping.
+var uploadCommandPattern = regexp.MustCompile(`(?i)<@[A-Z0-9]+>\s+upload\s+(.+?)\s*$`)
+
+// ParseUploadCommand extracts the target path from an upload
+// command mention. Returns empty string when the message isn't an
+// upload command.
+func ParseUploadCommand(text string) string {
+	m := uploadCommandPattern.FindStringSubmatch(text)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
 // AllowCommand represents a parsed `@bot allow @user` or
 // `@bot disallow @user` message. Action is "allow" or "disallow".
 // UserID is the target Slack user id (without the `<@...>` wrapping).
