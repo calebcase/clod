@@ -310,7 +310,13 @@ func (h *Handler) executeUpload(
 		}
 
 		comment := fmt.Sprintf(":outbox_tray: Upload: `%s` (%d files zipped)", filepath.Base(path), len(files))
-		h.uploadOneFile(channelID, threadTS, zipPath, comment, logger)
+		if err := h.uploadZipWithProgress(channelID, threadTS, zipPath, comment, compressedBytes, logger); err != nil {
+			logger.Error().Err(err).Str("path", zipPath).Msg("zip upload failed")
+			if _, perr := h.bot.PostMessage(channelID,
+				fmt.Sprintf(":warning: Failed to upload `%s`: %v", zipPath, err), threadTS); perr != nil {
+				logger.Debug().Err(perr).Msg("failed to post zip-upload-error")
+			}
+		}
 		return
 	}
 
@@ -426,9 +432,96 @@ func (h *Handler) handleLargeZipConfirm(
 		}
 		comment := fmt.Sprintf(":outbox_tray: Upload: `%s` (%d files zipped, %s)",
 			filepath.Base(state.SourcePath), state.FileCount, humanBytes(state.CompressedBytes))
-		h.uploadOneFile(state.ChannelID, state.ThreadTS, state.ZipPath, comment, logger)
+		if err := h.uploadZipWithProgress(state.ChannelID, state.ThreadTS, state.ZipPath, comment, state.CompressedBytes, logger); err != nil {
+			logger.Error().Err(err).Str("path", state.ZipPath).Msg("large zip upload failed")
+			if _, perr := h.bot.PostMessage(state.ChannelID,
+				fmt.Sprintf(":warning: Failed to upload `%s`: %v", state.ZipPath, err), state.ThreadTS); perr != nil {
+				logger.Debug().Err(perr).Msg("failed to post large-zip-upload-error")
+			}
+		}
 		cleanup()
 	}
+}
+
+// uploadZipWithProgress wraps UploadFileV2 with a counting reader
+// so the user sees byte-level progress while the staging zip is
+// streamed to Slack. Used for both the small-zip and large-zip
+// (post-confirmation) paths since either can take a noticeable
+// amount of time on a slow uplink. Falls back gracefully when
+// progress can't be reported (zero-byte file, stat failure).
+func (h *Handler) uploadZipWithProgress(channelID, threadTS, zipPath, comment string, totalBytes int64, logger zerolog.Logger) error {
+	f, err := os.Open(zipPath)
+	if err != nil {
+		return oops.Trace(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	header := fmt.Sprintf(":outbox_tray: *Uploading `%s`* (%s)", filepath.Base(zipPath), humanBytes(totalBytes))
+	pr := &progressReader{
+		r:     f,
+		total: totalBytes,
+		emit: func(uploaded int64) {
+			pct := 0
+			if totalBytes > 0 {
+				pct = int(float64(uploaded) / float64(totalBytes) * 100)
+			}
+			line := fmt.Sprintf("[upload] %s / %s (%d%%)", humanBytes(uploaded), humanBytes(totalBytes), pct)
+			h.updateNamedProgressMessage(channelID, threadTS, "upload", header, line, logger)
+		},
+	}
+
+	params := slack.UploadFileV2Parameters{
+		Reader:          pr,
+		FileSize:        int(totalBytes),
+		Filename:        filepath.Base(zipPath),
+		Title:           filepath.Base(zipPath),
+		Channel:         channelID,
+		ThreadTimestamp: threadTS,
+		InitialComment:  comment,
+	}
+	_, err = h.bot.client.UploadFileV2(params)
+	if err != nil {
+		h.finalizeNamedProgressMessage(channelID, threadTS, "upload",
+			fmt.Sprintf(":x: *Upload failed* `%s`: %v", filepath.Base(zipPath), err), logger)
+		return oops.Trace(err)
+	}
+	h.finalizeNamedProgressMessage(channelID, threadTS, "upload",
+		fmt.Sprintf(":white_check_mark: *Uploaded* `%s` (%s)", filepath.Base(zipPath), humanBytes(totalBytes)), logger)
+	return nil
+}
+
+// progressReader wraps an io.Reader and calls emit periodically
+// with the running byte count. Throttled to one emit per 1 MB
+// (or one per 5% of total, whichever fires first) so a fast
+// upload doesn't spam the rolling progress widget — the actual
+// chat.update rate is further throttled inside
+// updateNamedProgressMessage.
+type progressReader struct {
+	r               io.Reader
+	total           int64
+	read            int64
+	lastEmittedRead int64
+	emit            func(uploaded int64)
+}
+
+func (p *progressReader) Read(buf []byte) (int, error) {
+	n, err := p.r.Read(buf)
+	if n > 0 {
+		p.read += int64(n)
+		threshold := int64(1 << 20) // 1 MB
+		if p.total > 0 {
+			if pctChunk := p.total / 20; pctChunk > 0 && pctChunk < threshold {
+				threshold = pctChunk
+			}
+		}
+		if p.read-p.lastEmittedRead >= threshold || (p.total > 0 && p.read == p.total) {
+			if p.emit != nil {
+				p.emit(p.read)
+			}
+			p.lastEmittedRead = p.read
+		}
+	}
+	return n, err
 }
 
 // uploadOneFile is a thin wrapper around FileHandler.UploadFromTaskOutputs
