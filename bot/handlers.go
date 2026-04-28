@@ -95,6 +95,16 @@ type Handler struct {
 	// removes.
 	pendingLargeUploads sync.Map
 
+	// expectedTaskCancels marks progressKeys whose currently-
+	// running task is being cancelled by the bot itself for an
+	// expected reason (e.g. mid-session model swap). finalizeTask
+	// reads this to suppress the noisy "Task completed with
+	// error: clod execution was cancelled" Slack post that would
+	// otherwise fire on the cmd.Wait error. The flag is cleared
+	// after suppression so a subsequent unexpected cancel still
+	// gets reported.
+	expectedTaskCancels sync.Map
+
 	// userNameCache memoizes Slack user_id → display name lookups for
 	// the session. Slack's team/users.info is rate-limited and we call
 	// it once per distinct author when formatting referenced threads.
@@ -1573,11 +1583,81 @@ func (h *Handler) applyModelSet(channelID, threadTS string, session *SessionMapp
 		}
 	}
 
-	if _, err := h.bot.PostMessage(channelID,
-		fmt.Sprintf(":%s: Model set to `%s` — takes effect on the next message you send in this thread.", newEmoji, newModel),
-		threadTS); err != nil {
+	progressKey := key(channelID, threadTS)
+	_, taskRunning := h.runningTasks.Load(progressKey)
+	var msg string
+	if taskRunning {
+		msg = fmt.Sprintf(":%s: Model set to `%s` — restarting the running task to apply.", newEmoji, newModel)
+	} else {
+		msg = fmt.Sprintf(":%s: Model set to `%s` — applies on the next mention in this thread.", newEmoji, newModel)
+	}
+	if _, err := h.bot.PostMessage(channelID, msg, threadTS); err != nil {
 		logger.Debug().Err(err).Msg("failed to post model-set confirmation")
 	}
+	if taskRunning {
+		h.restartRunningTaskForSettingChange(channelID, threadTS, fmt.Sprintf("model swap → `%s`", newModel), logger)
+	}
+}
+
+// restartRunningTaskForSettingChange cancels the currently-running
+// task in this thread, waits for it to wind down, and re-spawns it
+// via runClod with --resume + the latest stored settings (model,
+// effort, etc.). Used by the `set` command path when the new value
+// only takes effect at process start (claude can't switch model /
+// effort mid stream-json session).
+//
+// reason is a short label included in the "Restarting…" notice so
+// users see what triggered the swap. No-op if no running task or
+// no captured session id (can't resume without one).
+func (h *Handler) restartRunningTaskForSettingChange(channelID, threadTS, reason string, logger zerolog.Logger) {
+	progressKey := key(channelID, threadTS)
+	val, ok := h.runningTasks.Load(progressKey)
+	if !ok {
+		return
+	}
+	runningTask := val.(*RunningTask)
+	session := h.bot.sessions.Get(channelID, threadTS)
+	if session == nil || session.SessionID == "" {
+		logger.Warn().Msg("can't restart task: no captured session id")
+		return
+	}
+	// Mark this cancel as expected so finalizeTask suppresses
+	// its "task completed with error" Slack post.
+	h.expectedTaskCancels.Store(progressKey, true)
+	runningTask.Cancel()
+
+	// Spin off the resume in a goroutine so handleSetCommand can
+	// return — the cancel + wind-down can take several seconds
+	// and we don't want to block the Slack event handler.
+	go func() {
+		// Wait for the old runClod loop to exit. task.Done()
+		// fires when the runner's process completes; the
+		// runClod goroutine's defer-cleanup runs immediately
+		// after, but a short pause helps avoid racing the
+		// runningTasks.Delete with our upcoming Store.
+		select {
+		case <-runningTask.Done():
+		case <-time.After(60 * time.Second):
+			logger.Warn().Msg("timeout waiting for cancelled task to exit; abandoning restart")
+			h.expectedTaskCancels.Delete(progressKey)
+			return
+		}
+		// Brief wait so the prior runClod's deferred
+		// runningTasks.Delete fires before our new runClod's
+		// runningTasks.Store overwrites it (otherwise the
+		// deferred Delete would clobber the new entry).
+		time.Sleep(250 * time.Millisecond)
+
+		if _, err := h.bot.PostMessage(channelID,
+			fmt.Sprintf(":arrows_counterclockwise: Resuming task `%s` (%s)…", session.TaskName, reason),
+			threadTS); err != nil {
+			logger.Debug().Err(err).Msg("failed to post restart-resume notice")
+		}
+		nudge := fmt.Sprintf("The session was restarted to apply: %s. Continue where you left off; do not redo steps already completed.", reason)
+		// Use Background so the resume isn't tied to the
+		// upstream Slack event ctx, which is short-lived.
+		h.runClod(context.Background(), channelID, session.UserID, session.TaskPath, session.TaskName, nudge, session.SessionID, threadTS, logger)
+	}()
 }
 
 // effortLevels are the values claude-code's `/effort` command
@@ -1673,10 +1753,19 @@ func (h *Handler) applyEffortSet(channelID, threadTS string, session *SessionMap
 		}
 		return
 	}
-	if _, err := h.bot.PostMessage(channelID,
-		fmt.Sprintf(":brain: Effort set to `%s` — takes effect on the next message you send in this thread.", v),
-		threadTS); err != nil {
+	progressKey := key(channelID, threadTS)
+	_, taskRunning := h.runningTasks.Load(progressKey)
+	var msg string
+	if taskRunning {
+		msg = fmt.Sprintf(":brain: Effort set to `%s` — restarting the running task to apply.", v)
+	} else {
+		msg = fmt.Sprintf(":brain: Effort set to `%s` — applies on the next mention in this thread.", v)
+	}
+	if _, err := h.bot.PostMessage(channelID, msg, threadTS); err != nil {
 		logger.Debug().Err(err).Msg("failed to post effort-set confirmation")
+	}
+	if taskRunning {
+		h.restartRunningTaskForSettingChange(channelID, threadTS, fmt.Sprintf("effort change → `%s`", v), logger)
 	}
 }
 
@@ -3529,8 +3618,13 @@ func (h *Handler) finalizeTask(
 ) {
 	var finalMsg string
 	cleanExit := result.Error == nil
+	progressKey := key(channelID, threadTS)
+	expectedCancel := false
+	if _, ok := h.expectedTaskCancels.LoadAndDelete(progressKey); ok {
+		expectedCancel = true
+	}
 	if result.Error != nil {
-		logger.Error().Err(result.Error).Msg("clod returned error")
+		logger.Error().Err(result.Error).Bool("expected_cancel", expectedCancel).Msg("clod returned error")
 		finalMsg = fmt.Sprintf(":warning: Task completed with error: %v", result.Error)
 	} else {
 		logger.Info().
@@ -3538,8 +3632,14 @@ func (h *Handler) finalizeTask(
 			Msg("task completed successfully")
 		finalMsg = ":white_check_mark: Task completed!"
 	}
-	if _, err := h.bot.PostMessage(channelID, finalMsg, threadTS); err != nil {
-		logger.Error().Err(err).Msg("failed to post final task message")
+	// Skip the "...cancelled" warning when the bot itself cancelled
+	// the task for a known reason (currently: mid-session model
+	// swap). The follow-up code path posts its own status so the
+	// user knows what's happening.
+	if !(expectedCancel && result.Error != nil) {
+		if _, err := h.bot.PostMessage(channelID, finalMsg, threadTS); err != nil {
+			logger.Error().Err(err).Msg("failed to post final task message")
+		}
 	}
 
 	// The task's container is gone regardless of exit code, so any
