@@ -38,6 +38,15 @@ type SessionMapping struct {
 	// flag is paired with UpdatedAt (heartbeat-bumped while running) to
 	// decide whether a still-Active session is fresh enough to resume.
 	Active bool `json:"active,omitempty"`
+	// Idle is true between turns: the agent emitted its `result` for the
+	// previous turn and is waiting for the next user input. Auto-resume
+	// on bot restart skips Active && Idle sessions because the agent
+	// wasn't doing anything when the bot died — waking the thread is
+	// just noise. Cleared whenever a fresh user input is sent (initial
+	// prompt, thread reply, ambig redirect). Set when the per-turn
+	// stats message lands. Stays unset on disk for new (pre-Idle-flag)
+	// sessions, so default behaviour is unchanged.
+	Idle bool `json:"idle,omitempty"`
 	// ActiveMonitors is the set of task_ids currently running under the
 	// agent's `Monitor` tool. Populated as Monitor starts arrive and
 	// drained on TaskStop; a keycap reaction on ReactionAnchorTS reflects
@@ -387,6 +396,26 @@ func (s *SessionStore) SetActive(channelID, threadTS string, active bool) {
 // the basename since this is a single-package project.
 func shortCaller(file string, line int) string {
 	return filepath.Base(file) + ":" + strconv.Itoa(line)
+}
+
+// SetIdle records whether the session's agent is idle (between turns,
+// waiting for user input) or busy (mid-turn). Auto-resume after a bot
+// restart skips Active && Idle sessions — the agent wasn't doing
+// anything when the bot died, so waking the thread is pure noise.
+// Caller is responsible for Save(). Bumps UpdatedAt so the heartbeat
+// staleness check still treats the session as recently active.
+func (s *SessionStore) SetIdle(channelID, threadTS string, idle bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := key(channelID, threadTS)
+	session := s.sessions[k]
+	if session == nil {
+		// Idle has no meaning without a session; don't synthesize one.
+		return
+	}
+	session.Idle = idle
+	session.UpdatedAt = time.Now()
 }
 
 // Touch bumps UpdatedAt so the session's "last seen alive" timestamp stays
