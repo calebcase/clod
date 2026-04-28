@@ -2706,7 +2706,16 @@ func (h *Handler) runNewTask(
 			CreatedAt: time.Now(),
 		}
 	}
-	session.ReactionAnchorTS = ev.TimeStamp
+	// ReactionAnchorTS is the message everyone — channel browsers, the
+	// home tab, the Slack search picker — sees as "this thread". We
+	// pin it on session creation and never move it: a `@bot close`
+	// followed by a re-mention should keep all the bot's status
+	// reactions on the original anchor where users will look for
+	// them. Re-entries fall through this branch and reuse the prior
+	// anchor.
+	if session.ReactionAnchorTS == "" {
+		session.ReactionAnchorTS = ev.TimeStamp
+	}
 	session.Model = initialModel
 	session.ModelReactionEmoji = emojiForModel(initialModel)
 	// Root tasks (`*:` / `!:` — taskPath is the workspace root)
@@ -2732,11 +2741,11 @@ func (h *Handler) runNewTask(
 	if err := h.bot.sessions.Save(); err != nil {
 		logger.Error().Err(err).Msg("failed to save session after status post")
 	}
-	if err := h.bot.AddReaction(ev.Channel, ev.TimeStamp, session.ModelReactionEmoji); err != nil {
+	if err := h.bot.AddReaction(ev.Channel, session.ReactionAnchorTS, session.ModelReactionEmoji); err != nil {
 		logger.Debug().Err(err).Msg("failed to add model reaction")
 	}
 	if session.PermissionMode == "plan" {
-		if err := h.bot.AddReaction(ev.Channel, ev.TimeStamp, planModeEmoji); err != nil {
+		if err := h.bot.AddReaction(ev.Channel, session.ReactionAnchorTS, planModeEmoji); err != nil {
 			logger.Debug().Err(err).Msg("failed to add plan-mode reaction")
 		}
 	}
@@ -4916,7 +4925,14 @@ func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger
 			CreatedAt: time.Now(),
 		}
 	}
-	session.ReactionAnchorTS = p.MentionTS
+	// Pin the anchor on the original mention only — see handleNewTask
+	// for the rationale. If init re-runs against a previously closed
+	// session (e.g. user nuked `.clod/` and started over) we keep the
+	// existing anchor so the home tab and channel browsers point at
+	// the same message.
+	if session.ReactionAnchorTS == "" {
+		session.ReactionAnchorTS = p.MentionTS
+	}
 	session.Model = initialModel
 	session.ModelReactionEmoji = emojiForModel(initialModel)
 	// Default plan mode on for a freshly-initialized task — same policy
@@ -4930,11 +4946,11 @@ func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger
 	if err := h.bot.sessions.Save(); err != nil {
 		logger.Error().Err(err).Msg("failed to save session after init")
 	}
-	if err := h.bot.AddReaction(p.ChannelID, p.MentionTS, session.ModelReactionEmoji); err != nil {
+	if err := h.bot.AddReaction(p.ChannelID, session.ReactionAnchorTS, session.ModelReactionEmoji); err != nil {
 		logger.Debug().Err(err).Msg("failed to add model reaction after init")
 	}
 	if session.PermissionMode == "plan" {
-		if err := h.bot.AddReaction(p.ChannelID, p.MentionTS, planModeEmoji); err != nil {
+		if err := h.bot.AddReaction(p.ChannelID, session.ReactionAnchorTS, planModeEmoji); err != nil {
 			logger.Debug().Err(err).Msg("failed to add plan-mode reaction after init")
 		}
 	}
