@@ -502,7 +502,7 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 		if input != "" {
 			send := func(finalInput string) {
 				logger.Debug().Str("input", finalInput).Msg("sending input to running task")
-				if err := task.SendInput(finalInput); err != nil {
+				if err := h.sendUserInput(task, ev.Channel, threadTS, finalInput); err != nil {
 					logger.Error().Err(err).Msg("failed to send input to task")
 				}
 			}
@@ -687,7 +687,7 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		h.lastOutputMsg.Delete(key(ev.Channel, threadTS))
 		send := func(finalInput string) {
 			logger.Debug().Str("input", finalInput).Msg("sending thread reply to running task")
-			if err := task.SendInput(finalInput); err != nil {
+			if err := h.sendUserInput(task, ev.Channel, threadTS, finalInput); err != nil {
 				logger.Error().Err(err).Msg("failed to send input to task")
 			}
 		}
@@ -2808,6 +2808,23 @@ func monitorCountEmojiFor(count int) string {
 	}
 }
 
+// sendUserInput forwards a user-driven turn to the running task and
+// records that the session is no longer idle (a new turn is starting).
+// Permission responses and other mid-turn writes don't go through here —
+// they continue an in-flight turn rather than start a new one, and
+// shouldn't reset the Idle flag. Errors from SendInput are returned for
+// caller-specific logging; the Idle bookkeeping happens regardless of
+// whether the write succeeds, on the basis that the user clearly
+// intends to drive a new turn (a stuck "idle" flag would silently
+// suppress the eventual auto-resume after the next bot restart).
+func (h *Handler) sendUserInput(task *RunningTask, channelID, threadTS, input string) error {
+	h.bot.sessions.SetIdle(channelID, threadTS, false)
+	if err := h.bot.sessions.Save(); err != nil {
+		h.logger.Debug().Err(err).Msg("save before sendUserInput")
+	}
+	return task.SendInput(input)
+}
+
 // syncMonitorCountEmoji brings the anchor-message reaction into line with
 // the session's current ActiveMonitors count. Idempotent; safe to call
 // whenever monitor state changes.
@@ -3049,12 +3066,30 @@ func (h *Handler) handleContinuation(
 // tells the agent to pick up where it left off. Sessions whose UpdatedAt
 // is older than maxAge are considered stale — we clear the flag without
 // resuming so stopped-then-left-overnight threads don't all wake up at
-// once.
+// once. Sessions where the agent was idle (between turns) when the bot
+// died are also skipped: there was no work in progress, so waking the
+// thread would be pure noise. The next user message in the thread will
+// pick up via the normal resume-on-mention path.
 func (h *Handler) ResumeActiveSessions(ctx context.Context, maxAge time.Duration) {
 	fresh, stale := h.bot.sessions.ActiveSessions(maxAge)
 
+	// Partition fresh into actually-busy (resume) vs idle (skip without
+	// a wake-up notice). The Idle flag was true on disk iff the agent
+	// emitted its `result` for the previous turn and no further user
+	// input arrived before the bot exited.
+	var busy []*SessionMapping
+	var idle []*SessionMapping
+	for _, s := range fresh {
+		if s.Idle {
+			idle = append(idle, s)
+		} else {
+			busy = append(busy, s)
+		}
+	}
+
 	logger := h.logger.With().
-		Int("fresh", len(fresh)).
+		Int("busy", len(busy)).
+		Int("idle", len(idle)).
 		Int("stale", len(stale)).
 		Dur("max_age", maxAge).
 		Logger()
@@ -3071,20 +3106,34 @@ func (h *Handler) ResumeActiveSessions(ctx context.Context, maxAge time.Duration
 			Msg("skipping stale active session")
 		h.bot.sessions.SetActive(s.ChannelID, s.ThreadTS, false)
 	}
-	if len(stale) > 0 {
+	// Idle sessions: the process is gone (died with the bot), so the
+	// on-disk Active=true is misleading. Clear it so subsequent
+	// startups don't keep re-evaluating these threads, and so the
+	// home tab's "active" indicator reflects reality. Idle stays as
+	// last-known state for diagnostic value; the next runClod start
+	// will reset it.
+	for _, s := range idle {
+		h.logger.Info().
+			Str("channel", s.ChannelID).
+			Str("thread_ts", s.ThreadTS).
+			Str("task", s.TaskName).
+			Msg("skipping idle active session — no work was in progress when bot exited")
+		h.bot.sessions.SetActive(s.ChannelID, s.ThreadTS, false)
+	}
+	if len(stale)+len(idle) > 0 {
 		if err := h.bot.sessions.Save(); err != nil {
-			logger.Error().Err(err).Msg("failed to persist cleared stale flags")
+			logger.Error().Err(err).Msg("failed to persist cleared active flags")
 		}
 	}
 
-	if len(fresh) == 0 {
-		logger.Debug().Msg("no fresh active sessions to resume")
+	if len(busy) == 0 {
+		logger.Debug().Msg("no busy active sessions to resume")
 		return
 	}
 
 	logger.Info().Msg("resuming active sessions after bot restart")
 
-	for _, s := range fresh {
+	for _, s := range busy {
 		s := s // capture for goroutine
 		go h.resumeOneSession(ctx, s)
 	}
@@ -3209,8 +3258,12 @@ func (h *Handler) runClod(
 
 	// Flag the session as actively running so a bot restart can resume it.
 	// The flag is only cleared on clean completion below — shutdown, crash,
-	// or timeout leaves it set so the next startup picks it up.
+	// or timeout leaves it set so the next startup picks it up. The Idle
+	// flag rides alongside Active to track turn-level state: cleared here
+	// because runner.Start has just queued the initial / resume / nudge
+	// prompt, so the agent is mid-turn from the moment this returns.
 	h.bot.sessions.SetActive(channelID, threadTS, true)
+	h.bot.sessions.SetIdle(channelID, threadTS, false)
 	if err := h.bot.sessions.Save(); err != nil {
 		logger.Debug().Err(err).Msg("failed to persist active flag")
 	}
@@ -3432,6 +3485,14 @@ func (h *Handler) runClod(
 				h.postStatsMessage(channelID, threadTS, content[9:]) // Skip "__STATS__" prefix.
 				// Clear consolidation since stats message breaks the chain.
 				h.lastOutputMsg.Delete(threadKey)
+				// Stats land at the end of every turn — the agent is now
+				// idle, waiting for the next user input. Persist that so a
+				// bot kill between turns doesn't trigger an unnecessary
+				// auto-resume on next startup.
+				h.bot.sessions.SetIdle(channelID, threadTS, true)
+				if err := h.bot.sessions.Save(); err != nil {
+					logger.Debug().Err(err).Msg("save after marking session idle")
+				}
 				continue
 			}
 
@@ -5144,7 +5205,7 @@ func (h *Handler) handleAmbiguousAction(
 	if actionValue.Redirect && ambig.Text != "" {
 		// Clear output consolidation since the user is starting a new turn.
 		h.lastOutputMsg.Delete(actionValue.ThreadKey)
-		if err := task.SendInput(ambig.Text); err != nil {
+		if err := h.sendUserInput(task, pending.ChannelID, pending.ThreadTS, ambig.Text); err != nil {
 			logger.Error().Err(err).Msg("failed to send redirected input")
 		}
 	}
