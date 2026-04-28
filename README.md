@@ -546,16 +546,24 @@ session persistence and permission management.
 
 ### Features
 
-- **Socket Mode** - No public endpoint needed
-- **Session persistence** - Continue conversations across Slack threads
-- **Permission prompts** - Interactive buttons for tool approvals
-- **File uploads** - Attach files as context for agents
-- **Task discovery** - Automatically finds agents with `.clod/` directories
+- **Socket Mode** — no public endpoint needed; the bot dials out to Slack
+- **Multiple ways to start a task** — explicit task dirs, auto-named tasks (with optional template), workspace-root tasks, or "host-direct" runs that bypass the docker sandbox
+- **Session persistence** — continue conversations across Slack threads; auto-resumes when the bot restarts mid-task
+- **Permission prompts** — interactive Slack buttons for tool approvals, with persistent allow/deny patterns
+- **Per-thread settings** — model (`opus` / `sonnet` / `haiku` / point releases / 1M-context variants), effort level, plan mode, verbosity, file-sync toggle, per-thread allowlist
+- **File handling** — Slack attachments come into the task dir; new/changed files in the task dir flow back to Slack as snippets (toggleable). `@bot upload <path>` pushes host files into the thread, zipping anything over the threshold
+- **Slack reference expansion** — paste a permalink to a thread/channel and the bot pulls the conversation into the prompt (with confirmation for large or private references)
+- **Layered agent prompts** — `AGENT.md` per task plus a workspace-wide `AGENTS.md` are appended to the system prompt on every run
+- **Home tab** — per-user recent sessions with clickable links and workspace-wide usage rollups (cost + turns over 24h/7d/30d/90d/365d)
+- **Task discovery** — automatically finds tasks (subdirectories with `.clod/`); the agents base dir itself is also runnable
+
 ### Quick Start
 
 1. **Create Slack App**
 
-   [Click here to create Clod Bot from manifest.](https://api.slack.com/apps?new_app=1&manifest_yaml=_metadata%3A%0A%20%20major_version%3A%202%0A%20%20minor_version%3A%201%0A%0Adisplay_information%3A%0A%20%20name%3A%20Clod%20Bot%0A%20%20description%3A%20Run%20Claude%20Code%20agents%20via%20Slack%20with%20isolated%20Docker%20execution%0A%20%20background_color%3A%20%22%234A154B%22%0A%20%20long_description%3A%20%22Clod%20Bot%20enables%20you%20to%20run%20Claude%20Code%20agents%20directly%20from%20Slack.%20Each%20agent%20runs%20in%20an%20isolated%20Docker%20container%20with%20its%20own%20dependencies%20and%20configuration.%20The%20bot%20supports%20file%20uploads%2C%20session%20persistence%20across%20threads%2C%20and%20interactive%20permission%20prompts.%22%0A%0Afeatures%3A%0A%20%20bot_user%3A%0A%20%20%20%20display_name%3A%20Clod%20Bot%0A%20%20%20%20always_online%3A%20true%0A%0Aoauth_config%3A%0A%20%20scopes%3A%0A%20%20%20%20bot%3A%0A%20%20%20%20%20%20-%20app_mentions%3Aread%0A%20%20%20%20%20%20-%20channels%3Ahistory%0A%20%20%20%20%20%20-%20channels%3Ajoin%0A%20%20%20%20%20%20-%20chat%3Awrite%0A%20%20%20%20%20%20-%20chat%3Awrite.customize%0A%20%20%20%20%20%20-%20chat%3Awrite.public%0A%20%20%20%20%20%20-%20groups%3Ahistory%0A%20%20%20%20%20%20-%20groups%3Aread%0A%20%20%20%20%20%20-%20files%3Aread%0A%20%20%20%20%20%20-%20files%3Awrite%0A%20%20%20%20%20%20-%20reactions%3Aread%0A%20%20%20%20%20%20-%20remote_files%3Aread%0A%20%20%20%20%20%20-%20remote_files%3Awrite%0A%0Asettings%3A%0A%20%20event_subscriptions%3A%0A%20%20%20%20bot_events%3A%0A%20%20%20%20%20%20-%20app_mention%0A%20%20%20%20%20%20-%20message.channels%0A%20%20%20%20%20%20-%20message.groups%0A%20%20%20%20%20%20-%20reaction_added%0A%20%20%20%20%20%20-%20reaction_removed%0A%20%20interactivity%3A%0A%20%20%20%20is_enabled%3A%20true%0A%20%20org_deploy_enabled%3A%20false%0A%20%20socket_mode_enabled%3A%20true%0A%20%20token_rotation_enabled%3A%20false%0A)
+   [Click here to create Clod Bot from manifest.](https://api.slack.com/apps?new_app=1&manifest_yaml=_metadata%3A%0A%20%20major_version%3A%202%0A%20%20minor_version%3A%201%0A%0Adisplay_information%3A%0A%20%20name%3A%20Clod%20Bot%0A%20%20description%3A%20Run%20Claude%20Code%20agents%20via%20Slack%20with%20isolated%20Docker%20execution%0A%20%20background_color%3A%20%22%234A154B%22%0A%20%20long_description%3A%20%22Clod%20Bot%20enables%20you%20to%20run%20Claude%20Code%20agents%20directly%20from%20Slack.%20Each%20agent%20runs%20in%20an%20isolated%20Docker%20container%20with%20its%20own%20dependencies%20and%20configuration.%20The%20bot%20supports%20file%20uploads%2C%20session%20persistence%20across%20threads%2C%20and%20interactive%20permission%20prompts.%22%0A%0Afeatures%3A%0A%20%20bot_user%3A%0A%20%20%20%20display_name%3A%20Clod%20Bot%0A%20%20%20%20always_online%3A%20true%0A%20%20app_home%3A%0A%20%20%20%20home_tab_enabled%3A%20true%0A%20%20%20%20messages_tab_enabled%3A%20true%0A%20%20%20%20messages_tab_read_only_enabled%3A%20false%0A%0Aoauth_config%3A%0A%20%20scopes%3A%0A%20%20%20%20bot%3A%0A%20%20%20%20%20%20-%20app_mentions%3Aread%0A%20%20%20%20%20%20-%20channels%3Ahistory%0A%20%20%20%20%20%20-%20channels%3Ajoin%0A%20%20%20%20%20%20-%20channels%3Aread%0A%20%20%20%20%20%20-%20chat%3Awrite%0A%20%20%20%20%20%20-%20chat%3Awrite.customize%0A%20%20%20%20%20%20-%20chat%3Awrite.public%0A%20%20%20%20%20%20-%20groups%3Ahistory%0A%20%20%20%20%20%20-%20groups%3Aread%0A%20%20%20%20%20%20-%20im%3Ahistory%0A%20%20%20%20%20%20-%20im%3Aread%0A%20%20%20%20%20%20-%20im%3Awrite%0A%20%20%20%20%20%20-%20im%3Awrite.topic%0A%20%20%20%20%20%20-%20mpim%3Ahistory%0A%20%20%20%20%20%20-%20mpim%3Aread%0A%20%20%20%20%20%20-%20files%3Aread%0A%20%20%20%20%20%20-%20files%3Awrite%0A%20%20%20%20%20%20-%20reactions%3Aread%0A%20%20%20%20%20%20-%20reactions%3Awrite%0A%20%20%20%20%20%20-%20remote_files%3Aread%0A%20%20%20%20%20%20-%20remote_files%3Awrite%0A%20%20%20%20%20%20-%20search%3Aread.im%0A%20%20%20%20%20%20-%20search%3Aread.mpim%0A%20%20%20%20%20%20-%20users%3Aread%0A%0Asettings%3A%0A%20%20event_subscriptions%3A%0A%20%20%20%20bot_events%3A%0A%20%20%20%20%20%20-%20app_home_opened%0A%20%20%20%20%20%20-%20app_mention%0A%20%20%20%20%20%20-%20message.channels%0A%20%20%20%20%20%20-%20message.groups%0A%20%20%20%20%20%20-%20message.im%0A%20%20%20%20%20%20-%20message.mpim%0A%20%20%20%20%20%20-%20reaction_added%0A%20%20%20%20%20%20-%20reaction_removed%0A%20%20interactivity%3A%0A%20%20%20%20is_enabled%3A%20true%0A%20%20org_deploy_enabled%3A%20false%0A%20%20socket_mode_enabled%3A%20true%0A%20%20token_rotation_enabled%3A%20false%0A)
+
+   The canonical manifest lives at `bot/manifest.yaml` — re-encode that file if you ever need to refresh this link.
 
    Select a workspace and click **Create**.
 
@@ -612,33 +620,99 @@ session persistence and permission management.
    bot
    ```
 
+   See the **Bot Configuration** section below for the full set of `CLOD_BOT_*`
+   environment variables (timeouts, default model, agent prompt paths, etc.).
+   Most users only need the three required tokens above plus
+   `CLOD_BOT_AGENTS_PATH`.
+
 ### Bot Usage
 
-Mention the bot with agent name and instructions:
+The bot recognizes a small command grammar in mentions. Everything to the left
+of the colon is structural; everything to the right is free-form instructions
+sent to the agent.
+
+#### Starting a task
+
+| Form | Meaning |
+| --- | --- |
+| `@bot <task>: <instructions>` | Run an existing task in `<AgentsPath>/<task>/`. If the directory has no `.clod/` yet, the bot opens an init dialog before starting. |
+| `@bot <template>:: <instructions>` | Auto-name a new task and copy `<template>` as the starting point. Skips the init dialog. |
+| `@bot :: <instructions>` | Auto-name a new task. The bot opens a two-step init dialog (template picker → custom detail) before starting. |
+| `@bot *: <instructions>` | Run inside the agents base dir itself rather than a subdirectory. Filesync and plan mode default off. |
+| `@bot !: <instructions>` | "Host-direct" mode — runs `claude` directly on the host without the docker sandbox. The bot prompts for confirmation first. Sticky for the life of the thread. |
+
+Task names are restricted to `[a-zA-Z0-9_-]` (max 64 chars). The `::` form
+disambiguates template-based auto-naming from `<task>:` because task names
+can't contain whitespace.
+
+Example:
 
 ```
 @clod-bot services: Follow the instructions in TASK-deprecations.md
 ```
 
-Assuming an agent directory like:
+with an agent directory like:
 
 ```
 services/
+├── .clod/
 └── TASK-deprecations.md
 ```
 
-The bot will start a session with `clod` in the `services` directory and give
-it the initial prompt `Follow the instructions in TASK-deprecations.md`.
-
-Reply in threads to continue sessions:
+starts a `clod` session in `services/` with the initial prompt `Follow the
+instructions in TASK-deprecations.md`. Reply in the thread to continue:
 
 ```
 Find the users that will be impacted by the deprecations.
 ```
 
-**Joining existing conversations**: When you use a proper bot command (`@bot task_name: instructions`) in an existing thread that wasn't started by a bot mention, the bot will automatically gather all previous messages in the thread and use them as context. This allows you to bring the bot into ongoing discussions seamlessly.
+#### Per-thread commands
 
-**Note**: The bot only responds to the proper command format (`@bot task_name: instructions`). Casual mentions without the command format in new threads will be ignored to avoid interrupting unrelated conversations.
+These commands run against the active session for the thread you send them in.
+They must be sent as `@bot <command>` so they reach the command router rather
+than the running agent:
+
+| Command | Effect |
+| --- | --- |
+| `@bot close` | Stop the running task and close the session. Auto-resume on bot restart is disabled until you @-mention again. |
+| `@bot upload <path>` | Upload a host-side file (or directory, with a recursive-vs-top-level prompt) into the thread. Many files get zipped to /tmp first, with a confirmation prompt for archives over 100 MB. |
+| `@bot allow @user` / `@bot disallow @user` | Manage the per-thread allowlist (in addition to the bot-wide allowlist). |
+| `@bot set model=<value>` | Switch model. Accepts families (`opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`), specific point releases (`claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, …), and 1M-context variants (`opus[1m]`, `sonnet[1m]`). `+` / `-` cycle, or react with 🎼 / 📜 / 🌸. While a task is running, the bot cancels and resumes with the new model. |
+| `@bot set effort=<value>` | Set how long claude thinks per turn (`low`, `medium`, `high`, `xhigh`, `max`). `+` / `-` step; `clear` removes the override. |
+| `@bot set verbosity=<value>` | `0` = summary (default), `1` = full, `-1` = silent. Or react with 🙈 / 💬. |
+| `@bot set plan=<on/off>` | Toggle plan mode. `+` / `-` / 💭 also work. |
+| `@bot set filesync=<on/off>` | Toggle the task-dir → Slack file watcher for this thread. |
+
+#### Joining existing conversations
+
+When you use a start command (`@bot <task>: instructions`) inside an existing
+thread that wasn't started by the bot, the bot collects the prior messages in
+the thread and includes them as context in the initial prompt — so you can
+bring it into ongoing discussions without recapping.
+
+#### Slack references
+
+Paste a Slack permalink (channel link or thread link) into a message and the
+bot will expand the referenced thread and include it in the prompt:
+
+- Public channels the bot isn't in: it auto-joins and posts a notice
+- Private channels: invite the bot first with `/invite @<bot>`
+- Large or private references trigger a confirmation dialog (Include inline,
+  Save as asset, Skip, Cancel)
+
+#### DMs with the bot
+
+Top-level DMs need an explicit prefix (`*:`, `!:`, `::`, `<template>::`, or
+`<task>:`) — the @-mention is implicit. Inside an active session's thread,
+just type to send input to the running task. Bot commands (`close`, `set …`,
+`allow @user`) inside a thread still need an explicit `<@bot> <command>`.
+
+#### Per-task agent prompt
+
+Each task's `README.md` (configurable) is appended to claude's system prompt
+as `AGENT.md` on every run — edit it to give the agent persistent task
+context. A workspace-wide `AGENTS.md` at the agents base dir applies to
+every task; task-specific guidance overrides workspace-wide on conflict.
 
 ## Sharing Configurations
 
@@ -693,18 +767,35 @@ contains no credentials or hard-coded paths.
 
 ### Bot Configuration
 
-All bot-specific configuration uses the `CLOD_BOT_` prefix:
+All bot-specific configuration uses the `CLOD_BOT_` prefix.
 
-- `CLOD_BOT_AGENTS_PATH` - Base path to search for agent directories (default: `.`)
-- `CLOD_BOT_AGENTS_PROMPT_PATH` - Path to agent prompt file relative to task directory (default: `README.md`). The file is copied to the runtime directory and Claude is instructed to read it. Set to empty string to disable.
-- `CLOD_BOT_ALLOWED_USERS` - Comma-separated list of allowed Slack user IDs
-- `CLOD_BOT_SESSION_STORE_PATH` - Path to session store JSON file (default: `sessions.json`)
-- `CLOD_BOT_TIMEOUT` - Timeout for clod execution (default: `30m`)
-- `CLOD_BOT_PERMISSION_MODE` - Claude permission mode: `default`, `acceptEdits`, or `bypassPermissions` (default: `default`)
-- `CLOD_BOT_VERBOSE_TOOLS` - Comma-separated list of tools affected by verbosity toggle (default: `Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode`)
-- `CLOD_BOT_GRACEFUL_SHUTDOWN_TTL` - Time to wait for graceful shutdown (default: `30s`)
-- `CLOD_BOT_LOG_LEVEL` - Logging level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
-- `CLOD_BOT_LOG_FORMAT` - Log format: `json` or `console` (default: `json`)
+**Slack credentials (required):**
+
+- `SLACK_BOT_TOKEN` — bot user OAuth token (`xoxb-…`)
+- `SLACK_APP_TOKEN` — app-level token for Socket Mode (`xapp-…`)
+- `CLOD_BOT_ALLOWED_USERS` — comma-separated list of Slack user IDs allowed to drive the bot
+
+**Workspace + agents:**
+
+- `CLOD_BOT_AGENTS_PATH` — base path the bot scans for tasks (default: `.`). Subdirectories with a `.clod/` are tasks; the base dir itself is also runnable via `@bot *:` / `@bot !:`.
+- `CLOD_BOT_AGENTS_PROMPT_PATH` — per-task agent prompt file (default: `README.md`, relative to each task dir or an absolute path). Copied into the runtime dir as `AGENT.md` and appended to claude's system prompt. Empty disables.
+- `CLOD_BOT_AGENTS_SHARED_PROMPT_PATH` — workspace-wide agent prompt file (default: `AGENTS.md`, relative to `CLOD_BOT_AGENTS_PATH` or absolute). Copied into every task alongside the per-task prompt. Empty disables.
+
+**Behavior + defaults:**
+
+- `CLOD_BOT_DEFAULT_MODEL` — default `claude --model` to use when a thread hasn't picked one (e.g. `opus`, `sonnet`, `claude-haiku-4-5`). Empty defers to claude's own default.
+- `CLOD_BOT_PERMISSION_MODE` — claude permission mode: `default`, `acceptEdits`, `plan`, or `bypassPermissions` (default: `bypassPermissions`, matching the recommendation for confined containerized environments).
+- `CLOD_BOT_VERBOSITY_LEVEL` — default verbosity: `-1` (silent), `0` (summary), `1` (full) (default: `0`).
+- `CLOD_BOT_VERBOSE_TOOLS` — tools affected by the verbosity toggle (default: `Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode`).
+- `CLOD_BOT_TIMEOUT` — per-invocation timeout for `clod` execution (default: `24h`).
+- `CLOD_BOT_RESUME_STALE_AFTER` — active sessions older than this on startup are treated as stale and not auto-resumed (default: `30m`). Set to `0` to disable auto-resume entirely.
+
+**Storage + lifecycle:**
+
+- `CLOD_BOT_SESSION_STORE_PATH` — path to the session JSON file (default: `sessions.json`). Per-user usage samples are stored in a sidecar `usage.json` next to it.
+- `CLOD_BOT_GRACEFUL_SHUTDOWN_TTL` — graceful shutdown window before forcing exit (default: `30s`). Send a second `SIGINT` / `SIGTERM` to force exit immediately.
+- `CLOD_BOT_LOG_LEVEL` — `trace` / `debug` / `info` / `warn` / `error` / `fatal` / `panic` (default: `info`).
+- `CLOD_BOT_LOG_FORMAT` — `json` or `console` (default: `json`).
 
 ### Example: Force Reinit
 
