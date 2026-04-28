@@ -168,8 +168,11 @@ agent_directory/
 │   └── runtime-{suffix}/               # Runtime files (per instance)
 │       ├── permission_request.fifo     # Permission requests → bot
 │       ├── permission_response.fifo    # Permission responses → Claude
-│       ├── permission_mcp.py           # MCP permission server
-│       └── mcp_config.json             # MCP server configuration
+│       ├── permbridge                  # Static linux/amd64 MCP bridge (embedded in bot)
+│       ├── mcp_config.json             # MCP server configuration
+│       ├── AGENT.md                    # Per-task system-prompt addendum (copied from task README)
+│       ├── AGENTS.md                   # Workspace-wide system-prompt addendum (optional)
+│       └── direct-home/                # HOME redirect for `@bot !:` host-direct sessions
 │
 ├── [project files]                     # Your working directory
 │   ├── src/
@@ -254,14 +257,18 @@ Slack User
               ▼
 ┌─────────────────────────────────────────┐
 │  Runner: Start Task                     │
-│  1. Create .clod-runtime/               │
+│  1. Create .clod/runtime-{suffix}/      │
 │  2. Create permission FIFOs             │
 │  3. Generate mcp_config.json            │
-│  4. Copy permission_mcp.py              │
-│  5. Execute: cd task_path &&            │
-│     .clod/system/run --output-format    │
-│     stream-json --prompt "..."          │
-│     --mcp-config ...                    │
+│  4. Write embedded permbridge binary    │
+│  5. Copy AGENT.md / AGENTS.md prompts   │
+│  6. Execute: cd task_path &&            │
+│     clod --output-format stream-json    │
+│     --input-format stream-json          │
+│     --append-system-prompt ...          │
+│     --permission-prompt-tool ...        │
+│     (or claude directly when            │
+│      UseClaudeDirect is set)            │
 └─────────────┬───────────────────────────┘
               │
               ▼
@@ -314,9 +321,14 @@ Claude (in container)
     │  (e.g., Bash command)
     ▼
 ┌──────────────────────────────────┐
-│  MCP Server (permission_mcp.py)  │
-│  Tool: request_permission        │
-│  Args: {tool, args, description} │
+│  MCP Bridge (permbridge, Go)     │
+│  Static linux/amd64 binary,      │
+│  embedded into the bot via       │
+│  go:embed and written into the   │
+│  per-task runtime dir at start.  │
+│  Speaks JSON-RPC MCP on stdio,   │
+│  forwards request_permission to  │
+│  the bot over the FIFO pair.     │
 └────────┬─────────────────────────┘
          │
          │  Write JSON to
@@ -357,9 +369,10 @@ Claude (in container)
          │  permission_response.fifo
          ▼
 ┌──────────────────────────────────┐
-│  MCP Server                      │
+│  permbridge                      │
 │  - Read response from FIFO       │
-│  - Return to Claude              │
+│  - Return to Claude as MCP       │
+│    tool result                   │
 └────────┬─────────────────────────┘
          │
          │  {allowed: true/false}
@@ -440,17 +453,32 @@ Slack User
 - Initialize all components
 - Start bot server
 
-**Configuration**:
+**Configuration** (full struct lives in `bot/cli.go`):
 
 ```go
-type CLI struct {
-    SlackBotToken   string
-    SlackAppToken   string
-    AllowedUsers    []string
-    AgentsPath      string
-    SessionStore    string
-    PermissionMode  string
-    ClodTimeout     time.Duration
+type Flags struct {
+    Log struct {
+        Level  zerolog.Level // trace/debug/info/warn/error/fatal/panic
+        Format string        // json or console
+    }
+
+    SlackBotToken string // xoxb-…
+    SlackAppToken string // xapp-…
+    AllowedUsers  []string
+
+    SessionStorePath string // sessions.json + sidecar usage.json
+
+    AgentsPath             string // base dir scanned for tasks
+    AgentsPromptPath       string // per-task prompt (default README.md → AGENT.md)
+    AgentsSharedPromptPath string // workspace-wide prompt (default AGENTS.md)
+
+    ClodTimeout         time.Duration // per-invocation; default 24h
+    PermissionMode      string        // default: bypassPermissions
+    VerboseTools        []string      // tools the verbosity toggle gates
+    VerbosityLevel      int           // -1 silent / 0 summary / 1 full
+    DefaultModel        string        // claude --model fallback when thread has none
+    GracefulShutdownTTL time.Duration // default 30s
+    ResumeStaleAfter    time.Duration // default 30m; 0 disables auto-resume
 }
 ```
 
@@ -462,9 +490,11 @@ type CLI struct {
 
 **Event Handlers**:
 
-- `app_mention`: Initial task requests
-- `message`: Thread continuations
-- `interactive`: Permission buttons
+- `app_mention`: parses commands and starts tasks
+- `message` (channels / groups / im / mpim): thread continuations, DM dispatch, slack-permalink expansion, file-attachment ingestion
+- `app_home_opened`: renders the Home tab (per-user recent sessions + workspace usage rollup + help reference)
+- `block_actions` / `view_submission`: interactive buttons and modal callbacks (permission prompts, init dialogs, upload confirmations, model picker, slackref expansion choice, large-zip / dangerous-mode confirmation, home-tab refresh)
+- `reaction_added` / `reaction_removed`: emoji-driven controls on the anchor message (model picker, plan toggle, verbosity)
 - Connection lifecycle events
 
 #### Handler Layer (handlers.go)
@@ -520,7 +550,7 @@ type RunningTask interface {
 - JSON persistence
 - Atomic file writes
 
-**Session Mapping**:
+**Session Mapping** (full struct lives in `bot/session.go`):
 
 ```go
 type SessionMapping struct {
@@ -530,11 +560,42 @@ type SessionMapping struct {
     TaskPath  string
     SessionID string
     UserID    string
-    VerbosityLevel int       // Per-thread verbosity: -1 (silent), 0 (summary), 1 (full)
-    CreatedAt      time.Time
-    UpdatedAt      time.Time
+
+    // Per-thread settings (also see `@bot set …` commands)
+    VerbosityLevel    int    // -1 silent / 0 summary / 1 full
+    Model             string // "" = bot default; family or specific release
+    PermissionMode    string // "" = bot default; "plan" enables plan mode
+    FileSyncDisabled  bool   // toggle for the task-dir → Slack file watcher
+    UseClaudeDirect   bool   // run claude on the host instead of via clod
+    ExtraAllowedUsers []string
+
+    // Liveness + resume
+    Active           bool   // true while runClod is executing; cleared on clean exit
+    ReactionAnchorTS string // user's @-mention TS — anchor for status reactions
+
+    // Reactions the bot has placed on the anchor (so we can remove them later;
+    // Slack reactions are per-user)
+    ModelReactionEmoji string
+    MonitorCountEmoji  string
+
+    // Background watchers spawned by the agent's Monitor tool
+    ActiveMonitors []string
+
+    // Lifetime totals across resumes (claude's per-result stats only cover
+    // the current process, so we accumulate here)
+    CumulativeCostUSD float64
+    CumulativeTurns   int
+
+    CreatedAt time.Time
+    UpdatedAt time.Time // bumped on every heartbeat / mutation
 }
 ```
+
+`SessionStore` keeps a map keyed by `channelID:threadTS`. The store also
+tracks per-result usage samples (user, cost USD, turns, timestamp) in a
+sidecar `usage.json` file — used by the Home tab to render workspace-wide
+rollups over rolling 24h / 7d / 30d / 90d / 365d windows. Samples older
+than 365 days are pruned at append time.
 
 #### File Handler (files.go)
 
@@ -558,10 +619,115 @@ type SessionMapping struct {
 
 **Components**:
 
-1. **MCP Server** (permission_mcp.py): Python script implementing MCP protocol
-2. **FIFO Pipes**: Named pipes for IPC
-3. **Pattern Matching** (permission.go): Rule evaluation
-4. **Persistence**: Save rules to claude.json
+1. **MCP Bridge** (`bot/permbridge`): a small Go program that speaks JSON-RPC
+   MCP on stdio and advertises a single `request_permission` tool. Built
+   statically as a `linux/amd64` binary and embedded into the bot via
+   `go:embed`; the bot writes the bytes into the per-task runtime dir at
+   startup and points claude's `--permission-prompt-tool` at that path.
+   Replaces an earlier Python implementation so user task images don't have
+   to carry a python3 interpreter just to make the permission system work.
+2. **FIFO Pipes** (`permission_request.fifo` / `permission_response.fifo`):
+   the runtime dir is bind-mounted into the container, so both sides see
+   the same paths. permbridge writes requests and reads responses; the bot
+   does the inverse.
+3. **Pattern Matching** (`permission.go`): rule evaluation for "Allow
+   similar" decisions (`Tool(arg:*)`, `Tool(path/**)`, etc.).
+4. **Persistence**: approved patterns are saved to both `allowedTools` and
+   `permissions.allow` in `.clod/claude/claude.json` so claude reapplies
+   them on resume.
+
+### 4. Command Grammar (parser.go)
+
+The bot recognizes a small grammar in mentions:
+
+| Form | Result |
+| --- | --- |
+| `<@bot> <task>: <text>` | Run an existing task at `<AgentsPath>/<task>/`; opens an init dialog if `.clod/` is missing. |
+| `<@bot> <template>:: <text>` | Auto-name a new task and copy `<template>` as the seed. Skips the dialog. |
+| `<@bot> :: <text>` | Auto-name a new task; pick template / Custom in a two-step modal. |
+| `<@bot> *: <text>` | Run inside the agents base dir itself (no per-task subdir). |
+| `<@bot> !: <text>` | Host-direct mode — run `claude` on the host without docker. Confirmation required. |
+| `<@bot> close` / `set …` / `allow @u` / `disallow @u` / `upload <path>` | Per-thread commands that route to the command handler instead of the running agent. |
+
+Task names are restricted to `[a-zA-Z0-9_-]` (max 64 chars). Because they
+can't contain whitespace, `<template>::` and `<task>:` are unambiguous.
+
+DMs follow the same grammar with one exception: top-level DMs require the
+explicit prefix (the `@bot` mention is implicit). Inside an active session's
+thread, plain text is forwarded as input to the running task; bot commands
+inside a thread still need an explicit `<@bot>` mention to reach the
+command router.
+
+### 5. Home Tab (hometab.go)
+
+On `app_home_opened` the bot renders:
+
+- **Personal section** — sessions owned by the viewer that have been touched
+  in the last 7 days. Each row shows the task name as a link to the anchor
+  message (the user's @-mention), an active/idle status pip, lifetime turns
+  + cost, and "updated N ago". A `[latest →]` link jumps to the most recent
+  bot post in the thread when that's distinct from the anchor.
+- **Workspace section** (allowlisted users only) — per-user usage rollups
+  over rolling 24h / 7d / 30d / 90d / 365d windows, sorted by 30-day cost.
+- **Help reference** — the same `buildHomeHelpBlocks` content the help
+  modal uses; serves as a discoverability surface for the command grammar.
+- **Refresh button** — re-renders the view in place.
+
+### 6. Slack-reference expansion (slackref.go)
+
+When the user pastes a Slack permalink (channel link or thread link) into a
+message, the bot detects it, fetches the referenced thread, and includes it
+in the prompt. For public channels the bot isn't already a member of, it
+auto-joins via `channels:join` and posts a notice in the active thread.
+Private channels require an explicit `/invite @bot`. Large or private
+references trigger a confirmation modal (Include inline, Save as asset,
+Skip, Cancel).
+
+### 7. Upload command (upload.go)
+
+`@bot upload <path>` pushes host-side files into the active thread:
+
+- Single file → uploaded directly.
+- Directory → recursive-vs-top-level prompt.
+- Many files / large totals → zipped to `/tmp` first, with progress posted
+  back to Slack as the zip is built.
+- Archives over 100 MB → confirmation modal before transfer.
+- During upload → a progressReader streams byte counts back so users see
+  movement on long transfers.
+
+### 8. Layered agent prompts (runner.go)
+
+On every clod invocation the runner copies up to two prompt files into the
+runtime dir and appends them to claude's system prompt via
+`--append-system-prompt`:
+
+- `AGENT.md` — taken from `<task>/<CLOD_BOT_AGENTS_PROMPT_PATH>` (default
+  `README.md`). Per-task guidance.
+- `AGENTS.md` — taken from `<AgentsPath>/<CLOD_BOT_AGENTS_SHARED_PROMPT_PATH>`
+  (default `AGENTS.md`). Workspace-wide guidance applied to every task.
+
+Either or both may be missing on disk; missing files are silently skipped.
+Task-specific guidance takes precedence over workspace-wide on conflict.
+
+### 9. Host-direct mode
+
+`@bot !: …` (and reaffirm-confirmation flow) flips `UseClaudeDirect` on the
+session. In that mode the runner spawns `claude` on the host instead of via
+`clod`'s docker wrapper. To keep the host config isolated, HOME is
+redirected to the per-task `.clod/direct-home/` so claude's own state files
+land under the task dir rather than in the operator's `~/.claude*`. The
+flag is sticky for the life of the session so resumes keep the same
+execution mode.
+
+### 10. Auto-restart on `set model` / `set effort`
+
+Mid-session changes to `model` or `effortLevel` aren't applied by claude
+once the stream-json process has started. When a `set model=…` or
+`set effort=…` lands while a task is running, the bot writes the new value
+to both `sessions.json` and the per-task `.clod/claude/settings.json`,
+records the cancel as expected (so the synthesized "task cancelled"
+message is suppressed), cancels the running task, and immediately resumes
+with the new `--model` / effort applied.
 
 **Permission Patterns**:
 
@@ -663,7 +829,7 @@ Tool Execution (if approved)
 
 ### Environment Variables
 
-**Bot Configuration**:
+**Bot Configuration** (full descriptions in README.md):
 
 ```bash
 # Required
@@ -671,19 +837,29 @@ SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 CLOD_BOT_ALLOWED_USERS=U123,U456,U789
 
-# Optional - Bot Configuration (CLOD_BOT_* prefix)
-CLOD_BOT_AGENTS_PATH=/path/to/agents       # Default: .
-CLOD_BOT_SESSION_STORE_PATH=./sessions.json
-CLOD_BOT_PERMISSION_MODE=default           # default|acceptEdits|bypassPermissions
-CLOD_BOT_TIMEOUT=30m                       # Default: 30 minutes
-CLOD_BOT_LOG_LEVEL=info                    # trace|debug|info|warn|error
-CLOD_BOT_LOG_FORMAT=console                # json|console
-CLOD_BOT_VERBOSE_TOOLS=Read,Glob,...       # Tools affected by verbosity
-CLOD_BOT_GRACEFUL_SHUTDOWN_TTL=30s         # Graceful shutdown timeout
+# Optional - workspace + agents
+CLOD_BOT_AGENTS_PATH=/path/to/agents              # Default: .
+CLOD_BOT_AGENTS_PROMPT_PATH=README.md             # Per-task agent prompt → AGENT.md
+CLOD_BOT_AGENTS_SHARED_PROMPT_PATH=AGENTS.md      # Workspace-wide → AGENTS.md
 
-# Optional - CLI Configuration (CLOD_* prefix)
-CLOD_CONCURRENT=false                      # Enable concurrent clod instances (default: false)
+# Optional - behavior + defaults
+CLOD_BOT_DEFAULT_MODEL=                            # e.g. opus, claude-haiku-4-5
+CLOD_BOT_PERMISSION_MODE=bypassPermissions         # default|acceptEdits|plan|bypassPermissions
+CLOD_BOT_VERBOSITY_LEVEL=0                         # -1 silent / 0 summary / 1 full
+CLOD_BOT_VERBOSE_TOOLS=Read,Glob,Grep,...          # Tools the verbosity toggle gates
+CLOD_BOT_TIMEOUT=24h                               # Per-invocation timeout
+CLOD_BOT_RESUME_STALE_AFTER=30m                    # 0 disables auto-resume
+
+# Optional - storage + lifecycle
+CLOD_BOT_SESSION_STORE_PATH=./sessions.json        # Sidecar usage.json next to it
+CLOD_BOT_GRACEFUL_SHUTDOWN_TTL=30s
+CLOD_BOT_LOG_LEVEL=info                            # trace|debug|info|warn|error|fatal|panic
+CLOD_BOT_LOG_FORMAT=json                           # json|console
 ```
+
+The bot always launches `clod` in concurrent mode so each session gets its
+own runtime dir and the permission FIFOs don't collide. `CLOD_CONCURRENT` is
+no longer a user-facing toggle.
 
 ### Claude Configuration (claude.json)
 
@@ -710,9 +886,10 @@ CLOD_CONCURRENT=false                      # Enable concurrent clod instances (d
 
 ### MCP Configuration (mcp_config.json)
 
-**Location**: `.clod-runtime/mcp_config.json`
+**Location**: `.clod/runtime-{suffix}/mcp_config.json`
 
-**Generated by**: Runner at task start
+**Generated by**: Runner at task start. The runtime dir is bind-mounted into
+the container, so the in-container path matches the host path.
 
 **Structure**:
 
@@ -720,16 +897,15 @@ CLOD_CONCURRENT=false                      # Enable concurrent clod instances (d
 {
   "mcpServers": {
     "permission": {
-      "command": "python3",
-      "args": [
-        "/abs/path/to/.clod-runtime/permission_mcp.py",
-        "/abs/path/to/.clod-runtime/permission_request.fifo",
-        "/abs/path/to/.clod-runtime/permission_response.fifo"
-      ]
+      "command": "/abs/path/to/.clod/runtime-{suffix}/permbridge",
+      "args": []
     }
   }
 }
 ```
+
+`permbridge` reads `CLOD_RUNTIME_DIR` from its environment and looks for
+`permission_request.fifo` / `permission_response.fifo` inside it.
 
 ---
 
@@ -815,8 +991,11 @@ func formatToolOutput(tool string, output interface{}) string {
   - `creack/pty`: Pseudo-terminal for subprocess I/O
   - `gomarkdown/markdown`: Markdown processing
 - **Concurrency**: Goroutines for I/O streaming
-- **IPC**: FIFO named pipes
-- **Persistence**: JSON files
+- **IPC**: FIFO named pipes (host ↔ container) + a static `permbridge`
+  Go binary embedded into the bot via `go:embed` and written into each
+  per-task runtime dir
+- **Persistence**: JSON files (`sessions.json` for per-thread state,
+  sidecar `usage.json` for per-result usage samples)
 
 ### Integration Layer
 

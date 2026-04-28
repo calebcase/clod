@@ -29,7 +29,8 @@ const startMsgTemplate = ":rocket: Starting a `%s` task...\n\n" +
 	"field      | values                             | notes\n" +
 	"-----------+------------------------------------+--------------------------------\n" +
 	"verbosity  | +/- or 0/1/-1 (or 💬 / 🙈)         | 🙈 silent · summary · 💬 full\n" +
-	"model      | opus|sonnet|haiku (+/- cycles)     | 🎼 · 📜 · 🌸\n" +
+	"model      | opus|sonnet|haiku (+/- cycles)     | 🎼 · 📜 · 🌸 · point releases ok\n" +
+	"effort     | low|medium|high|xhigh|max (+/-)    | clear → model default\n" +
 	"plan       | on|off (or +/-)                    | 💭 on by default\n" +
 	"filesync   | on|off                             | sync project dir (non-recursive)\n" +
 	"```"
