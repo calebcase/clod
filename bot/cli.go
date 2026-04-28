@@ -12,7 +12,7 @@ import (
 )
 
 // Version is the bot version. Update this when releasing.
-const Version = "0.30.0"
+const Version = "0.31.0"
 
 type Flags struct {
 	Log struct {
@@ -27,11 +27,11 @@ type Flags struct {
 
 	SessionStorePath string `kong:"default='sessions.json',env='CLOD_BOT_SESSION_STORE_PATH',help='Path to session store JSON file'"`
 
-	AgentsPath string `kong:"default='.',env='CLOD_BOT_AGENTS_PATH',help='Base path to search for agent directories'"`
+	WorkspacePath string `kong:"default='.',env='CLOD_BOT_WORKSPACE_PATH',help='Base path to search for domain directories. Each subdirectory is a domain of work; the workspace is the dir itself.'"`
 
-	AgentsPromptPath string `kong:"default='README.md',env='CLOD_BOT_AGENTS_PROMPT_PATH',help='Path to per-task agent prompt file (relative to task dir or absolute). Empty disables.'"`
+	DomainReadme string `kong:"default='README.md',env='CLOD_BOT_DOMAIN_README',help='Path to per-domain README, relative to the domain dir or absolute. Inlined into the system prompt as domain-specific guidance. Empty disables.'"`
 
-	AgentsSharedPromptPath string `kong:"default='AGENTS.md',env='CLOD_BOT_AGENTS_SHARED_PROMPT_PATH',help='Path to workspace-wide agent prompt file (relative to the agents base dir or absolute). Copied into every task alongside the per-task prompt. Empty disables.'"`
+	WorkspaceReadme string `kong:"default='README.md',env='CLOD_BOT_WORKSPACE_README',help='Path to the workspace-root README, relative to the workspace dir (CLOD_BOT_WORKSPACE_PATH) or absolute. Inlined into the system prompt as workspace-wide guidance shared across every domain. Empty disables.'"`
 
 	ClodTimeout time.Duration `kong:"default='24h',env='CLOD_BOT_TIMEOUT',help='Timeout for clod execution'"`
 
@@ -55,7 +55,7 @@ type CLI struct {
 func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	logger.Info().
 		Str("version", Version).
-		Str("agents_path", cli.AgentsPath).
+		Str("workspace_path", cli.WorkspacePath).
 		Str("session_store", cli.SessionStorePath).
 		Int("allowed_users", len(cli.AllowedUsers)).
 		Msg("starting clod slack bot")
@@ -63,13 +63,13 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	// Initialize components
 	auth := NewAuthorizer(cli.AllowedUsers)
 
-	tasks, err := NewTaskRegistry(cli.AgentsPath)
+	domains, err := NewDomainRegistry(cli.WorkspacePath)
 	if err != nil {
 		return err
 	}
 
-	taskNames := tasks.List()
-	logger.Info().Strs("tasks", taskNames).Msg("discovered tasks")
+	domainNames := domains.List()
+	logger.Info().Strs("domains", domainNames).Msg("discovered domains")
 
 	sessions, err := NewSessionStore(cli.SessionStorePath, cli.VerbosityLevel, logger)
 	if err != nil {
@@ -80,21 +80,21 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		Str("path", cli.SessionStorePath).
 		Msg("loaded sessions from storage")
 
-	// Resolve the shared prompt path relative to the agents base
-	// dir when it isn't already absolute, so `AGENTS.md` (the
-	// default) lands at `<AgentsPath>/AGENTS.md`.
-	sharedPromptPath := cli.AgentsSharedPromptPath
-	if sharedPromptPath != "" && !filepath.IsAbs(sharedPromptPath) && cli.AgentsPath != "" {
-		sharedPromptPath = filepath.Join(cli.AgentsPath, sharedPromptPath)
+	// Resolve the workspace README path relative to the workspace
+	// dir when it isn't already absolute, so the default
+	// `README.md` lands at `<WorkspacePath>/README.md`.
+	workspaceReadmePath := cli.WorkspaceReadme
+	if workspaceReadmePath != "" && !filepath.IsAbs(workspaceReadmePath) && cli.WorkspacePath != "" {
+		workspaceReadmePath = filepath.Join(cli.WorkspacePath, workspaceReadmePath)
 	}
-	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, cli.AgentsPromptPath, sharedPromptPath, logger)
+	runner := NewRunner(cli.ClodTimeout, cli.PermissionMode, cli.DomainReadme, workspaceReadmePath, logger)
 
 	// Create and start the bot
 	bot, err := NewBot(
 		cli.SlackBotToken,
 		cli.SlackAppToken,
 		auth,
-		tasks,
+		domains,
 		sessions,
 		runner,
 		cli.VerboseTools,

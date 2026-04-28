@@ -63,9 +63,9 @@ task execution.
 │                   │                      │  ┌─────────────▼───────────────┐ ││
 │                   │                      │  │  Supporting Components      │ ││
 │                   │                      │  │  ┌─────────────────────┐    │ ││
-│                   │                      │  │  │ TaskRegistry        │    │ ││
-│                   │                      │  │  │ (tasks.go)          │    │ ││
-│                   │                      │  │  │ - Discover agents   │    │ ││
+│                   │                      │  │  │ DomainRegistry      │    │ ││
+│                   │                      │  │  │ (domains.go)        │    │ ││
+│                   │                      │  │  │ - Discover domains  │    │ ││
 │                   │                      │  │  └─────────────────────┘    │ ││
 │                   │                      │  │  ┌─────────────────────┐    │ ││
 │                   │                      │  │  │ SessionStore        │    │ ││
@@ -170,8 +170,7 @@ agent_directory/
 │       ├── permission_response.fifo    # Permission responses → Claude
 │       ├── permbridge                  # Static linux/amd64 MCP bridge (embedded in bot)
 │       ├── mcp_config.json             # MCP server configuration
-│       ├── AGENT.md                    # Per-task system-prompt addendum (copied from task README)
-│       ├── AGENTS.md                   # Workspace-wide system-prompt addendum (optional)
+│       ├── CONTEXT.md                  # Combined onboarding (workspace + domain READMEs)
 │       └── direct-home/                # HOME redirect for `@bot !:` host-direct sessions
 │
 ├── [project files]                     # Your working directory
@@ -261,7 +260,8 @@ Slack User
 │  2. Create permission FIFOs             │
 │  3. Generate mcp_config.json            │
 │  4. Write embedded permbridge binary    │
-│  5. Copy AGENT.md / AGENTS.md prompts   │
+│  5. Build CONTEXT.md (workspace +       │
+│     domain READMEs concatenated)        │
 │  6. Execute: cd task_path &&            │
 │     clod --output-format stream-json    │
 │     --input-format stream-json          │
@@ -468,9 +468,9 @@ type Flags struct {
 
     SessionStorePath string // sessions.json + sidecar usage.json
 
-    AgentsPath             string // base dir scanned for tasks
-    AgentsPromptPath       string // per-task prompt (default README.md → AGENT.md)
-    AgentsSharedPromptPath string // workspace-wide prompt (default AGENTS.md)
+    WorkspacePath     string // workspace dir scanned for domains
+    DomainReadme    string // per-domain README (default README.md inside the domain dir)
+    WorkspaceReadme string // workspace-root README (default README.md at the workspace root)
 
     ClodTimeout         time.Duration // per-invocation; default 24h
     PermissionMode      string        // default: bypassPermissions
@@ -529,18 +529,18 @@ type RunningTask interface {
 }
 ```
 
-#### Task Registry (tasks.go)
+#### Domain Registry (domains.go)
 
-- Discover agent directories
-- Validate .clod presence
-- Map task names to paths
+- Discover domain directories under the workspace
+- Validate `.clod/` presence
+- Map domain names to absolute paths
 
 **Discovery Logic**:
 
 ```go
-// Scans AGENTS_PATH for:
-// - Directories with .clod/ subdirectory
-// - Containing executable .clod/system/run script
+// Scans CLOD_BOT_WORKSPACE_PATH for:
+// - Subdirectories with a .clod/ subdirectory
+// - Containing an executable .clod/system/run script
 // Maps: lowercase(dirname) → absolute path
 ```
 
@@ -642,10 +642,10 @@ The bot recognizes a small grammar in mentions:
 
 | Form | Result |
 | --- | --- |
-| `<@bot> <task>: <text>` | Run an existing task at `<AgentsPath>/<task>/`; opens an init dialog if `.clod/` is missing. |
+| `<@bot> <domain>: <text>` | Start a task in an existing domain at `<WorkspacePath>/<domain>/`; opens an init dialog if `.clod/` is missing. |
 | `<@bot> <template>:: <text>` | Auto-name a new task and copy `<template>` as the seed. Skips the dialog. |
 | `<@bot> :: <text>` | Auto-name a new task; pick template / Custom in a two-step modal. |
-| `<@bot> *: <text>` | Run inside the agents base dir itself (no per-task subdir). |
+| `<@bot> *: <text>` | Run inside the workspace root itself (no per-domain subdir). |
 | `<@bot> !: <text>` | Host-direct mode — run `claude` on the host without docker. Confirmation required. |
 | `<@bot> close` / `set …` / `allow @u` / `disallow @u` / `upload <path>` | Per-thread commands that route to the command handler instead of the running agent. |
 
@@ -695,19 +695,30 @@ Skip, Cancel).
 - During upload → a progressReader streams byte counts back so users see
   movement on long transfers.
 
-### 8. Layered agent prompts (runner.go)
+### 8. Onboarding context (runner.go + permission.go)
 
-On every clod invocation the runner copies up to two prompt files into the
-runtime dir and appends them to claude's system prompt via
-`--append-system-prompt`:
+On every clod invocation the runner builds a single combined `CONTEXT.md`
+in the runtime dir containing the available workspace + domain READMEs,
+then passes it to claude via `--append-system-prompt-file`:
 
-- `AGENT.md` — taken from `<task>/<CLOD_BOT_AGENTS_PROMPT_PATH>` (default
-  `README.md`). Per-task guidance.
-- `AGENTS.md` — taken from `<AgentsPath>/<CLOD_BOT_AGENTS_SHARED_PROMPT_PATH>`
-  (default `AGENTS.md`). Workspace-wide guidance applied to every task.
+- `# Workspace context` — from `<WorkspacePath>/<CLOD_BOT_WORKSPACE_README>`
+  (default `README.md` at the workspace root). Shared across every domain.
+- `# Domain: <name>` — from `<domain>/<CLOD_BOT_DOMAIN_README>` (default
+  `README.md` inside the domain). Domain-specific guidance.
 
-Either or both may be missing on disk; missing files are silently skipped.
-Task-specific guidance takes precedence over workspace-wide on conflict.
+Either or both source files may be missing on disk; missing sections are
+silently skipped. The workspace section is emitted first so the
+domain-specific section appears last and can override on conflict.
+
+The file form (`--append-system-prompt-file`) sidesteps the OS argv
+length cap that long inline `--append-system-prompt` text would hit. The
+runtime dir is bind-mounted into the container, so the path the bot
+writes is the path claude opens. When neither README is present, no file
+is written and the flag is omitted.
+
+The intent is that a workspace's README files double as onboarding docs
+— the same content that orients a new teammate in a domain is the
+content the LLM gets as system prompt.
 
 ### 9. Host-direct mode
 
@@ -837,10 +848,10 @@ SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 CLOD_BOT_ALLOWED_USERS=U123,U456,U789
 
-# Optional - workspace + agents
-CLOD_BOT_AGENTS_PATH=/path/to/agents              # Default: .
-CLOD_BOT_AGENTS_PROMPT_PATH=README.md             # Per-task agent prompt → AGENT.md
-CLOD_BOT_AGENTS_SHARED_PROMPT_PATH=AGENTS.md      # Workspace-wide → AGENTS.md
+# Optional - workspace + domains
+CLOD_BOT_WORKSPACE_PATH=/path/to/workspace          # Default: .
+CLOD_BOT_DOMAIN_README=README.md                  # Per-domain onboarding README
+CLOD_BOT_WORKSPACE_README=README.md               # Workspace-root onboarding README
 
 # Optional - behavior + defaults
 CLOD_BOT_DEFAULT_MODEL=                            # e.g. opus, claude-haiku-4-5
@@ -1025,10 +1036,10 @@ clod                # Builds image and runs
 export SLACK_BOT_TOKEN=xoxb-...
 export SLACK_APP_TOKEN=xapp-...
 export CLOD_BOT_ALLOWED_USERS=U123,U456
-export CLOD_BOT_AGENTS_PATH=/path/to/agents
+export CLOD_BOT_WORKSPACE_PATH=/path/to/workspace
 
-cd /path/to/agents/my_task
-clod                # Initialize task
+cd /path/to/workspace/my_domain
+clod                # Initialize the domain
 
 cd /path/to/clod/bot
 go run . server     # Start bot

@@ -58,7 +58,7 @@ var autoNamePattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+::\s*(.+)`)
 var namedAutoPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})::\s*(.+)`)
 
 // rootMentionPattern matches `<@BOT> *: instructions` — the shorthand
-// for "run clod directly in the agents base directory" (rather than a
+// for "run clod directly in the workspace root" (rather than a
 // subdirectory task). The base dir itself is treated as the task; it
 // gets its own `.clod/` that clod initializes when missing.
 var rootMentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+\*:\s*(.+)`)
@@ -75,7 +75,7 @@ func ParseRootMention(text string) string {
 
 // dangerousRootMentionPattern matches `<@BOT> !: instructions` — the
 // shorthand for "run claude directly on the host, outside any docker
-// sandbox, in the agents base directory". The `!:` form is visually
+// sandbox, in the workspace root". The `!:` form is visually
 // distinct from `*:` to reinforce that the user is opting out of the
 // container isolation.
 var dangerousRootMentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+!:\s*(.+)`)

@@ -399,10 +399,10 @@ func allZero(totals []UsageTotals) bool {
 // thread messages elsewhere in the bot.
 func buildHomeHelpBlocks() []slack.Block {
 	starting := "*Starting tasks*\n" +
-		"• `@bot <task>: <instructions>` — run an existing task; opens an init dialog when the task dir doesn't have `.clod/` yet\n" +
-		"• `@bot <template>:: <instructions>` — auto-named task using `<template>` as the starting point (no dialog)\n" +
-		"• `@bot :: <instructions>` — auto-named task; pick a template or Custom setup in the two-step init dialog\n" +
-		"• `@bot *: <instructions>` — run in the agents base dir itself (no per-task subdirectory). Filesync and plan mode default off.\n" +
+		"• `@bot <domain>: <instructions>` — start a task in an existing domain; opens an init dialog when the domain dir doesn't have `.clod/` yet\n" +
+		"• `@bot <template>:: <instructions>` — start a task in a fresh auto-named domain seeded from `<template>` (no dialog)\n" +
+		"• `@bot :: <instructions>` — start a task in a fresh auto-named domain; pick a template or Custom setup in the two-step init dialog\n" +
+		"• `@bot *: <instructions>` — run in the workspace root itself (no per-domain subdirectory). Filesync and plan mode default off.\n" +
 		"• `@bot !: <instructions>` — run claude directly on the host (no docker sandbox; confirmation required)"
 
 	perThread := "*Per-thread commands* (any active session)\n" +
@@ -426,10 +426,10 @@ func buildHomeHelpBlocks() []slack.Block {
 		"• Private channels: invite the bot first with `/invite @<bot>` — no scope can grant private-channel access without an invite\n" +
 		"• Large or private references trigger a confirmation dialog before inclusion (Include inline, Save as asset, Skip, Cancel)"
 
-	prompts := "*Per-task agent prompt*\n" +
-		"• Each task's `README.md` is appended to claude's system prompt as `AGENT.md` on every run — edit it to give the agent persistent task context\n" +
-		"• A workspace-wide `AGENTS.md` at the agents base dir applies to every task. Task-specific guidance overrides workspace-wide on conflict.\n" +
-		"• File names are configurable via `CLOD_BOT_AGENTS_PROMPT_PATH` and `CLOD_BOT_AGENTS_SHARED_PROMPT_PATH`"
+	prompts := "*Onboarding context (READMEs)*\n" +
+		"• Each domain's `README.md` is inlined into claude's system prompt on every run — write it like onboarding docs for someone new to that domain (a junior engineer or an LLM should both succeed from it)\n" +
+		"• The workspace-root `README.md` (at `CLOD_BOT_WORKSPACE_PATH`) is shared across every domain. Domain-specific guidance overrides workspace-wide on conflict.\n" +
+		"• File names are configurable via `CLOD_BOT_DOMAIN_README` and `CLOD_BOT_WORKSPACE_README`"
 
 	mkSec := func(text string) slack.Block {
 		return slack.NewSectionBlock(

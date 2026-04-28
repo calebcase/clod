@@ -23,7 +23,7 @@ import (
 // fields / values / notes line up. Emojis in the "notes" column may
 // render slightly wider than a monospace glyph on some clients — that's
 // fine because nothing to their right depends on alignment.
-const startMsgTemplate = ":rocket: Starting a `%s` task...\n\n" +
+const startMsgTemplate = ":rocket: Starting work in the `%s` domain...\n\n" +
 	"_Settings are controlled with `@bot set FIELD=VALUE`:_\n" +
 	"```\n" +
 	"field      | values                             | notes\n" +
@@ -387,7 +387,7 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 	}
 
 	// `@bot !: <instructions>` — run claude DIRECTLY on the host
-	// (outside the clod/docker sandbox) in the agents base directory.
+	// (outside the clod/docker sandbox) in the workspace root.
 	// Checked before `*:` so the two syntaxes don't fight; the `!:`
 	// form posts a confirmation dialog first because the user is
 	// opting out of container isolation.
@@ -396,10 +396,10 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 		return
 	}
 
-	// `@bot *: <instructions>` — run clod directly in the agents base
-	// directory (treat the base itself as the task, not a subdir of it).
-	// Useful for cross-task work or setups where the base dir IS the
-	// project you want the agent working in.
+	// `@bot *: <instructions>` — run clod directly in the workspace root
+	// (treat the workspace itself as a domain, not a subdir of it).
+	// Useful for cross-domain work or setups where the workspace itself
+	// is the project being worked on.
 	if instructions := ParseRootMention(ev.Text); instructions != "" {
 		h.handleRootTask(ctx, ev, threadTS, instructions, logger)
 		return
@@ -420,10 +420,10 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 	// / ssh / model / packages; they can just click Create to take the
 	// defaults.
 	if instructions := ParseAutoNameMention(ev.Text); instructions != "" {
-		base := h.bot.tasks.BasePath()
+		base := h.bot.domains.BasePath()
 		if base == "" {
 			if _, err := h.bot.PostMessage(ev.Channel,
-				":warning: Couldn't generate a task name — `CLOD_BOT_AGENTS_PATH` isn't set.",
+				":warning: Couldn't generate a task name — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 				threadTS); err != nil {
 				logger.Debug().Err(err).Msg("failed to post auto-name error")
 			}
@@ -2166,7 +2166,7 @@ func (h *Handler) handleNewTask(
 	// Look up the task. If discovery didn't find it, check whether the dir
 	// simply doesn't exist yet or exists but lacks `.clod/`; either case
 	// gets an interactive setup prompt rather than a "unknown task" error.
-	taskPath, err := h.bot.tasks.Get(parsed.TaskName)
+	taskPath, err := h.bot.domains.Get(parsed.TaskName)
 	if err != nil {
 		if h.maybePromptInit(ev, threadTS, parsed, logger) {
 			return
@@ -2174,7 +2174,7 @@ func (h *Handler) handleNewTask(
 		msg := fmt.Sprintf(
 			"Unknown task: `%s`\n\n%s",
 			parsed.TaskName,
-			h.bot.tasks.ListFormatted(),
+			h.bot.domains.ListFormatted(),
 		)
 		if _, postErr := h.bot.PostMessage(ev.Channel, msg, threadTS); postErr != nil {
 			logger.Error().Err(postErr).Msg("failed to post unknown task message")
@@ -2320,7 +2320,7 @@ func hasStartShortcut(text string) bool {
 	return false
 }
 
-// handleRootTask runs a task directly in the agents base directory
+// handleRootTask runs a task directly in the workspace root
 // rather than a subdirectory. The base dir itself is the task — `.clod/`
 // lives at basePath, `taskPath = basePath`. If `.clod/` isn't set up
 // yet, we fall through to the standard init prompt (with createDir=false
@@ -2332,10 +2332,10 @@ func (h *Handler) handleRootTask(
 	instructions string,
 	logger zerolog.Logger,
 ) {
-	base := h.bot.tasks.BasePath()
+	base := h.bot.domains.BasePath()
 	if base == "" {
 		if _, err := h.bot.PostMessage(ev.Channel,
-			":warning: Can't run a root task — `CLOD_BOT_AGENTS_PATH` isn't set.",
+			":warning: Can't run a root task — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post root-task error")
 		}
@@ -2397,10 +2397,10 @@ func (h *Handler) handleNamedTemplateAutoTask(
 	instructions string,
 	logger zerolog.Logger,
 ) {
-	base := h.bot.tasks.BasePath()
+	base := h.bot.domains.BasePath()
 	if base == "" {
 		if _, err := h.bot.PostMessage(ev.Channel,
-			":warning: Can't create a templated task — `CLOD_BOT_AGENTS_PATH` isn't set.",
+			":warning: Can't create a templated task — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post named-auto base error")
 		}
@@ -2417,7 +2417,7 @@ func (h *Handler) handleNamedTemplateAutoTask(
 	case os.IsNotExist(statErr):
 		if _, err := h.bot.PostMessage(ev.Channel,
 			fmt.Sprintf(":warning: Template `%s` doesn't exist. Available templates: %s",
-				template, h.bot.tasks.ListFormatted()),
+				template, h.bot.domains.ListFormatted()),
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post template-missing warning")
 		}
@@ -2484,7 +2484,7 @@ func (h *Handler) handleNamedTemplateAutoTask(
 	// later mentions / continuations. Not fatal if discovery has a
 	// hiccup — the task's `.clod/` is on disk, so subsequent
 	// mentions will still find it.
-	if err := h.bot.tasks.Refresh(); err != nil {
+	if err := h.bot.domains.Refresh(); err != nil {
 		logger.Debug().Err(err).Msg("task registry refresh after named-template task")
 	}
 
@@ -2502,10 +2502,10 @@ func (h *Handler) handleDangerousRootTask(
 	instructions string,
 	logger zerolog.Logger,
 ) {
-	base := h.bot.tasks.BasePath()
+	base := h.bot.domains.BasePath()
 	if base == "" {
 		if _, err := h.bot.PostMessage(ev.Channel,
-			":warning: Can't run a host-direct task — `CLOD_BOT_AGENTS_PATH` isn't set.",
+			":warning: Can't run a host-direct task — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post dangerous-root error")
 		}
@@ -2709,7 +2709,7 @@ func (h *Handler) runNewTask(
 	session.ReactionAnchorTS = ev.TimeStamp
 	session.Model = initialModel
 	session.ModelReactionEmoji = emojiForModel(initialModel)
-	// Root tasks (`*:` / `!:` — taskPath is the agents base dir)
+	// Root tasks (`*:` / `!:` — taskPath is the workspace root)
 	// touch every subdirectory; their defaults differ from subdir
 	// tasks in two ways:
 	//   1. filesync defaults OFF — the agent's churn across
@@ -2721,7 +2721,7 @@ func (h *Handler) runNewTask(
 	// Both only apply to freshly-created sessions; existing sessions
 	// keep whatever the user explicitly set. Toggle back via
 	// `@bot set filesync=on` / `@bot set plan=on`.
-	isRootTask := taskPath == h.bot.tasks.BasePath()
+	isRootTask := taskPath == h.bot.domains.BasePath()
 	if newSession && isRootTask {
 		session.FileSyncDisabled = true
 	}
@@ -2845,7 +2845,7 @@ func (h *Handler) maybePromptInit(
 	if !safeTaskNamePattern.MatchString(parsed.TaskName) {
 		return false
 	}
-	base := h.bot.tasks.BasePath()
+	base := h.bot.domains.BasePath()
 	if base == "" {
 		return false
 	}
@@ -2898,7 +2898,7 @@ func (h *Handler) postInitPrompt(
 		return true
 	}
 
-	base := h.bot.tasks.BasePath()
+	base := h.bot.domains.BasePath()
 	packages := initPackageSuggestions(base, taskName)
 	// Preselect the baseline defaults (by index) so one click gives a
 	// reasonable setup.
@@ -4561,7 +4561,7 @@ func (h *Handler) handleInitFinal(
 	// overwrites the .clod/ files from the user's pickers, so template
 	// .clod choices yield to the explicit UI selections.
 	if state.SelTemplate != "" {
-		base := h.bot.tasks.BasePath()
+		base := h.bot.domains.BasePath()
 		srcPath := filepath.Join(base, state.SelTemplate)
 		// Ensure the new task dir exists so the copy has a target.
 		if err := os.MkdirAll(state.TaskPath, 0o755); err != nil {
@@ -4600,7 +4600,7 @@ func (h *Handler) handleInitFinal(
 	// which it doesn't yet — clod generates that on first invocation. We
 	// bypass discovery for this one call by manually constructing the
 	// task path and invoking runClod directly.
-	if err := h.bot.tasks.Refresh(); err != nil {
+	if err := h.bot.domains.Refresh(); err != nil {
 		logger.Warn().Err(err).Msg("failed to refresh task registry after init")
 	}
 
@@ -4691,10 +4691,10 @@ func (h *Handler) handleDangerousFinal(
 		logger.Error().Err(err).Msg("failed to update dangerous message after proceed")
 	}
 
-	base := h.bot.tasks.BasePath()
+	base := h.bot.domains.BasePath()
 	if base == "" {
 		if _, err := h.bot.PostMessage(state.ChannelID,
-			":warning: Can't run a host-direct task — `CLOD_BOT_AGENTS_PATH` isn't set.",
+			":warning: Can't run a host-direct task — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 			state.ThreadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post dangerous-final base-missing error")
 		}
@@ -4861,7 +4861,7 @@ func (h *Handler) completeInitWithTemplate(
 		logger.Debug().Err(err).Msg("failed to post step1 setup-in-progress update")
 	}
 
-	base := h.bot.tasks.BasePath()
+	base := h.bot.domains.BasePath()
 	tplPath := filepath.Join(base, state.SelTemplate)
 	if err := materializeFromTemplate(tplPath, state.TaskPath, state.TaskName); err != nil {
 		logger.Error().Err(err).
@@ -4875,7 +4875,7 @@ func (h *Handler) completeInitWithTemplate(
 		return
 	}
 
-	if err := h.bot.tasks.Refresh(); err != nil {
+	if err := h.bot.domains.Refresh(); err != nil {
 		logger.Debug().Err(err).Msg("task registry refresh after templated init")
 	}
 

@@ -22,7 +22,7 @@ type Bot struct {
 	socket        *socketmode.Client
 	socketHandler *socketmode.SocketmodeHandler
 	auth          *Authorizer
-	tasks         *TaskRegistry
+	domains       *DomainRegistry
 	sessions      *SessionStore
 	runner        *Runner
 	files         *FileHandler
@@ -51,7 +51,7 @@ func NewBot(
 	botToken string,
 	appToken string,
 	auth *Authorizer,
-	tasks *TaskRegistry,
+	domains *DomainRegistry,
 	sessions *SessionStore,
 	runner *Runner,
 	verboseTools []string,
@@ -77,7 +77,7 @@ func NewBot(
 		socket:        socket,
 		socketHandler: socketHandler,
 		auth:          auth,
-		tasks:         tasks,
+		domains:       domains,
 		sessions:      sessions,
 		runner:        runner,
 		files:         NewFileHandler(client, logger),
