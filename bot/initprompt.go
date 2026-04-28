@@ -587,12 +587,13 @@ func writeInitFiles(p *pendingInit, image, sshMode string, packages []string) er
 		return err
 	}
 
-	// README.md stub at the task dir root. The bot's agent-prompt default
-	// is README.md; having at least a stub silences the "agent prompt file
-	// not found" warning and gives the user a place to document the task.
+	// README.md stub at the domain dir root. The bot reads each domain's
+	// README.md and inlines it into the system prompt as onboarding
+	// context, so we leave a placeholder a person (or LLM) can flesh
+	// out without having to learn an extra file convention.
 	readmePath := filepath.Join(p.TaskPath, "README.md")
 	if _, err := os.Stat(readmePath); os.IsNotExist(err) {
-		stub := fmt.Sprintf("# %s\n\nAdd task-specific instructions and context for the agent here.\n", p.TaskName)
+		stub := fmt.Sprintf("# %s\n\nOnboarding notes for this domain. Anyone (a teammate or an LLM) should be able to read this and start contributing.\n\nReplace this placeholder with the conventions, tooling, and points of contact someone needs to be productive in the `%s` domain.\n", p.TaskName, p.TaskName)
 		if err := os.WriteFile(readmePath, []byte(stub), 0o644); err != nil {
 			return fmt.Errorf("write README.md: %w", err)
 		}

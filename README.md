@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] in a modestly more secure way.
 
-**Version 0.30.0**
+**Version 0.31.0**
 
 ## Features
 
@@ -541,21 +541,31 @@ See [Claude permission modes documentation][claude-permission-modes] for details
 
 ## Slack Bot Integration
 
-Clod includes a Go-based Slack bot for running agents remotely with full
-session persistence and permission management.
+Clod includes a Go-based Slack bot for running claude code in a workspace of
+domain directories. Each domain is its own area of work — its own
+`.clod/` setup, its own `README.md` of onboarding context, its own
+session history. The bot drives claude inside each domain; the same
+README that orients an LLM should be the same README that orients a
+new teammate joining the team.
+
+### Concepts
+
+- **Workspace** — the top-level directory the bot watches (`CLOD_BOT_WORKSPACE_PATH`). Holds domain subdirectories plus a workspace-root `README.md` of cross-domain conventions.
+- **Domain** — a subdirectory inside the workspace with its own `.clod/` and a `README.md` that explains what the domain is for, its conventions, and how to work in it.
+- **Task** — a unit of work happening in a Slack thread. Every task runs against one domain; many tasks may run against the same domain over time.
 
 ### Features
 
 - **Socket Mode** — no public endpoint needed; the bot dials out to Slack
-- **Multiple ways to start a task** — explicit task dirs, auto-named tasks (with optional template), workspace-root tasks, or "host-direct" runs that bypass the docker sandbox
+- **Multiple ways to start a task** — pick an existing domain, auto-name a new domain (with optional template), run in the workspace root itself, or use "host-direct" mode that bypasses the docker sandbox
 - **Session persistence** — continue conversations across Slack threads; auto-resumes when the bot restarts mid-task
 - **Permission prompts** — interactive Slack buttons for tool approvals, with persistent allow/deny patterns
 - **Per-thread settings** — model (`opus` / `sonnet` / `haiku` / point releases / 1M-context variants), effort level, plan mode, verbosity, file-sync toggle, per-thread allowlist
-- **File handling** — Slack attachments come into the task dir; new/changed files in the task dir flow back to Slack as snippets (toggleable). `@bot upload <path>` pushes host files into the thread, zipping anything over the threshold
+- **File handling** — Slack attachments come into the domain dir; new/changed files in the domain dir flow back to Slack as snippets (toggleable). `@bot upload <path>` pushes host files into the thread, zipping anything over the threshold
 - **Slack reference expansion** — paste a permalink to a thread/channel and the bot pulls the conversation into the prompt (with confirmation for large or private references)
-- **Layered agent prompts** — `AGENT.md` per task plus a workspace-wide `AGENTS.md` are appended to the system prompt on every run
+- **Onboarding READMEs as system prompt** — the workspace-root `README.md` plus the domain's `README.md` are inlined into claude's system prompt on every run via `--append-system-prompt-file`. Same docs work for a person reading the directory and an LLM running there.
 - **Home tab** — per-user recent sessions with clickable links and workspace-wide usage rollups (cost + turns over 24h/7d/30d/90d/365d)
-- **Task discovery** — automatically finds tasks (subdirectories with `.clod/`); the agents base dir itself is also runnable
+- **Domain discovery** — automatically finds domains (subdirectories with `.clod/`); the workspace root itself is also runnable
 
 ### Quick Start
 
@@ -609,8 +619,8 @@ session persistence and permission management.
    ```bash
    export SLACK_BOT_TOKEN="xoxb-your-bot-token-here"
    export SLACK_APP_TOKEN="xapp-your-app-token-here"
-   export CLOD_BOT_ALLOWED_USERS="U12345678,U87654321"  # Comma-separated User IDs
-   export CLOD_BOT_AGENTS_PATH="/path/to/your/agents"   # Directory containing agent folders
+   export CLOD_BOT_ALLOWED_USERS="U12345678,U87654321"   # Comma-separated User IDs
+   export CLOD_BOT_WORKSPACE_PATH="/path/to/your/workspace" # Workspace dir with domain subdirs
    ```
 
 7. **Run Bot**
@@ -621,29 +631,29 @@ session persistence and permission management.
    ```
 
    See the **Bot Configuration** section below for the full set of `CLOD_BOT_*`
-   environment variables (timeouts, default model, agent prompt paths, etc.).
+   environment variables (timeouts, default model, README paths, etc.).
    Most users only need the three required tokens above plus
-   `CLOD_BOT_AGENTS_PATH`.
+   `CLOD_BOT_WORKSPACE_PATH`.
 
 ### Bot Usage
 
 The bot recognizes a small command grammar in mentions. Everything to the left
 of the colon is structural; everything to the right is free-form instructions
-sent to the agent.
+sent to claude.
 
 #### Starting a task
 
 | Form | Meaning |
 | --- | --- |
-| `@bot <task>: <instructions>` | Run an existing task in `<AgentsPath>/<task>/`. If the directory has no `.clod/` yet, the bot opens an init dialog before starting. |
-| `@bot <template>:: <instructions>` | Auto-name a new task and copy `<template>` as the starting point. Skips the init dialog. |
-| `@bot :: <instructions>` | Auto-name a new task. The bot opens a two-step init dialog (template picker → custom detail) before starting. |
-| `@bot *: <instructions>` | Run inside the agents base dir itself rather than a subdirectory. Filesync and plan mode default off. |
+| `@bot <domain>: <instructions>` | Start a task in an existing domain at `<WorkspacePath>/<domain>/`. If the directory has no `.clod/` yet, the bot opens an init dialog before starting. |
+| `@bot <template>:: <instructions>` | Start a task in a new auto-named domain seeded from `<template>`. Skips the init dialog. |
+| `@bot :: <instructions>` | Start a task in a new auto-named domain. The bot opens a two-step init dialog (template picker → custom detail) before starting. |
+| `@bot *: <instructions>` | Run inside the workspace root itself rather than a domain subdirectory. Filesync and plan mode default off. |
 | `@bot !: <instructions>` | "Host-direct" mode — runs `claude` directly on the host without the docker sandbox. The bot prompts for confirmation first. Sticky for the life of the thread. |
 
-Task names are restricted to `[a-zA-Z0-9_-]` (max 64 chars). The `::` form
-disambiguates template-based auto-naming from `<task>:` because task names
-can't contain whitespace.
+Domain names are restricted to `[a-zA-Z0-9_-]` (max 64 chars). The `::` form
+disambiguates template-based auto-naming from `<domain>:` because domain
+names can't contain whitespace.
 
 Example:
 
@@ -651,12 +661,15 @@ Example:
 @clod-bot services: Follow the instructions in TASK-deprecations.md
 ```
 
-with an agent directory like:
+with a workspace laid out like:
 
 ```
-services/
-├── .clod/
-└── TASK-deprecations.md
+workspace/
+├── README.md            # Workspace-wide onboarding (shared across domains)
+└── services/            # The "services" domain
+    ├── .clod/
+    ├── README.md        # Domain-specific onboarding
+    └── TASK-deprecations.md
 ```
 
 starts a `clod` session in `services/` with the initial prompt `Follow the
@@ -670,7 +683,7 @@ Find the users that will be impacted by the deprecations.
 
 These commands run against the active session for the thread you send them in.
 They must be sent as `@bot <command>` so they reach the command router rather
-than the running agent:
+than the running task:
 
 | Command | Effect |
 | --- | --- |
@@ -681,11 +694,11 @@ than the running agent:
 | `@bot set effort=<value>` | Set how long claude thinks per turn (`low`, `medium`, `high`, `xhigh`, `max`). `+` / `-` step; `clear` removes the override. |
 | `@bot set verbosity=<value>` | `0` = summary (default), `1` = full, `-1` = silent. Or react with 🙈 / 💬. |
 | `@bot set plan=<on/off>` | Toggle plan mode. `+` / `-` / 💭 also work. |
-| `@bot set filesync=<on/off>` | Toggle the task-dir → Slack file watcher for this thread. |
+| `@bot set filesync=<on/off>` | Toggle the domain-dir → Slack file watcher for this thread. |
 
 #### Joining existing conversations
 
-When you use a start command (`@bot <task>: instructions`) inside an existing
+When you use a start command (`@bot <domain>: instructions`) inside an existing
 thread that wasn't started by the bot, the bot collects the prior messages in
 the thread and includes them as context in the initial prompt — so you can
 bring it into ongoing discussions without recapping.
@@ -703,16 +716,32 @@ bot will expand the referenced thread and include it in the prompt:
 #### DMs with the bot
 
 Top-level DMs need an explicit prefix (`*:`, `!:`, `::`, `<template>::`, or
-`<task>:`) — the @-mention is implicit. Inside an active session's thread,
+`<domain>:`) — the @-mention is implicit. Inside an active session's thread,
 just type to send input to the running task. Bot commands (`close`, `set …`,
 `allow @user`) inside a thread still need an explicit `<@bot> <command>`.
 
-#### Per-task agent prompt
+#### Onboarding context (READMEs)
 
-Each task's `README.md` (configurable) is appended to claude's system prompt
-as `AGENT.md` on every run — edit it to give the agent persistent task
-context. A workspace-wide `AGENTS.md` at the agents base dir applies to
-every task; task-specific guidance overrides workspace-wide on conflict.
+Write the workspace and each domain like onboarding documentation. The same
+docs that bring a new teammate up to speed are what claude reads as system
+prompt context on every run.
+
+- **Workspace-root `README.md`** (at `CLOD_BOT_WORKSPACE_PATH/README.md`)
+  — cross-domain conventions, shared tooling, points of contact, links
+  to internal references. Applies to every domain.
+- **Domain `README.md`** (at `<workspace>/<domain>/README.md`) — what the
+  domain owns, how it's structured, common operations, gotchas. Applies
+  only when running in that domain. Domain-specific guidance overrides
+  workspace-wide on conflict.
+
+Both files are inlined into claude's system prompt via
+`--append-system-prompt-file` on every run, with section headers
+(`# Workspace context` / `# Domain: <name>`) so the LLM knows which is
+which. Either may be missing — the bot just skips that section.
+
+Both filenames are configurable (`CLOD_BOT_WORKSPACE_README` /
+`CLOD_BOT_DOMAIN_README`) but the defaults match the natural location a
+human would look first.
 
 ## Sharing Configurations
 
@@ -775,11 +804,11 @@ All bot-specific configuration uses the `CLOD_BOT_` prefix.
 - `SLACK_APP_TOKEN` — app-level token for Socket Mode (`xapp-…`)
 - `CLOD_BOT_ALLOWED_USERS` — comma-separated list of Slack user IDs allowed to drive the bot
 
-**Workspace + agents:**
+**Workspace + domains:**
 
-- `CLOD_BOT_AGENTS_PATH` — base path the bot scans for tasks (default: `.`). Subdirectories with a `.clod/` are tasks; the base dir itself is also runnable via `@bot *:` / `@bot !:`.
-- `CLOD_BOT_AGENTS_PROMPT_PATH` — per-task agent prompt file (default: `README.md`, relative to each task dir or an absolute path). Copied into the runtime dir as `AGENT.md` and appended to claude's system prompt. Empty disables.
-- `CLOD_BOT_AGENTS_SHARED_PROMPT_PATH` — workspace-wide agent prompt file (default: `AGENTS.md`, relative to `CLOD_BOT_AGENTS_PATH` or absolute). Copied into every task alongside the per-task prompt. Empty disables.
+- `CLOD_BOT_WORKSPACE_PATH` — workspace directory the bot scans for domains (default: `.`). Subdirectories with a `.clod/` are domains; the workspace itself is also runnable via `@bot *:` / `@bot !:`.
+- `CLOD_BOT_DOMAIN_README` — per-domain onboarding README (default: `README.md`, relative to each domain dir or an absolute path). Inlined into claude's system prompt under `# Domain: <name>`. Empty disables.
+- `CLOD_BOT_WORKSPACE_README` — workspace-root onboarding README (default: `README.md`, relative to `CLOD_BOT_WORKSPACE_PATH` or absolute). Inlined into claude's system prompt under `# Workspace context`, applied to every domain. Empty disables.
 
 **Behavior + defaults:**
 

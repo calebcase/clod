@@ -57,27 +57,38 @@ type PermissionResponse struct {
 
 // PermissionFIFO manages the FIFO for permission requests/responses.
 type PermissionFIFO struct {
-	taskPath      string
+	domainPath    string
 	runtimeSuffix string
 	requestPath   string
 	responsePath  string
+	contextPath   string // CONTEXT.md if any onboarding sections were written; "" otherwise
 	requests      chan PermissionRequest
 	responses     chan PermissionResponse
 	logger        zerolog.Logger
 	cancel        context.CancelFunc
 }
 
-// NewPermissionFIFO creates and initializes the permission FIFO.
-// FIFOs are created in .clod/runtime so they're accessible from inside the
-// Docker container where .clod/runtime is mounted read-write.
-// If runtimeSuffix is provided, it will be used to create a unique runtime directory.
-// If empty, generates a random suffix for concurrent instances.
-// If agentsPromptPath is provided and not empty, that file's content is
-// copied into the runtime directory as AGENT.md (the per-task prompt).
-// If agentsSharedPromptPath is provided and not empty, that file's
-// content is copied as AGENTS.md (the workspace-wide prompt). Either
-// may be missing on disk; missing files are silently skipped.
-func NewPermissionFIFO(taskPath string, runtimeSuffix string, agentsPromptPath string, agentsSharedPromptPath string, logger zerolog.Logger) (*PermissionFIFO, error) {
+// ContextFileName is the filename of the combined onboarding context written
+// into the runtime directory. The runner passes this to claude via
+// `--append-system-prompt-file` so the workspace + domain READMEs become
+// part of the system prompt on every run, regardless of size (CLI argument
+// limits would otherwise cap inline `--append-system-prompt` text).
+const ContextFileName = "CONTEXT.md"
+
+// NewPermissionFIFO creates and initializes the runtime directory for a
+// domain run: the FIFO pair, the embedded permbridge binary, and an
+// optional combined onboarding `CONTEXT.md` built from the workspace and
+// domain READMEs.
+//
+// If runtimeSuffix is empty, a random one is generated.
+//
+// `domainReadmePath` (relative to the domain dir or absolute) and
+// `workspaceReadmePath` (absolute) are concatenated into the CONTEXT.md
+// with section headers. Either may be missing on disk; missing files
+// are silently skipped. If both are empty or both files are missing,
+// no CONTEXT.md is written and the runner skips the
+// `--append-system-prompt-file` flag.
+func NewPermissionFIFO(domainPath string, runtimeSuffix string, domainReadmePath string, workspaceReadmePath string, logger zerolog.Logger) (*PermissionFIFO, error) {
 	// Generate random suffix if not provided (for concurrent mode)
 	if runtimeSuffix == "" {
 		// Generate 6 random hex characters
@@ -90,56 +101,62 @@ func NewPermissionFIFO(taskPath string, runtimeSuffix string, agentsPromptPath s
 
 	// Put FIFOs in .clod/runtime-{suffix} for concurrent instances
 	runtimeDirName := filepath.Join(".clod", "runtime-"+runtimeSuffix)
-	runtimeDir := filepath.Join(taskPath, runtimeDirName)
+	runtimeDir := filepath.Join(domainPath, runtimeDirName)
 	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
 		return nil, oops.Trace(err)
 	}
 
-	// Copy the agent prompt file to the runtime directory if configured.
-	if agentsPromptPath != "" {
-		var srcPath string
-		if filepath.IsAbs(agentsPromptPath) {
-			srcPath = agentsPromptPath
-		} else {
-			srcPath = filepath.Join(taskPath, agentsPromptPath)
-		}
-
-		promptContent, err := os.ReadFile(srcPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				logger.Warn().Str("path", srcPath).Msg("agent prompt file not found, skipping")
-			} else {
-				return nil, oops.Trace(err)
+	// Build the combined onboarding context. `# Workspace context` comes
+	// first so domain-specific guidance can override it (anyone reading
+	// top-down sees the more specific advice last). Only sections whose
+	// source file exists and is non-empty are emitted.
+	var contextBody []byte
+	if workspaceReadmePath != "" {
+		body, err := os.ReadFile(workspaceReadmePath)
+		switch {
+		case err == nil && len(body) > 0:
+			contextBody = append(contextBody, []byte("# Workspace context\n\n")...)
+			contextBody = append(contextBody, body...)
+			if !endsWithNewline(body) {
+				contextBody = append(contextBody, '\n')
 			}
-		} else if len(promptContent) > 0 {
-			agentMDPath := filepath.Join(runtimeDir, "AGENT.md")
-			if err := os.WriteFile(agentMDPath, promptContent, 0644); err != nil {
-				return nil, oops.Trace(err)
-			}
-			logger.Debug().Str("src", srcPath).Str("dst", agentMDPath).Msg("copied agent prompt file")
+		case err != nil && !os.IsNotExist(err):
+			return nil, oops.Trace(err)
+		case os.IsNotExist(err):
+			logger.Debug().Str("path", workspaceReadmePath).Msg("workspace README not found, skipping")
 		}
 	}
-
-	// Copy the workspace-wide (shared) prompt. Resolved absolutely
-	// upstream in cli.go, so we don't attempt task-relative
-	// interpretation here — a relative path reaching this point would
-	// resolve against the bot's working directory, which isn't
-	// meaningful for this feature.
-	if agentsSharedPromptPath != "" {
-		sharedContent, err := os.ReadFile(agentsSharedPromptPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				logger.Debug().Str("path", agentsSharedPromptPath).Msg("shared agent prompt file not found, skipping")
-			} else {
-				return nil, oops.Trace(err)
-			}
-		} else if len(sharedContent) > 0 {
-			sharedMDPath := filepath.Join(runtimeDir, "AGENTS.md")
-			if err := os.WriteFile(sharedMDPath, sharedContent, 0644); err != nil {
-				return nil, oops.Trace(err)
-			}
-			logger.Debug().Str("src", agentsSharedPromptPath).Str("dst", sharedMDPath).Msg("copied shared agent prompt file")
+	if domainReadmePath != "" {
+		var srcPath string
+		if filepath.IsAbs(domainReadmePath) {
+			srcPath = domainReadmePath
+		} else {
+			srcPath = filepath.Join(domainPath, domainReadmePath)
 		}
+		body, err := os.ReadFile(srcPath)
+		switch {
+		case err == nil && len(body) > 0:
+			if len(contextBody) > 0 {
+				contextBody = append(contextBody, '\n')
+			}
+			contextBody = append(contextBody, []byte(fmt.Sprintf("# Domain: %s\n\n", filepath.Base(domainPath)))...)
+			contextBody = append(contextBody, body...)
+			if !endsWithNewline(body) {
+				contextBody = append(contextBody, '\n')
+			}
+		case err != nil && !os.IsNotExist(err):
+			return nil, oops.Trace(err)
+		case os.IsNotExist(err):
+			logger.Warn().Str("path", srcPath).Msg("domain README not found, skipping")
+		}
+	}
+	contextPath := ""
+	if len(contextBody) > 0 {
+		contextPath = filepath.Join(runtimeDir, ContextFileName)
+		if err := os.WriteFile(contextPath, contextBody, 0644); err != nil {
+			return nil, oops.Trace(err)
+		}
+		logger.Debug().Str("path", contextPath).Int("bytes", len(contextBody)).Msg("wrote onboarding context")
 	}
 
 	requestPath := filepath.Join(runtimeDir, FIFORequestName)
@@ -174,14 +191,21 @@ func NewPermissionFIFO(taskPath string, runtimeSuffix string, agentsPromptPath s
 	}
 
 	return &PermissionFIFO{
-		taskPath:      taskPath,
+		domainPath:    domainPath,
 		runtimeSuffix: runtimeSuffix,
 		requestPath:   requestPath,
 		responsePath:  responsePath,
+		contextPath:   contextPath,
 		requests:      make(chan PermissionRequest, 10),
 		responses:     make(chan PermissionResponse, 10),
 		logger:        logger.With().Str("component", "permission_fifo").Logger(),
 	}, nil
+}
+
+// endsWithNewline reports whether b ends with '\n'. Tiny helper to keep
+// section concatenation tidy.
+func endsWithNewline(b []byte) bool {
+	return len(b) > 0 && b[len(b)-1] == '\n'
 }
 
 // Start begins listening for permission requests and sending responses.
@@ -337,25 +361,12 @@ func (p *PermissionFIFO) RuntimeSuffix() string {
 	return p.runtimeSuffix
 }
 
-// AgentPromptPath returns the path to AGENT.md if it exists, empty string otherwise.
-func (p *PermissionFIFO) AgentPromptPath() string {
-	agentPath := filepath.Join(filepath.Dir(p.requestPath), "AGENT.md")
-	if _, err := os.Stat(agentPath); err == nil {
-		return agentPath
-	}
-	return ""
-}
-
-// SharedPromptPath returns the path to AGENTS.md (the workspace-wide
-// prompt materialized into the runtime dir) if it exists, empty string
-// otherwise. Companion to AgentPromptPath — the runner uses both to
-// decide which --append-system-prompt directives to emit.
-func (p *PermissionFIFO) SharedPromptPath() string {
-	sharedPath := filepath.Join(filepath.Dir(p.requestPath), "AGENTS.md")
-	if _, err := os.Stat(sharedPath); err == nil {
-		return sharedPath
-	}
-	return ""
+// ContextPath returns the absolute path to CONTEXT.md (combined workspace
+// + domain onboarding) when at least one source README produced content,
+// or empty string when neither was present. The runner passes this to
+// claude via `--append-system-prompt-file`.
+func (p *PermissionFIFO) ContextPath() string {
+	return p.contextPath
 }
 
 // MCPScriptPath returns the path to the in-container permission bridge

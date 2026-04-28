@@ -279,7 +279,7 @@ func scopeHintForHistory(channelID string, isIM, isMpIM bool) string {
 }
 
 // FormatRefInline renders an under-cap result as a labeled block suitable
-// for splicing into the agent prompt.
+// for splicing into the user's prompt to claude.
 func FormatRefInline(res *SlackRefResult, userCache map[string]string, client *slack.Client, logger zerolog.Logger) string {
 	var b strings.Builder
 	tag := "#" + res.ChannelName

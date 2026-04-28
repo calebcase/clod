@@ -65,27 +65,27 @@ var progressStderrPattern = regexp.MustCompile(`^(\[clod\]|#\d+ (\[|DONE))`)
 
 // Runner executes clod processes.
 type Runner struct {
-	timeout                time.Duration
-	permissionMode         string
-	agentsPromptPath       string // per-task prompt (default README.md in task dir)
-	agentsSharedPromptPath string // workspace-wide prompt (default <AgentsPath>/AGENTS.md, absolute)
-	logger                 zerolog.Logger
+	timeout             time.Duration
+	permissionMode      string
+	domainReadmePath    string // per-domain README (default README.md inside the domain dir)
+	workspaceReadmePath string // workspace-root README (default <WorkspacePath>/README.md, absolute)
+	logger              zerolog.Logger
 }
 
 // NewRunner creates a new Runner.
 func NewRunner(
 	timeout time.Duration,
 	permissionMode string,
-	agentsPromptPath string,
-	agentsSharedPromptPath string,
+	domainReadmePath string,
+	workspaceReadmePath string,
 	logger zerolog.Logger,
 ) *Runner {
 	return &Runner{
-		timeout:                timeout,
-		permissionMode:         permissionMode,
-		agentsPromptPath:       agentsPromptPath,
-		agentsSharedPromptPath: agentsSharedPromptPath,
-		logger:                 logger.With().Str("component", "runner").Logger(),
+		timeout:             timeout,
+		permissionMode:      permissionMode,
+		domainReadmePath:    domainReadmePath,
+		workspaceReadmePath: workspaceReadmePath,
+		logger:              logger.With().Str("component", "runner").Logger(),
 	}
 }
 
@@ -549,7 +549,7 @@ func (r *Runner) Start(
 
 	// Create permission FIFO for MCP communication (must be done before building args).
 	// Pass empty string to generate a unique runtime suffix for concurrent instances.
-	permFIFO, err := NewPermissionFIFO(taskPath, "", r.agentsPromptPath, r.agentsSharedPromptPath, r.logger)
+	permFIFO, err := NewPermissionFIFO(taskPath, "", r.domainReadmePath, r.workspaceReadmePath, r.logger)
 	if err != nil {
 		cancel()
 		return nil, oops.Trace(err)
@@ -581,50 +581,23 @@ func (r *Runner) Start(
 		permToolName,
 	}
 
-	// Always append the embedded clod runtime notice so the agent knows
-	// it's running inside an ephemeral container that may be interrupted.
-	// --append-system-prompt can appear multiple times; later sections
-	// below may add more (e.g. the AGENT.md nudge).
+	// Always append the embedded clod runtime notice so anyone working
+	// in this thread (LLM or human helper) knows it's running inside an
+	// ephemeral container that may be interrupted. Kept inline because
+	// it's bot-internal plumbing — workspace authors shouldn't see it
+	// commingled with their CONTEXT.md onboarding text.
 	if runtimeNotice := strings.TrimSpace(clodRuntimePrompt); runtimeNotice != "" {
 		args = append(args, "--append-system-prompt", runtimeNotice)
 	}
 
-	// Point the agent at the workspace-wide + per-task prompt files
-	// that were copied into the runtime dir. Layered: AGENTS.md
-	// applies to every task; AGENT.md adds task-specific context on
-	// top. Either (or both) may be missing and we skip whichever
-	// isn't present.
-	runtimeDirName := filepath.Join(".clod", "runtime-"+permFIFO.RuntimeSuffix())
-	sharedPresent := permFIFO.SharedPromptPath() != ""
-	taskPresent := permFIFO.AgentPromptPath() != ""
-	switch {
-	case sharedPresent && taskPresent:
-		args = append(
-			args,
-			"--append-system-prompt",
-			fmt.Sprintf(
-				"You are an agent. Read %s/AGENTS.md (workspace-wide guidance) AND %s/AGENT.md (task-specific guidance) as soon as possible and treat both as part of your system prompt. The task-specific guidance overrides the workspace-wide guidance when they conflict.",
-				runtimeDirName, runtimeDirName,
-			),
-		)
-	case sharedPresent:
-		args = append(
-			args,
-			"--append-system-prompt",
-			fmt.Sprintf(
-				"You are an agent. Read %s/AGENTS.md (workspace-wide guidance) as soon as possible and treat it as part of your system prompt.",
-				runtimeDirName,
-			),
-		)
-	case taskPresent:
-		args = append(
-			args,
-			"--append-system-prompt",
-			fmt.Sprintf(
-				"You are an agent as described in %s/AGENT.md; Read that document as soon as possible and treat it as part of your system prompt.",
-				runtimeDirName,
-			),
-		)
+	// Inline the combined onboarding context (workspace + domain READMEs)
+	// via --append-system-prompt-file. The file form sidesteps the OS
+	// argv length cap that --append-system-prompt would hit on long
+	// READMEs. Permission setup writes the file only when at least one
+	// source README produced content; an empty ContextPath() means there
+	// was nothing to inline and we skip the flag.
+	if ctxPath := permFIFO.ContextPath(); ctxPath != "" {
+		args = append(args, "--append-system-prompt-file", ctxPath)
 	}
 
 	// Pass any saved allowed tools so they're respected immediately.
