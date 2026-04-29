@@ -413,10 +413,10 @@ func buildHomeHelpBlocks() []slack.Block {
 		"• `@bot set effort=low|medium|high|xhigh|max` — set how long claude thinks per turn. `+` / `-` to step. `clear` removes the override (model default applies).\n" +
 		"• `@bot set verbosity=0|1|-1` — silent / summary / full. Or 🙈 / 💬\n" +
 		"• `@bot set plan=on|off` — toggle plan mode. Or `+` / `-` / 💭\n" +
-		"• `@bot set filesync=on|off` — toggle file syncing for the task dir back to Slack"
+		"• `@bot set filesync=on|off` — toggle file syncing for the domain dir back to Slack"
 
 	dms := "*DMs with the bot*\n" +
-		"• Top-level DMs need an explicit prefix (`*:`, `!:`, `::`, `<template>::`, or `<task>:`) — the `@bot` mention is implicit. Anything else returns this usage info instead of starting or continuing a task.\n" +
+		"• Top-level DMs need an explicit prefix (`*:`, `!:`, `::`, `<template>::`, or `<domain>:`) — the `@bot` mention is implicit. Anything else returns this usage info instead of starting or continuing a task.\n" +
 		"• Inside an active session's thread, just type to send input to the running task. No prefix needed.\n" +
 		"• Bot commands inside a thread (`close`, `set ...`, `allow @user`) need an explicit `<@bot> <command>` so they reach the command router rather than the agent."
 
