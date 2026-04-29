@@ -571,7 +571,8 @@ type SessionMapping struct {
 
     // Liveness + resume
     Active           bool   // true while runClod is executing; cleared on clean exit
-    ReactionAnchorTS string // user's @-mention TS — anchor for status reactions
+    Idle             bool   // true between turns (agent emitted result, waiting for input)
+    ReactionAnchorTS string // first @-mention TS — anchor for status reactions; pinned for life
 
     // Reactions the bot has placed on the anchor (so we can remove them later;
     // Slack reactions are per-user)
@@ -739,6 +740,61 @@ to both `sessions.json` and the per-task `.clod/claude/settings.json`,
 records the cancel as expected (so the synthesized "task cancelled"
 message is suppressed), cancels the running task, and immediately resumes
 with the new `--model` / effort applied.
+
+### 11. Auto-resume on bot restart (busy vs idle)
+
+`SessionMapping.Active` flips to `true` when `runClod` starts and only
+back to `false` on a clean exit. An unclean exit (crash, shutdown,
+timeout) leaves it set so the next bot startup can pick up where the
+previous run left off.
+
+`SessionMapping.Idle` rides alongside `Active` to track turn-level
+state:
+
+- `false` while a turn is in progress — set by `runClod` at start,
+  reset by the `sendUserInput` helper that wraps every user-driven
+  `task.SendInput` (initial prompt, thread reply, ambig redirect).
+- `true` between turns — set when claude emits the per-turn `result`
+  / stats message. Because claude doesn't emit `result` until every
+  tool call in the turn has resolved, an outstanding permission
+  prompt or `AskUserQuestion` modal naturally keeps `Idle=false`
+  (the agent is paused on the FIFO / tool result, no result yet).
+
+`ResumeActiveSessions` partitions `Active=true` sessions on startup:
+
+- **Stale** (UpdatedAt older than `CLOD_BOT_RESUME_STALE_AFTER`) —
+  flag cleared, no resume. Prevents stopped-then-left-overnight
+  threads from all waking up at once.
+- **Idle** (`Active && Idle`) — flag cleared, no resume notice. The
+  agent had finished its last turn cleanly, so the bot considers the
+  task complete. The next user mention in the thread takes the
+  existing resume-on-mention path, which posts the standard
+  *"Resuming task X..."* notice — i.e. an active user re-engagement,
+  not a deploy-time wake-up.
+- **Busy** (`Active && !Idle`) — resumed via `runClod` with the
+  saved `SessionID` plus a "continue where you left off" nudge.
+  Covers mid-stream computation as well as outstanding permission
+  / `AskUserQuestion` prompts: claude's `--resume` re-evaluates the
+  conversation and re-issues any unresolved tool call, which the
+  bot intercepts and re-posts.
+
+This convention works in concert with workspace guidance to use
+`AskUserQuestion` for any user-input request (rather than asking in
+prose) so the "result with no pending tool call = task complete"
+signal stays reliable. See the workspace README's *"When you need
+user input"* section.
+
+### Anchor message stability
+
+`ReactionAnchorTS` is the message channel browsers, the home tab,
+and Slack search all surface as "this thread"; it's pinned to the
+first @-mention that created the session and is never reassigned to
+later mentions. A `@bot close` followed by a re-mention reuses the
+same anchor so the bot's status reactions (model emoji, plan-mode
+💭, monitor-count keycap) stay where users actually look for them.
+The reassignment guard lives in `handleNewTask` and the post-init
+handler — both gate `ReactionAnchorTS = ev.TimeStamp` (or
+`p.MentionTS`) on `if session.ReactionAnchorTS == ""`.
 
 **Permission Patterns**:
 
