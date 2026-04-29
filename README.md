@@ -558,7 +558,7 @@ new teammate joining the team.
 
 - **Socket Mode** — no public endpoint needed; the bot dials out to Slack
 - **Multiple ways to start a task** — pick an existing domain, auto-name a new domain (with optional template), run in the workspace root itself, or use "host-direct" mode that bypasses the docker sandbox
-- **Session persistence** — continue conversations across Slack threads; auto-resumes when the bot restarts mid-task
+- **Session persistence** — continue conversations across Slack threads; auto-resumes mid-turn work when the bot restarts, but skips threads that were idle (last turn ended cleanly with no outstanding `AskUserQuestion` or permission prompt) so a deploy doesn't wake every dormant thread
 - **Permission prompts** — interactive Slack buttons for tool approvals, with persistent allow/deny patterns
 - **Per-thread settings** — model (`opus` / `sonnet` / `haiku` / point releases / 1M-context variants), effort level, plan mode, verbosity, file-sync toggle, per-thread allowlist
 - **File handling** — Slack attachments come into the domain dir; new/changed files in the domain dir flow back to Slack as snippets (toggleable). `@bot upload <path>` pushes host files into the thread, zipping anything over the threshold
@@ -817,7 +817,7 @@ All bot-specific configuration uses the `CLOD_BOT_` prefix.
 - `CLOD_BOT_VERBOSITY_LEVEL` — default verbosity: `-1` (silent), `0` (summary), `1` (full) (default: `0`).
 - `CLOD_BOT_VERBOSE_TOOLS` — tools affected by the verbosity toggle (default: `Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode`).
 - `CLOD_BOT_TIMEOUT` — per-invocation timeout for `clod` execution (default: `24h`).
-- `CLOD_BOT_RESUME_STALE_AFTER` — active sessions older than this on startup are treated as stale and not auto-resumed (default: `30m`). Set to `0` to disable auto-resume entirely.
+- `CLOD_BOT_RESUME_STALE_AFTER` — active sessions older than this on startup are treated as stale and not auto-resumed (default: `30m`). Set to `0` to disable auto-resume entirely. Independent of the idle-skip logic: idle threads (turn ended, no outstanding tool call) are skipped regardless of staleness, since the agent had genuinely finished its work.
 
 **Storage + lifecycle:**
 
