@@ -643,21 +643,34 @@ The bot recognizes a small grammar in mentions:
 
 | Form | Result |
 | --- | --- |
-| `<@bot> <domain>: <text>` | Start a task in an existing domain at `<WorkspacePath>/<domain>/`; opens an init dialog if `.clod/` is missing. |
-| `<@bot> <template>:: <text>` | Auto-name a new task and copy `<template>` as the seed. Skips the dialog. |
-| `<@bot> :: <text>` | Auto-name a new task; pick template / Custom in a two-step modal. |
-| `<@bot> *: <text>` | Run inside the workspace root itself (no per-domain subdir). |
-| `<@bot> !: <text>` | Host-direct mode — run `claude` on the host without docker. Confirmation required. |
-| `<@bot> close` / `set …` / `allow @u` / `disallow @u` / `upload <path>` | Per-thread commands that route to the command handler instead of the running agent. |
+| `<@bot> <domain>: <text>` | Start a session in an existing domain at `<WorkspacePath>/<domain>/`; opens an init dialog if `.clod/` is missing. |
+| `<@bot> <template>:: <text>` | Auto-name a new domain and copy `<template>` as the seed. Skips the dialog. |
+| `<@bot> :: <text>` | Auto-name a new domain; pick template / Custom in a two-step modal. |
+| `<@bot> *: <text>` | Start a session in the workspace root itself (no per-domain subdir). |
+| `<@bot> !: <text>` | Host-direct session — run `claude` on the host without docker. Confirmation required. |
+| `<@bot> close` / `set …` / `allow @u` / `disallow @u` / `upload <path>` | Per-session commands that route to the command handler instead of the running agent. |
 
-Task names are restricted to `[a-zA-Z0-9_-]` (max 64 chars). Because they
-can't contain whitespace, `<template>::` and `<task>:` are unambiguous.
+All start forms accept an optional model prefix between `<@bot>` and the
+start token: `<@bot> <model> <start command>`. `ParseModelPrefix` checks
+the first whitespace-delimited word against a constrained set of known
+model tokens (`opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`,
+`claude-(opus|sonnet|haiku)-X.Y…`, optionally suffixed with `[1m]`); if
+it matches AND the rewritten text matches a start pattern (the
+`hasStartPattern` gate), the dispatcher strips the model and pre-sets
+it on the session via `SessionStore.SetModel` so the downstream
+GetModel cascade picks it up as the highest-priority source. If the
+first word doesn't match a known model, no strip happens — protects
+against accidentally swallowing unrelated prose.
 
-DMs follow the same grammar with one exception: top-level DMs require the
-explicit prefix (the `@bot` mention is implicit). Inside an active session's
-thread, plain text is forwarded as input to the running task; bot commands
-inside a thread still need an explicit `<@bot>` mention to reach the
-command router.
+Domain names are restricted to `[a-zA-Z0-9_-]` (max 64 chars). Because
+they can't contain whitespace, `<template>::`, `<domain>:`, and the
+optional model prefix are all unambiguous.
+
+DMs follow the same grammar with one exception: top-level DMs require
+the explicit prefix (the `@bot` mention is implicit). Inside an active
+session's thread, plain text is forwarded as input to the running
+agent; bot commands inside a thread still need an explicit `<@bot>`
+mention to reach the command router.
 
 ### 5. Home Tab (hometab.go)
 

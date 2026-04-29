@@ -255,9 +255,9 @@ const noneTemplateSentinel = "__none__"
 func buildInitStep1Blocks(p *pendingInit, progressKey string) []slack.Block {
 	var headerText string
 	if p.CreateDir {
-		headerText = fmt.Sprintf(":sparkles: *Set up new task* `%s`\n_Pick a template to clone, or choose Custom setup to configure from scratch._", p.TaskName)
+		headerText = fmt.Sprintf(":sparkles: *Set up new domain* `%s`\n_Pick a template to clone, or choose Custom setup to configure from scratch._", p.TaskName)
 	} else {
-		headerText = fmt.Sprintf(":sparkles: *Initialize task* `%s`\n_Pick a template to clone, or choose Custom setup to configure from scratch._", p.TaskName)
+		headerText = fmt.Sprintf(":sparkles: *Initialize domain* `%s`\n_Pick a template to clone, or choose Custom setup to configure from scratch._", p.TaskName)
 	}
 
 	blocks := []slack.Block{
@@ -330,9 +330,9 @@ func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
 	var headerText string
 	switch {
 	case p.CreateDir:
-		headerText = fmt.Sprintf(":sparkles: *Set up new task* `%s` — custom configuration\n_The directory `%s` doesn't exist yet. I'll create it and write a fresh `.clod/` from the options below._", p.TaskName, p.TaskPath)
+		headerText = fmt.Sprintf(":sparkles: *Set up new domain* `%s` — custom configuration\n_The directory `%s` doesn't exist yet. I'll create it and write a fresh `.clod/` from the options below._", p.TaskName, p.TaskPath)
 	default:
-		headerText = fmt.Sprintf(":sparkles: *Initialize task* `%s` — custom configuration\n_The directory exists but isn't set up for clod. I'll create `.clod/` with the options below._", p.TaskName)
+		headerText = fmt.Sprintf(":sparkles: *Initialize domain* `%s` — custom configuration\n_The directory exists but isn't set up for clod. I'll create `.clod/` with the options below._", p.TaskName)
 	}
 
 	blocks := []slack.Block{
@@ -479,7 +479,7 @@ func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
 	createBtn := slack.NewButtonBlockElement(
 		"init_create",
 		createValue,
-		slack.NewTextBlockObject("plain_text", "Create and run task", false, false),
+		slack.NewTextBlockObject("plain_text", "Create and start session", false, false),
 	)
 	createBtn.Style = "primary"
 	cancelBtn := slack.NewButtonBlockElement(

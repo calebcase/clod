@@ -18,11 +18,12 @@ import (
 	"github.com/slack-go/slack/slackevents"
 )
 
-// startMsgTemplate is the ":rocket: Starting a task" banner shown at the
-// top of every new task thread. Settings help is a fixed-width table so
-// fields / values / notes line up. Emojis in the "notes" column may
-// render slightly wider than a monospace glyph on some clients — that's
-// fine because nothing to their right depends on alignment.
+// startMsgTemplate is the ":rocket: Starting work in the X domain" banner
+// shown at the top of every new session thread. Settings help is a
+// fixed-width table so fields / values / notes line up. Emojis in the
+// "notes" column may render slightly wider than a monospace glyph on
+// some clients — that's fine because nothing to their right depends on
+// alignment.
 const startMsgTemplate = ":rocket: Starting work in the `%s` domain...\n\n" +
 	"_Settings are controlled with `@bot set FIELD=VALUE`:_\n" +
 	"```\n" +
@@ -386,6 +387,36 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 		return
 	}
 
+	// Optional model prefix: `<@bot> <model> <start command>`. Domain
+	// names disallow whitespace, so the first whitespace-delimited
+	// word can't collide with a real domain — letting users specify
+	// the model at start time alongside any of the start-command
+	// shapes (`<domain>:`, `<template>::`, `::`, `*:`, `!:`).
+	//
+	// We strip the model token only when the rewritten text actually
+	// matches a start pattern; otherwise non-start commands like
+	// `@bot opus close` (nonsense, but possible) would have their
+	// leading word silently swallowed.
+	//
+	// Pre-setting the model on the session here means the downstream
+	// handlers' existing GetModel-cascade naturally picks it up as
+	// the highest-priority source. SetModel materialises a stub
+	// session if none exists yet — harmless for genuinely new
+	// sessions, and a tiny leak (orphan stub holding just a model
+	// preference) if the user cancels an init dialog without ever
+	// completing a task. Cleaned up on the next mention that
+	// actually starts a session in the same thread.
+	if rewritten, modelToken := ParseModelPrefix(ev.Text); modelToken != "" {
+		if hasStartPattern(rewritten) {
+			logger.Info().Str("model", modelToken).Msg("model prefix on start command — applying")
+			ev.Text = rewritten
+			h.bot.sessions.SetModel(ev.Channel, threadTS, modelToken)
+			if err := h.bot.sessions.Save(); err != nil {
+				logger.Debug().Err(err).Msg("save after model-prefix set")
+			}
+		}
+	}
+
 	// `@bot !: <instructions>` — run claude DIRECTLY on the host
 	// (outside the clod/docker sandbox) in the workspace root.
 	// Checked before `*:` so the two syntaxes don't fight; the `!:`
@@ -423,7 +454,7 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 		base := h.bot.domains.BasePath()
 		if base == "" {
 			if _, err := h.bot.PostMessage(ev.Channel,
-				":warning: Couldn't generate a task name — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
+				":warning: Couldn't generate a domain name — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 				threadTS); err != nil {
 				logger.Debug().Err(err).Msg("failed to post auto-name error")
 			}
@@ -433,14 +464,14 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 		if err != nil {
 			logger.Error().Err(err).Msg("failed to generate task name")
 			if _, perr := h.bot.PostMessage(ev.Channel,
-				fmt.Sprintf(":warning: Couldn't generate a unique task name: %v", err),
+				fmt.Sprintf(":warning: Couldn't generate a unique domain name: %v", err),
 				threadTS); perr != nil {
 				logger.Debug().Err(perr).Msg("failed to post auto-name error")
 			}
 			return
 		}
 		if _, err := h.bot.PostMessage(ev.Channel,
-			fmt.Sprintf(":label: Auto-generated task name: `%s`", name),
+			fmt.Sprintf(":label: Auto-generated domain name: `%s`", name),
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post auto-name notice")
 		}
@@ -743,7 +774,7 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 	// Post status
 	if _, err := h.bot.PostMessage(
 		ev.Channel,
-		fmt.Sprintf(":arrows_counterclockwise: Resuming task `%s`...", session.TaskName),
+		fmt.Sprintf(":arrows_counterclockwise: Resuming session in `%s`...", session.TaskName),
 		threadTS,
 	); err != nil {
 		logger.Error().Err(err).Msg("failed to post resume task message")
@@ -1363,7 +1394,7 @@ func (h *Handler) handleCloseCommand(
 
 	var msg string
 	if wasRunning {
-		msg = ":wave: *Session closed.* The running task has been stopped. Auto-resume is disabled for this thread — @-mention me here with new instructions to pick it back up."
+		msg = ":wave: *Session closed.* The agent has been stopped. Auto-resume is disabled for this thread — @-mention me here with new instructions to pick it back up."
 	} else {
 		msg = ":wave: *Session closed.* Auto-resume is disabled for this thread — @-mention me here with new instructions to pick it back up."
 	}
@@ -1650,7 +1681,7 @@ func (h *Handler) restartRunningTaskForSettingChange(channelID, threadTS, reason
 		time.Sleep(250 * time.Millisecond)
 
 		if _, err := h.bot.PostMessage(channelID,
-			fmt.Sprintf(":arrows_counterclockwise: Resuming task `%s` (%s)…", session.TaskName, reason),
+			fmt.Sprintf(":arrows_counterclockwise: Resuming session in `%s` (%s)…", session.TaskName, reason),
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post restart-resume notice")
 		}
@@ -1758,7 +1789,7 @@ func (h *Handler) applyEffortSet(channelID, threadTS string, session *SessionMap
 	_, taskRunning := h.runningTasks.Load(progressKey)
 	var msg string
 	if taskRunning {
-		msg = fmt.Sprintf(":brain: Effort set to `%s` — restarting the running task to apply.", v)
+		msg = fmt.Sprintf(":brain: Effort set to `%s` — restarting the agent to apply.", v)
 	} else {
 		msg = fmt.Sprintf(":brain: Effort set to `%s` — applies on the next mention in this thread.", v)
 	}
@@ -2335,7 +2366,7 @@ func (h *Handler) handleRootTask(
 	base := h.bot.domains.BasePath()
 	if base == "" {
 		if _, err := h.bot.PostMessage(ev.Channel,
-			":warning: Can't run a root task — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
+			":warning: Can't start a workspace-root session — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post root-task error")
 		}
@@ -2363,7 +2394,7 @@ func (h *Handler) handleRootTask(
 	// Fall-through (shouldn't normally happen — postInitPrompt returns
 	// false only on Slack post failure or a stacked prompt).
 	if _, err := h.bot.PostMessage(ev.Channel,
-		":warning: Couldn't start a root task.",
+		":warning: Couldn't start a workspace-root session.",
 		threadTS); err != nil {
 		logger.Debug().Err(err).Msg("failed to post root-task fallthrough error")
 	}
@@ -2400,7 +2431,7 @@ func (h *Handler) handleNamedTemplateAutoTask(
 	base := h.bot.domains.BasePath()
 	if base == "" {
 		if _, err := h.bot.PostMessage(ev.Channel,
-			":warning: Can't create a templated task — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
+			":warning: Can't create a templated domain — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post named-auto base error")
 		}
@@ -2443,7 +2474,7 @@ func (h *Handler) handleNamedTemplateAutoTask(
 	// what the user means.
 	if autoGeneratedTaskName.MatchString(template) {
 		if _, err := h.bot.PostMessage(ev.Channel,
-			fmt.Sprintf(":warning: `%s` is an auto-named one-off, not a reusable template. Pick a durable task name instead.", template),
+			fmt.Sprintf(":warning: `%s` is an auto-named one-off, not a reusable template. Pick a durable domain name instead.", template),
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post template-auto warning")
 		}
@@ -2454,7 +2485,7 @@ func (h *Handler) handleNamedTemplateAutoTask(
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to generate task name for named-template task")
 		if _, perr := h.bot.PostMessage(ev.Channel,
-			fmt.Sprintf(":warning: Couldn't generate a unique task name: %v", err),
+			fmt.Sprintf(":warning: Couldn't generate a unique domain name: %v", err),
 			threadTS); perr != nil {
 			logger.Debug().Err(perr).Msg("failed to post auto-name error")
 		}
@@ -2475,7 +2506,7 @@ func (h *Handler) handleNamedTemplateAutoTask(
 	}
 
 	if _, err := h.bot.PostMessage(ev.Channel,
-		fmt.Sprintf(":label: Auto-generated task name: `%s` (template: `%s`)", name, template),
+		fmt.Sprintf(":label: Auto-generated domain name: `%s` (template: `%s`)", name, template),
 		threadTS); err != nil {
 		logger.Debug().Err(err).Msg("failed to post named-auto notice")
 	}
@@ -2505,7 +2536,7 @@ func (h *Handler) handleDangerousRootTask(
 	base := h.bot.domains.BasePath()
 	if base == "" {
 		if _, err := h.bot.PostMessage(ev.Channel,
-			":warning: Can't run a host-direct task — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
+			":warning: Can't start a host-direct session — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post dangerous-root error")
 		}
@@ -2769,7 +2800,7 @@ func (h *Handler) runNewTask(
 	}
 	cancel := func() {
 		if _, err := h.bot.PostMessage(ev.Channel,
-			":x: Task cancelled — referenced content couldn't be confirmed.",
+			":x: Session cancelled — referenced content couldn't be confirmed.",
 			threadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post slackref-cancel notice")
 		}
@@ -3025,7 +3056,7 @@ func (h *Handler) handleContinuation(
 	// Post initial status
 	if _, err := h.bot.PostMessage(
 		ev.Channel,
-		fmt.Sprintf(":arrows_counterclockwise: Continuing task `%s`...", session.TaskName),
+		fmt.Sprintf(":arrows_counterclockwise: Continuing session in `%s`...", session.TaskName),
 		threadTS,
 	); err != nil {
 		logger.Error().Err(err).Msg("failed to post continue task message")
@@ -3195,7 +3226,7 @@ func (h *Handler) resumeOneSession(ctx context.Context, s *SessionMapping) {
 
 	if _, err := h.bot.PostMessage(
 		s.ChannelID,
-		fmt.Sprintf(":arrows_counterclockwise: Resuming task `%s` after bot restart…", s.TaskName),
+		fmt.Sprintf(":arrows_counterclockwise: Resuming session in `%s` after bot restart…", s.TaskName),
 		s.ThreadTS,
 	); err != nil {
 		logger.Debug().Err(err).Msg("failed to post resume notice")
@@ -3250,8 +3281,8 @@ func (h *Handler) runClod(
 	task, err := h.bot.runner.Start(ctx, taskPath, prompt, sessionID, model, permissionMode, useClaudeDirect)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to start clod")
-		if _, postErr := h.bot.PostMessage(channelID, fmt.Sprintf(":x: Failed to start task: %v", err), threadTS); postErr != nil {
-			logger.Error().Err(postErr).Msg("failed to post task start error message")
+		if _, postErr := h.bot.PostMessage(channelID, fmt.Sprintf(":x: Failed to start session: %v", err), threadTS); postErr != nil {
+			logger.Error().Err(postErr).Msg("failed to post session start error message")
 		}
 		return
 	}
@@ -4636,7 +4667,7 @@ func (h *Handler) handleInitFinal(
 		// Ensure the new task dir exists so the copy has a target.
 		if err := os.MkdirAll(state.TaskPath, 0o755); err != nil {
 			logger.Error().Err(err).Str("dst", state.TaskPath).Msg("failed to create task dir for template copy")
-			msg := fmt.Sprintf(":x: Couldn't create the task directory: %v", err)
+			msg := fmt.Sprintf(":x: Couldn't create the domain directory: %v", err)
 			if updErr := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, msg); updErr != nil {
 				logger.Error().Err(updErr).Msg("failed to update init prompt after mkdir error")
 			}
@@ -4658,7 +4689,7 @@ func (h *Handler) handleInitFinal(
 
 	if err := writeInitFiles(state, state.SelImage, state.SelSSH, chosenPkgs); err != nil {
 		logger.Error().Err(err).Msg("failed to write init files")
-		msg := fmt.Sprintf(":x: Couldn't create the task setup: %v", err)
+		msg := fmt.Sprintf(":x: Couldn't create the domain setup: %v", err)
 		if updErr := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, msg); updErr != nil {
 			logger.Error().Err(updErr).Msg("failed to update init prompt after write error")
 		}
@@ -4692,7 +4723,7 @@ func (h *Handler) handleInitFinal(
 		tplLine = fmt.Sprintf("\n• Template: `%s`", state.SelTemplate)
 	}
 	outcome := fmt.Sprintf(
-		":white_check_mark: *Task `%s` initialized* by <@%s>\n• Image: `%s`\n• SSH: `%s`\n• Model: `%s`%s%s\n_Starting the task now…_",
+		":white_check_mark: *Domain `%s` initialized* by <@%s>\n• Image: `%s`\n• SSH: `%s`\n• Model: `%s`%s%s\n_Starting the session now…_",
 		state.TaskName, callback.User.ID, state.SelImage, state.SelSSH, state.SelModel, tplLine, pkgLine,
 	)
 	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
@@ -4764,7 +4795,7 @@ func (h *Handler) handleDangerousFinal(
 	base := h.bot.domains.BasePath()
 	if base == "" {
 		if _, err := h.bot.PostMessage(state.ChannelID,
-			":warning: Can't run a host-direct task — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
+			":warning: Can't start a host-direct session — `CLOD_BOT_WORKSPACE_PATH` isn't set.",
 			state.ThreadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post dangerous-final base-missing error")
 		}
@@ -4949,7 +4980,7 @@ func (h *Handler) completeInitWithTemplate(
 		logger.Debug().Err(err).Msg("task registry refresh after templated init")
 	}
 
-	outcome := fmt.Sprintf(":white_check_mark: *Task `%s` created* (by <@%s>) from template `%s`.", state.TaskName, userID, state.SelTemplate)
+	outcome := fmt.Sprintf(":white_check_mark: *Domain `%s` created* (by <@%s>) from template `%s`.", state.TaskName, userID, state.SelTemplate)
 	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
 		logger.Error().Err(err).Msg("failed to update init prompt after templated success")
 	}
@@ -5031,7 +5062,7 @@ func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger
 	}
 	cancel := func() {
 		if _, err := h.bot.PostMessage(p.ChannelID,
-			":x: Task cancelled — referenced content couldn't be confirmed.",
+			":x: Session cancelled — referenced content couldn't be confirmed.",
 			p.ThreadTS); err != nil {
 			logger.Debug().Err(err).Msg("failed to post slackref-cancel notice")
 		}
@@ -5161,7 +5192,7 @@ func (h *Handler) handleAmbiguousAction(
 		logger.Warn().Msg("no running task for ambiguous action")
 		if err := h.bot.UpdateMessage(
 			callback.Channel.ID, callback.Message.Timestamp,
-			":warning: Task is no longer running.",
+			":warning: Agent is no longer running.",
 		); err != nil {
 			logger.Error().Err(err).Msg("failed to update stale ambiguous message")
 		}

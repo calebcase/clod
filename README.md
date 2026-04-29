@@ -552,15 +552,15 @@ new teammate joining the team.
 
 - **Workspace** — the top-level directory the bot watches (`CLOD_BOT_WORKSPACE_PATH`). Holds domain subdirectories plus a workspace-root `README.md` of cross-domain conventions.
 - **Domain** — a subdirectory inside the workspace with its own `.clod/` and a `README.md` that explains what the domain is for, its conventions, and how to work in it.
-- **Task** — a unit of work happening in a Slack thread. Every task runs against one domain; many tasks may run against the same domain over time.
+- **Session** — a Slack thread driving an agent inside one domain. Sessions are persistent across thread replies and bot restarts; you start them, configure them, and close them. Each session runs the agent through a series of turns ("tasks") as the user replies.
 
 ### Features
 
 - **Socket Mode** — no public endpoint needed; the bot dials out to Slack
-- **Multiple ways to start a task** — pick an existing domain, auto-name a new domain (with optional template), run in the workspace root itself, or use "host-direct" mode that bypasses the docker sandbox
+- **Multiple ways to start a session** — pick an existing domain, auto-name a new domain (with optional template), run in the workspace root itself, or use "host-direct" mode that bypasses the docker sandbox
 - **Session persistence** — continue conversations across Slack threads; auto-resumes mid-turn work when the bot restarts, but skips threads that were idle (last turn ended cleanly with no outstanding `AskUserQuestion` or permission prompt) so a deploy doesn't wake every dormant thread
 - **Permission prompts** — interactive Slack buttons for tool approvals, with persistent allow/deny patterns
-- **Per-thread settings** — model (`opus` / `sonnet` / `haiku` / point releases / 1M-context variants), effort level, plan mode, verbosity, file-sync toggle, per-thread allowlist
+- **Per-session settings** — model (`opus` / `sonnet` / `haiku` / point releases / 1M-context variants), effort level, plan mode, verbosity, file-sync toggle, per-session allowlist
 - **File handling** — Slack attachments come into the domain dir; new/changed files in the domain dir flow back to Slack as snippets (toggleable). `@bot upload <path>` pushes host files into the thread, zipping anything over the threshold
 - **Slack reference expansion** — paste a permalink to a thread/channel and the bot pulls the conversation into the prompt (with confirmation for large or private references)
 - **Onboarding READMEs as system prompt** — the workspace-root `README.md` plus the domain's `README.md` are inlined into claude's system prompt on every run via `--append-system-prompt-file`. Same docs work for a person reading the directory and an LLM running there.
@@ -641,19 +641,39 @@ The bot recognizes a small command grammar in mentions. Everything to the left
 of the colon is structural; everything to the right is free-form instructions
 sent to claude.
 
-#### Starting a task
+#### Starting a session
 
 | Form | Meaning |
 | --- | --- |
-| `@bot <domain>: <instructions>` | Start a task in an existing domain at `<WorkspacePath>/<domain>/`. If the directory has no `.clod/` yet, the bot opens an init dialog before starting. |
-| `@bot <template>:: <instructions>` | Start a task in a new auto-named domain seeded from `<template>`. Skips the init dialog. |
-| `@bot :: <instructions>` | Start a task in a new auto-named domain. The bot opens a two-step init dialog (template picker → custom detail) before starting. |
-| `@bot *: <instructions>` | Run inside the workspace root itself rather than a domain subdirectory. Filesync and plan mode default off. |
-| `@bot !: <instructions>` | "Host-direct" mode — runs `claude` directly on the host without the docker sandbox. The bot prompts for confirmation first. Sticky for the life of the thread. |
+| `@bot <domain>: <instructions>` | Start a session in an existing domain at `<WorkspacePath>/<domain>/`. If the directory has no `.clod/` yet, the bot opens an init dialog before starting. |
+| `@bot <template>:: <instructions>` | Start a session in a new auto-named domain seeded from `<template>`. Skips the init dialog. |
+| `@bot :: <instructions>` | Start a session in a new auto-named domain. The bot opens a two-step init dialog (template picker → custom detail) before starting. |
+| `@bot *: <instructions>` | Start a session in the workspace root itself rather than a domain subdirectory. Filesync and plan mode default off. |
+| `@bot !: <instructions>` | Host-direct session — runs `claude` directly on the host without the docker sandbox. The bot prompts for confirmation first. Sticky for the life of the session. |
 
-Domain names are restricted to `[a-zA-Z0-9_-]` (max 64 chars). The `::` form
-disambiguates template-based auto-naming from `<domain>:` because domain
-names can't contain whitespace.
+Any of the start forms accept an optional **model name** between `@bot` and
+the start token, picking a specific model at session start instead of using
+the bot-wide default:
+
+```
+@bot opus services: do thing
+@bot sonnet[1m] :: spike a quick reproduction
+@bot haiku <template>:: scaffold
+@bot opus *: workspace-wide audit
+@bot claude-opus-4-7 services: …
+```
+
+Recognised model tokens are the same set `@bot set model=` accepts:
+`opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`, plus specific
+point releases (`claude-(opus|sonnet|haiku)-X.Y…`) and a `[1m]` suffix
+for 1M-context variants. The first whitespace-delimited word after the
+mention is checked against this set; if it doesn't match, parsing
+proceeds without consuming a model.
+
+Domain names are restricted to `[a-zA-Z0-9_-]` (max 64 chars). The `::`
+form disambiguates template-based auto-naming from `<domain>:` because
+domain names can't contain whitespace, which also makes the model
+prefix unambiguous against domain names.
 
 Example:
 
@@ -679,22 +699,22 @@ instructions in TASK-deprecations.md`. Reply in the thread to continue:
 Find the users that will be impacted by the deprecations.
 ```
 
-#### Per-thread commands
+#### Per-session commands
 
 These commands run against the active session for the thread you send them in.
 They must be sent as `@bot <command>` so they reach the command router rather
-than the running task:
+than the running agent:
 
 | Command | Effect |
 | --- | --- |
-| `@bot close` | Stop the running task and close the session. Auto-resume on bot restart is disabled until you @-mention again. |
+| `@bot close` | Stop the agent and close the session. Auto-resume on bot restart is disabled until you @-mention again. |
 | `@bot upload <path>` | Upload a host-side file (or directory, with a recursive-vs-top-level prompt) into the thread. Many files get zipped to /tmp first, with a confirmation prompt for archives over 100 MB. |
-| `@bot allow @user` / `@bot disallow @user` | Manage the per-thread allowlist (in addition to the bot-wide allowlist). |
-| `@bot set model=<value>` | Switch model. Accepts families (`opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`), specific point releases (`claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, …), and 1M-context variants (`opus[1m]`, `sonnet[1m]`). `+` / `-` cycle, or react with 🎼 / 📜 / 🌸. While a task is running, the bot cancels and resumes with the new model. |
-| `@bot set effort=<value>` | Set how long claude thinks per turn (`low`, `medium`, `high`, `xhigh`, `max`). `+` / `-` step; `clear` removes the override. |
+| `@bot allow @user` / `@bot disallow @user` | Manage the per-session allowlist (in addition to the bot-wide allowlist). |
+| `@bot set model=<value>` | Switch model. Accepts families (`opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`), specific point releases (`claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, …), and 1M-context variants (`opus[1m]`, `sonnet[1m]`). `+` / `-` cycle, or react with 🎼 / 📜 / 🌸. While the agent is running, the bot cancels and resumes with the new model. |
+| `@bot set effort=<value>` | Set how long claude thinks per turn (`low`, `medium`, `high`, `xhigh`, `max`). `+` / `-` step; `clear` removes the override. While the agent is running, the bot cancels and resumes with the new effort. |
 | `@bot set verbosity=<value>` | `0` = summary (default), `1` = full, `-1` = silent. Or react with 🙈 / 💬. |
 | `@bot set plan=<on/off>` | Toggle plan mode. `+` / `-` / 💭 also work. |
-| `@bot set filesync=<on/off>` | Toggle the domain-dir → Slack file watcher for this thread. |
+| `@bot set filesync=<on/off>` | Toggle the domain-dir → Slack file watcher for this session. |
 
 #### Joining existing conversations
 
@@ -717,7 +737,7 @@ bot will expand the referenced thread and include it in the prompt:
 
 Top-level DMs need an explicit prefix (`*:`, `!:`, `::`, `<template>::`, or
 `<domain>:`) — the @-mention is implicit. Inside an active session's thread,
-just type to send input to the running task. Bot commands (`close`, `set …`,
+just type to send input to the running agent. Bot commands (`close`, `set …`,
 `allow @user`) inside a thread still need an explicit `<@bot> <command>`.
 
 #### Onboarding context (READMEs)
