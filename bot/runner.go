@@ -21,9 +21,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// clodRuntimePrompt is the runtime notice appended to every claude
-// invocation via --append-system-prompt. Kept in its own text file so it
-// reads easily and can be edited without touching Go source.
+// clodRuntimePrompt is the runtime notice baked into the top of every
+// generated CONTEXT.md (see permission.go's NewPermissionFIFO). Kept in
+// its own text file so it reads easily and can be edited without
+// touching Go source. Used to live as its own --append-system-prompt
+// flag, but claude rejects combining --append-system-prompt with
+// --append-system-prompt-file, so it now ships inside the file.
 //
 //go:embed clod_runtime_prompt.txt
 var clodRuntimePrompt string
@@ -581,21 +584,16 @@ func (r *Runner) Start(
 		permToolName,
 	}
 
-	// Always append the embedded clod runtime notice so anyone working
-	// in this thread (LLM or human helper) knows it's running inside an
-	// ephemeral container that may be interrupted. Kept inline because
-	// it's bot-internal plumbing — workspace authors shouldn't see it
-	// commingled with their CONTEXT.md onboarding text.
-	if runtimeNotice := strings.TrimSpace(clodRuntimePrompt); runtimeNotice != "" {
-		args = append(args, "--append-system-prompt", runtimeNotice)
-	}
-
-	// Inline the combined onboarding context (workspace + domain READMEs)
-	// via --append-system-prompt-file. The file form sidesteps the OS
-	// argv length cap that --append-system-prompt would hit on long
-	// READMEs. Permission setup writes the file only when at least one
-	// source README produced content; an empty ContextPath() means there
-	// was nothing to inline and we skip the flag.
+	// Inline the combined onboarding context (runtime notice + workspace
+	// + domain READMEs) via --append-system-prompt-file. The file form
+	// sidesteps the OS argv length cap that --append-system-prompt
+	// would hit on long READMEs. We deliberately do NOT also pass
+	// --append-system-prompt: claude rejects the combination outright
+	// ("Cannot use both --append-system-prompt and
+	// --append-system-prompt-file"), so the runtime notice has to live
+	// inside the file alongside the user-authored sections (built by
+	// NewPermissionFIFO). An empty ContextPath() means even the
+	// runtime notice came back blank, so the flag is omitted.
 	if ctxPath := permFIFO.ContextPath(); ctxPath != "" {
 		args = append(args, "--append-system-prompt-file", ctxPath)
 	}
@@ -824,7 +822,20 @@ func (r *Runner) Start(
 	snapshotStderrTail := func() string {
 		stderrMu.Lock()
 		defer stderrMu.Unlock()
-		return strings.Join(stderrTail, "\n")
+		joined := strings.Join(stderrTail, "\n")
+		// Cap the tail so the formatted error still fits inside a
+		// Slack section block (~3000-char text limit). We keep the
+		// most-recent bytes — that's where the actual failure usually
+		// surfaces; the leading docker-build steps are noise once
+		// they've run. Without this, long preludes (e.g. SSH agent
+		// known-hosts dumps) push the opening ``` of the formatted
+		// error past Slack's truncation, leaving the user staring at
+		// an unfenced wall of text.
+		const maxTailBytes = 2200
+		if len(joined) > maxTailBytes {
+			joined = "…(earlier output trimmed)…\n" + joined[len(joined)-maxTailBytes:]
+		}
+		return joined
 	}
 
 	task := &RunningTask{

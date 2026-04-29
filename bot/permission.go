@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/calebcase/oops"
@@ -106,15 +107,31 @@ func NewPermissionFIFO(domainPath string, runtimeSuffix string, domainReadmePath
 		return nil, oops.Trace(err)
 	}
 
-	// Build the combined onboarding context. `# Workspace context` comes
-	// first so domain-specific guidance can override it (anyone reading
-	// top-down sees the more specific advice last). Only sections whose
-	// source file exists and is non-empty are emitted.
+	// Build the combined onboarding context. Order:
+	//   1. `# Runtime` — bot-internal notice describing the ephemeral
+	//      container lifecycle. Always present.
+	//   2. `# Workspace context` — workspace-wide guidance.
+	//   3. `# Domain: <name>` — domain-specific guidance, last so it can
+	//      override workspace-wide on conflict (top-down readers see the
+	//      most specific advice last).
+	//
+	// Claude rejects combining `--append-system-prompt` with
+	// `--append-system-prompt-file`, so the runtime notice has to live
+	// inside CONTEXT.md alongside the user-authored sections rather than
+	// being passed as its own inline `--append-system-prompt` flag.
 	var contextBody []byte
+	if runtimeNotice := strings.TrimSpace(clodRuntimePrompt); runtimeNotice != "" {
+		contextBody = append(contextBody, []byte("# Runtime\n\n")...)
+		contextBody = append(contextBody, []byte(runtimeNotice)...)
+		contextBody = append(contextBody, '\n')
+	}
 	if workspaceReadmePath != "" {
 		body, err := os.ReadFile(workspaceReadmePath)
 		switch {
 		case err == nil && len(body) > 0:
+			if len(contextBody) > 0 {
+				contextBody = append(contextBody, '\n')
+			}
 			contextBody = append(contextBody, []byte("# Workspace context\n\n")...)
 			contextBody = append(contextBody, body...)
 			if !endsWithNewline(body) {

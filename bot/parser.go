@@ -31,6 +31,42 @@ func ParseMention(text string) *ParsedMention {
 	}
 }
 
+// modelPrefixPattern matches `<@BOT> <model> <rest>` where `<model>` is
+// a recognised family name (`opus`, `sonnet`, `haiku`, plus the
+// `best`/`default`/`opusplan` aliases) or a specific point release
+// (`claude-(opus|sonnet|haiku)-X.Y...`), with an optional `[1m]`
+// 1M-context suffix. The pattern is constrained on purpose: a free-
+// form first-word match would silently swallow ordinary user prose
+// that happened to start with a real word.
+//
+// Group 1: bot mention (preserved so callers can rebuild the message
+// without the model token but with the same `<@BOT>` prefix).
+// Group 2: model token (with optional `[1m]`).
+// Group 3: rest of the message.
+var modelPrefixPattern = regexp.MustCompile(
+	`(?i)^(<@[A-Z0-9]+>)\s+((?:opus|sonnet|haiku|best|default|opusplan|claude-(?:opus|sonnet|haiku)-[\w.-]+)(?:\[1m\])?)\s+(.+)$`,
+)
+
+// ParseModelPrefix peeks at the first whitespace-delimited word after
+// the bot mention and, when it's a recognised model name, returns
+// `(rewritten_text_without_model, model_token)`. Otherwise returns
+// `(text, "")`.
+//
+// The rewritten text retains the original `<@BOT>` mention so it can
+// be re-fed to any of the existing start-pattern parsers (mention,
+// auto-name, named-template, root, dangerous-root) without further
+// massaging. Callers should still verify the rewritten text matches a
+// start pattern before applying the model — for non-start commands
+// (`close`, `set …`, etc.) a leading model word is meaningless and
+// should not be silently swallowed.
+func ParseModelPrefix(text string) (rewritten string, model string) {
+	m := modelPrefixPattern.FindStringSubmatch(text)
+	if len(m) < 4 {
+		return text, ""
+	}
+	return m[1] + " " + m[3], strings.ToLower(m[2])
+}
+
 // ParseContinuation parses a follow-up message in a thread (no task prefix needed).
 // Just strips the bot mention and returns the rest as instructions.
 var continuationPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s*(.*)`)
@@ -121,6 +157,30 @@ func ParseNamedAutoMention(text string) *NamedAutoMention {
 		Template:     m[1],
 		Instructions: strings.TrimSpace(m[2]),
 	}
+}
+
+// hasStartPattern reports whether `text` matches any of the start-
+// session shapes (explicit-domain, template auto-name, bare auto-name,
+// workspace root, or host-direct). Used by HandleAppMention to gate
+// the optional model-prefix preprocessor: model-stripping only takes
+// effect when the rewritten text would actually start a session.
+func hasStartPattern(text string) bool {
+	if ParseDangerousRootMention(text) != "" {
+		return true
+	}
+	if ParseRootMention(text) != "" {
+		return true
+	}
+	if ParseNamedAutoMention(text) != nil {
+		return true
+	}
+	if ParseAutoNameMention(text) != "" {
+		return true
+	}
+	if ParseMention(text) != nil {
+		return true
+	}
+	return false
 }
 
 // closeMentionPattern matches `<@BOT> close` (optionally with trailing

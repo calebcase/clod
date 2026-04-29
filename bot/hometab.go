@@ -398,26 +398,27 @@ func allZero(totals []UsageTotals) bool {
 // (bold headers, code spans, bullet lists) renders the same way as
 // thread messages elsewhere in the bot.
 func buildHomeHelpBlocks() []slack.Block {
-	starting := "*Starting tasks*\n" +
-		"• `@bot <domain>: <instructions>` — start a task in an existing domain; opens an init dialog when the domain dir doesn't have `.clod/` yet\n" +
-		"• `@bot <template>:: <instructions>` — start a task in a fresh auto-named domain seeded from `<template>` (no dialog)\n" +
-		"• `@bot :: <instructions>` — start a task in a fresh auto-named domain; pick a template or Custom setup in the two-step init dialog\n" +
-		"• `@bot *: <instructions>` — run in the workspace root itself (no per-domain subdirectory). Filesync and plan mode default off.\n" +
-		"• `@bot !: <instructions>` — run claude directly on the host (no docker sandbox; confirmation required)"
+	starting := "*Starting a session*\n" +
+		"• `@bot <domain>: <instructions>` — start a session in an existing domain; opens an init dialog when the domain dir doesn't have `.clod/` yet\n" +
+		"• `@bot <template>:: <instructions>` — start a session in a fresh auto-named domain seeded from `<template>` (no dialog)\n" +
+		"• `@bot :: <instructions>` — start a session in a fresh auto-named domain; pick a template or Custom setup in the two-step init dialog\n" +
+		"• `@bot *: <instructions>` — start a session in the workspace root itself (no per-domain subdirectory). Filesync and plan mode default off.\n" +
+		"• `@bot !: <instructions>` — start a host-direct session — runs claude directly on the host (no docker sandbox; confirmation required)\n" +
+		"• Any of the above can be prefixed with a model name to pick a specific model up front: `@bot opus services: …`, `@bot sonnet[1m] :: …`, `@bot claude-haiku-4-5 *: …` etc. Same models `@bot set model=` accepts (`opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`, `claude-(opus|sonnet|haiku)-X.Y…`, plus optional `[1m]` suffix for 1M-context variants)."
 
-	perThread := "*Per-thread commands* (any active session)\n" +
-		"• `@bot close` — stop the running task and close the session. Auto-resume on bot restart is disabled until you @-mention again.\n" +
+	perThread := "*Per-session commands* (any active thread)\n" +
+		"• `@bot close` — stop the agent and close the session. Auto-resume on bot restart is disabled until you @-mention again.\n" +
 		"• `@bot upload <path>` — upload a host-filesystem file (or directory, with a recursive-vs-top-level prompt) into this thread. >5 files get zipped to /tmp first.\n" +
-		"• `@bot allow @user` / `@bot disallow @user` — manage who else can drive this thread\n" +
-		"• `@bot set model=opus|sonnet|haiku|best|default|opusplan` — switch model family. `+` / `-` to cycle, or send 🎼 / 📜 / 🌸. Specific releases also work: `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, etc., plus 1M-context variants `opus[1m]` / `sonnet[1m]`.\n" +
-		"• `@bot set effort=low|medium|high|xhigh|max` — set how long claude thinks per turn. `+` / `-` to step. `clear` removes the override (model default applies).\n" +
+		"• `@bot allow @user` / `@bot disallow @user` — manage who else can drive this session\n" +
+		"• `@bot set model=opus|sonnet|haiku|best|default|opusplan` — switch model family. `+` / `-` to cycle, or send 🎼 / 📜 / 🌸. Specific releases also work: `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, etc., plus 1M-context variants `opus[1m]` / `sonnet[1m]`. While the agent is running, the bot cancels and resumes with the new model.\n" +
+		"• `@bot set effort=low|medium|high|xhigh|max` — set how long claude thinks per turn. `+` / `-` to step. `clear` removes the override (model default applies). While the agent is running, the bot cancels and resumes with the new effort.\n" +
 		"• `@bot set verbosity=0|1|-1` — silent / summary / full. Or 🙈 / 💬\n" +
 		"• `@bot set plan=on|off` — toggle plan mode. Or `+` / `-` / 💭\n" +
 		"• `@bot set filesync=on|off` — toggle file syncing for the domain dir back to Slack"
 
 	dms := "*DMs with the bot*\n" +
-		"• Top-level DMs need an explicit prefix (`*:`, `!:`, `::`, `<template>::`, or `<domain>:`) — the `@bot` mention is implicit. Anything else returns this usage info instead of starting or continuing a task.\n" +
-		"• Inside an active session's thread, just type to send input to the running task. No prefix needed.\n" +
+		"• Top-level DMs need an explicit prefix (`*:`, `!:`, `::`, `<template>::`, or `<domain>:`) — the `@bot` mention is implicit. Anything else returns this usage info instead of starting or continuing a session.\n" +
+		"• Inside an active session's thread, just type to send input to the running agent. No prefix needed.\n" +
 		"• Bot commands inside a thread (`close`, `set ...`, `allow @user`) need an explicit `<@bot> <command>` so they reach the command router rather than the agent."
 
 	refs := "*Slack references*\n" +
