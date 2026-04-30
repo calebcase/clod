@@ -1,0 +1,22 @@
+# Per-domain generated state — clod regenerates this on every run.
+*/.clod/system/
+*/.clod/runtime*/
+*/.clod/id
+
+# Per-tool state — host credentials / sessions / model blobs land
+# here and shouldn't be checked in.
+*/.clod/claude/
+*/.clod/crush/
+*/.clod/tool
+
+# clod settings the user can flip locally.
+*/.clod/concurrent
+*/.clod/ssh
+*/.clod/gpus
+*/.clod/claude-default-flags
+
+# Default Dockerfile_user/Dockerfile_project clod writes are
+# stub examples; only commit them when a domain actually needs
+# customisation. The random/ domain is meant to stay vanilla.
+*/.clod/Dockerfile_user
+*/.clod/Dockerfile_project

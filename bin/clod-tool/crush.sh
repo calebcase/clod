@@ -65,15 +65,18 @@ tool_init() {
     mkdir -p "$OLLAMA_HOST_CACHE"
 
     # Default model: pick once based on host hardware. Don't clobber
-    # an existing pick — the user may have overridden it.
-    if [[ ! -f "$TOOL_STATE_DIR/model" ]]; then
+    # an existing pick — the user may have overridden it. Lives under
+    # config/ so the bind-mount that maps `.clod/crush/config` →
+    # container `$HOME/.config/crush/` lands the file where the
+    # crush-wrapper expects it (`$HOME/.config/crush/model`).
+    if [[ ! -f "$TOOL_STATE_DIR/config/model" ]]; then
         local vram
         vram=$(detect_largest_gpu_vram_mib)
         local model
         model=$(pick_default_model_for_vram "$vram")
-        printf '%s\n' "$model" > "$TOOL_STATE_DIR/model"
+        printf '%s\n' "$model" > "$TOOL_STATE_DIR/config/model"
         printf '[clod] crush: detected %s MiB VRAM, defaulting to model %s\n' "$vram" "$model" >&2
-        printf '[clod] crush: edit .clod/crush/model to override\n' >&2
+        printf '[clod] crush: edit .clod/crush/config/model to override\n' >&2
     fi
 
     # Seed crush.json with an Ollama provider pointed at the in-
@@ -82,7 +85,7 @@ tool_init() {
     # clobber an existing config — the user may have customised it.
     if [[ ! -f "$TOOL_STATE_DIR/config/crush.json" ]]; then
         local model
-        model=$(<"$TOOL_STATE_DIR/model")
+        model=$(<"$TOOL_STATE_DIR/config/model")
         cat > "$TOOL_STATE_DIR/config/crush.json" <<JSON
 {
   "\$schema": "https://charm.land/crush.json",
@@ -146,33 +149,38 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
 # so the entire docker build stalls.
 #
 # Direct binary fetch is simpler and faster: pull the official
-# release tarball, extract `bin/ollama` into /usr/local/bin/, done.
-# The tarball is zstd-compressed under a .tgz extension, so we hand
-# tar the explicit --zstd flag rather than relying on auto-detection.
+# release tarball, extract `bin/ollama` (and `lib/*` for GPU runner
+# shared objects) into /usr/local/, done. The releases are
+# `<arch>.tar.zst` (renamed from .tgz somewhere around v0.6 — old
+# install.sh callers see the zstd-extraction error then hang on the
+# systemd setup). We hand tar `--zstd` explicitly.
 RUN set -eux; \
     arch="$(uname -m)"; \
     case "$arch" in \
-        x86_64)  asset=ollama-linux-amd64.tgz ;; \
-        aarch64) asset=ollama-linux-arm64.tgz ;; \
+        x86_64)  asset=ollama-linux-amd64.tar.zst ;; \
+        aarch64) asset=ollama-linux-arm64.tar.zst ;; \
         *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
     url="https://github.com/ollama/ollama/releases/latest/download/$asset"; \
-    curl -fsSL "$url" -o /tmp/ollama.tgz; \
+    curl -fsSL "$url" -o /tmp/ollama.tar.zst; \
     mkdir -p /tmp/ollama-extract; \
-    (tar --zstd -xf /tmp/ollama.tgz -C /tmp/ollama-extract \
-     || tar -xzf /tmp/ollama.tgz -C /tmp/ollama-extract); \
+    tar --zstd -xf /tmp/ollama.tar.zst -C /tmp/ollama-extract; \
     cp /tmp/ollama-extract/bin/ollama /usr/local/bin/ollama; \
     chmod +x /usr/local/bin/ollama; \
     if [ -d /tmp/ollama-extract/lib ]; then \
         mkdir -p /usr/local/lib; \
         cp -r /tmp/ollama-extract/lib/* /usr/local/lib/; \
     fi; \
-    rm -rf /tmp/ollama.tgz /tmp/ollama-extract; \
+    rm -rf /tmp/ollama.tar.zst /tmp/ollama-extract; \
     /usr/local/bin/ollama --version
 
-# Install Crush from the latest GitHub release. Uses uname -m to
-# pick the right tarball (amd64 / arm64). The single static Go
-# binary lands at /usr/local/bin/crush.
+# Install Crush from the latest GitHub release. The release tarball
+# nests its files under `crush_<ver>_<arch>/`, so we extract to a
+# temp dir and pull the binary out rather than expecting it at the
+# tarball root. The .sbom.json siblings in the release would also
+# match a naive Linux_x86_64*.tar.gz pattern; the regex below stops
+# at the first .tar.gz boundary which gives us the binary tarball
+# and not its checksum/sbom companions.
 RUN set -eux; \
     arch="$(uname -m)"; \
     case "$arch" in \
@@ -183,8 +191,12 @@ RUN set -eux; \
     url="$(curl -fsSL https://api.github.com/repos/charmbracelet/crush/releases/latest \
         | grep -oE "https://[^\"]*${asset}\\.tar\\.gz" | head -1)"; \
     test -n "$url"; \
-    curl -fsSL "$url" | tar -xz -C /usr/local/bin/ crush; \
-    chmod +x /usr/local/bin/crush
+    mkdir -p /tmp/crush-extract; \
+    curl -fsSL "$url" | tar -xz -C /tmp/crush-extract; \
+    cp /tmp/crush-extract/*/crush /usr/local/bin/crush; \
+    chmod +x /usr/local/bin/crush; \
+    rm -rf /tmp/crush-extract; \
+    /usr/local/bin/crush --version
 
 # crush-wrapper: boots Ollama in the background, waits for it to be
 # ready, pulls the configured model on first run, then runs crush in
@@ -192,52 +204,58 @@ RUN set -eux; \
 # mounted from .clod/crush/config/model, so a model swap on the host
 # takes effect on the next clod invocation without rebuilding the
 # image.
-COPY <<DEOF /usr/local/bin/crush-wrapper
+#
+# `<<"DEOF"` (quoted) tells Docker BuildKit to treat the heredoc body
+# verbatim: no variable expansion, no backslash-escape processing.
+# That keeps `\n` in printf format strings intact, keeps the grep
+# alternation `"name":"..."|"model":"..."` quote-matching, and lets
+# us write `$var` for runtime expansion without doubling backslashes.
+COPY <<"DEOF" /usr/local/bin/crush-wrapper
 #!/bin/bash
 set -euo pipefail
 
-ollama_host="\${OLLAMA_HOST:-127.0.0.1:11434}"
-ollama_url="http://\$ollama_host"
+ollama_host="${OLLAMA_HOST:-127.0.0.1:11434}"
+ollama_url="http://$ollama_host"
 log=/tmp/ollama.log
 
 # Start ollama if nothing's already listening (host-Ollama mode would
 # set OLLAMA_HOST to point at the host daemon, in which case we just
 # use it).
-if ! curl -sSf "\$ollama_url/api/tags" >/dev/null 2>&1; then
-  printf '[clod] starting ollama (logs: %s)\n' "\$log" >&2
-  ollama serve >"\$log" 2>&1 &
-  for i in \$(seq 1 60); do
-    if curl -sSf "\$ollama_url/api/tags" >/dev/null 2>&1; then
-      printf '[clod] ollama ready after %ss\n' "\$i" >&2
+if ! curl -sSf "$ollama_url/api/tags" >/dev/null 2>&1; then
+  printf '[clod] starting ollama (logs: %s)\n' "$log" >&2
+  ollama serve >"$log" 2>&1 &
+  for i in $(seq 1 60); do
+    if curl -sSf "$ollama_url/api/tags" >/dev/null 2>&1; then
+      printf '[clod] ollama ready after %ss\n' "$i" >&2
       break
     fi
     sleep 1
   done
-  if ! curl -sSf "\$ollama_url/api/tags" >/dev/null 2>&1; then
+  if ! curl -sSf "$ollama_url/api/tags" >/dev/null 2>&1; then
     printf '[clod] ERROR: ollama did not start within 60s; last 40 log lines:\n' >&2
-    tail -40 "\$log" >&2 || true
+    tail -40 "$log" >&2 || true
     exit 1
   fi
 fi
 
 # Resolve the configured model and pull it on first run. The crush
-# config volume mount lands at \$HOME/.config/crush/, so the model
+# config volume mount lands at $HOME/.config/crush/, so the model
 # pointer the host wrote to .clod/crush/model lives at
-# \$HOME/.config/crush/model.
-model_file="\$HOME/.config/crush/model"
-if [[ -f "\$model_file" ]]; then
-  model=\$(<"\$model_file")
+# $HOME/.config/crush/model.
+model_file="$HOME/.config/crush/model"
+if [[ -f "$model_file" ]]; then
+  model=$(<"$model_file")
 else
   model="qwen2.5-coder:7b"
 fi
 
-if ! curl -sSf "\$ollama_url/api/tags" \
-     | grep -qE "\"name\":\"\${model}\"|\"model\":\"\${model}\""; then
-  printf '[clod] pulling %s (first run on this host; this can take a while)\n' "\$model" >&2
-  ollama pull "\$model"
+if ! curl -sSf "$ollama_url/api/tags" \
+     | grep -qE "\"name\":\"${model}\"|\"model\":\"${model}\""; then
+  printf '[clod] pulling %s (first run on this host; this can take a while)\n' "$model" >&2
+  ollama pull "$model"
 fi
 
-exec crush "\$@"
+exec crush "$@"
 DEOF
 RUN chmod +x /usr/local/bin/crush-wrapper
 EOF
