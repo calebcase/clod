@@ -126,14 +126,29 @@ tool_sync() {
 # them, and the entrypoint script picks them up via PATH.
 tool_dockerfile_root_section() {
     cat <<'EOF'
+# zstd is required by the Ollama installer to unpack the release
+# tarball (since v0.6 or so the upstream archive uses zstd-compressed
+# layers). Without it the installer aborts before placing the binary
+# and clod sees no ollama at runtime. ca-certificates is already in
+# Dockerfile_base; we add zstd here in the crush-only path so claude
+# images don't pay for it.
+RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
+    --mount=type=cache,sharing=locked,target=/var/lib/apt \
+    apt-get update \
+ && apt-get install -qq -y zstd
+
 # Install Ollama (local LLM runtime). The official installer ships
-# the binary directly to /usr/local/bin/ollama and tries to set up
-# systemd; the systemd part is best-effort and harmlessly fails in a
-# container. We start `ollama serve` ourselves from the entrypoint
-# script.
+# the binary directly to /usr/local/bin/ollama and tries to set up a
+# systemd unit afterwards; the systemd part is best-effort and
+# harmlessly fails in a container. The wrapper at /usr/local/bin/
+# ollama is what we care about, so we verify it explicitly after
+# the installer runs and bail loudly if it's missing.
 RUN curl -fsSL https://ollama.com/install.sh | sh \
- || (echo "[clod] ollama installer reported a non-fatal error; continuing" >&2; \
-     test -x /usr/local/bin/ollama)
+ || echo "[clod] ollama installer reported a non-fatal error; verifying binary" >&2; \
+    test -x /usr/local/bin/ollama || { \
+      echo "[clod] ERROR: /usr/local/bin/ollama missing after installer ran" >&2; \
+      exit 1; \
+    }
 
 # Install Crush from the latest GitHub release. Uses uname -m to
 # pick the right tarball (amd64 / arm64). The single static Go
