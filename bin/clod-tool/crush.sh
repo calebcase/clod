@@ -126,10 +126,8 @@ tool_sync() {
 # them, and the entrypoint script picks them up via PATH.
 tool_dockerfile_root_section() {
     cat <<'EOF'
-# zstd is required by the Ollama installer to unpack the release
-# tarball (since v0.6 or so the upstream archive uses zstd-compressed
-# layers). Without it the installer aborts before placing the binary
-# and clod sees no ollama at runtime. ca-certificates is already in
+# zstd is required to unpack the Ollama release tarball (the upstream
+# archive uses zstd-compressed layers). ca-certificates is already in
 # Dockerfile_base; we add zstd here in the crush-only path so claude
 # images don't pay for it.
 RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
@@ -137,18 +135,40 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
     apt-get update \
  && apt-get install -qq -y zstd
 
-# Install Ollama (local LLM runtime). The official installer ships
-# the binary directly to /usr/local/bin/ollama and tries to set up a
-# systemd unit afterwards; the systemd part is best-effort and
-# harmlessly fails in a container. The wrapper at /usr/local/bin/
-# ollama is what we care about, so we verify it explicitly after
-# the installer runs and bail loudly if it's missing.
-RUN curl -fsSL https://ollama.com/install.sh | sh \
- || echo "[clod] ollama installer reported a non-fatal error; verifying binary" >&2; \
-    test -x /usr/local/bin/ollama || { \
-      echo "[clod] ERROR: /usr/local/bin/ollama missing after installer ran" >&2; \
-      exit 1; \
-    }
+# Install Ollama (local LLM runtime).
+#
+# We deliberately do NOT use the upstream `curl ... install.sh | sh`
+# convenience installer here: after dropping the binary it goes on to
+# add an `ollama` system user, set up a `ollama.service` systemd
+# unit, and try to start it. In a Docker build there's no systemd,
+# but the installer doesn't fail fast on that — it hangs at "Install
+# complete. Run \"ollama\" from the command line." and never returns,
+# so the entire docker build stalls.
+#
+# Direct binary fetch is simpler and faster: pull the official
+# release tarball, extract `bin/ollama` into /usr/local/bin/, done.
+# The tarball is zstd-compressed under a .tgz extension, so we hand
+# tar the explicit --zstd flag rather than relying on auto-detection.
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+        x86_64)  asset=ollama-linux-amd64.tgz ;; \
+        aarch64) asset=ollama-linux-arm64.tgz ;; \
+        *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/ollama/ollama/releases/latest/download/$asset"; \
+    curl -fsSL "$url" -o /tmp/ollama.tgz; \
+    mkdir -p /tmp/ollama-extract; \
+    (tar --zstd -xf /tmp/ollama.tgz -C /tmp/ollama-extract \
+     || tar -xzf /tmp/ollama.tgz -C /tmp/ollama-extract); \
+    cp /tmp/ollama-extract/bin/ollama /usr/local/bin/ollama; \
+    chmod +x /usr/local/bin/ollama; \
+    if [ -d /tmp/ollama-extract/lib ]; then \
+        mkdir -p /usr/local/lib; \
+        cp -r /tmp/ollama-extract/lib/* /usr/local/lib/; \
+    fi; \
+    rm -rf /tmp/ollama.tgz /tmp/ollama-extract; \
+    /usr/local/bin/ollama --version
 
 # Install Crush from the latest GitHub release. Uses uname -m to
 # pick the right tarball (amd64 / arm64). The single static Go
