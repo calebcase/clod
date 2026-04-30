@@ -102,6 +102,56 @@ cp .clod/claude/claude.json ~/.claude.json
 
 New directories initialized with clod will use this config as the base.
 
+### Switching the underlying tool
+
+Clod is tool-pluggable: the bash command can run different coding agents
+inside the same container-isolated workflow. Tool drivers live next to
+the `clod` binary at `bin/clod-tool/<name>.sh`.
+
+| Tool | Driver | Default behaviour |
+| --- | --- | --- |
+| `claude` (default) | `bin/clod-tool/claude.sh` | Runs [Claude Code](https://www.anthropic.com/claude-code), seeded from `~/.claude.json` if present. |
+| `crush` | `bin/clod-tool/crush.sh` | Runs [Charm Crush](https://github.com/charmbracelet/crush) against an in-container Ollama daemon. Local-first. |
+
+Pick a tool with either:
+
+```bash
+echo crush > .clod/tool      # per-directory persistent
+CLOD_TOOL=crush clod         # one-shot env override
+```
+
+The first time you run clod with a new tool selection, it re-initializes
+`.clod/` and rebuilds the container with that tool's runtime baked in.
+
+#### Crush mode (local-first)
+
+When `crush` is selected and the directory has no existing crush config,
+`clod` picks a coding model based on the largest GPU's VRAM:
+
+| Largest GPU VRAM | Model (Ollama tag) |
+| --- | --- |
+| ≥ 80 GB | `qwen2.5-coder:32b-instruct-fp16` |
+| ≥ 40 GB | `qwen2.5-coder:32b-instruct-q8_0` |
+| ≥ 24 GB | `qwen2.5-coder:32b` (default Q4_K_M) |
+| ≥ 12 GB | `qwen2.5-coder:14b` |
+| ≥ 6 GB | `qwen2.5-coder:7b` |
+| ≥ 3 GB | `qwen2.5-coder:3b` |
+| no GPU / unknown | `qwen2.5-coder:3b` (CPU fallback, slow) |
+
+The choice is written to `.clod/crush/model` — edit that file (or the
+generated `.clod/crush/config/crush.json`) to override. Model blobs are
+cached on the host at `~/.cache/clod/ollama/` so a 20 GB pull only happens
+once on a given machine and is shared across every clod domain. The
+container starts an Ollama daemon on `127.0.0.1:11434`, pulls the
+configured model on first run, then runs `crush` in the foreground.
+
+To switch back to Claude Code:
+
+```bash
+echo claude > .clod/tool
+clod
+```
+
 ## Architecture
 
 ### Four-Layer Dockerfile Design

@@ -7,6 +7,44 @@ reinit=${CLOD_REINIT:-false}
 noninteractive=${CLOD_NONINTERACTIVE:-false}
 config=${CLOD_CONFIG:-$HOME/.claude.json}
 
+# Locate the clod-tool/ directory regardless of how clod was invoked.
+# `~/bin/clod` is typically a symlink into the source tree, and the
+# tool drivers live next to the *real* binary, not the symlink.
+_clod_self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+CLOD_SCRIPT_DIR="$(dirname -- "$_clod_self")"
+CLOD_TOOL_DIR="$CLOD_SCRIPT_DIR/clod-tool"
+
+# Pick the active tool. Resolution order:
+#   1. CLOD_TOOL env (highest precedence — one-shot override).
+#   2. .clod/tool file (per-directory persistent setting).
+#   3. claude (default — backwards compatible with pre-multi-tool clod).
+resolve_tool() {
+    if [[ -n "${CLOD_TOOL:-}" ]]; then
+        printf '%s\n' "$CLOD_TOOL"
+        return
+    fi
+    if [[ -f .clod/tool ]]; then
+        printf '%s\n' "$(<.clod/tool)"
+        return
+    fi
+    printf 'claude\n'
+}
+
+CLOD_ACTIVE_TOOL="$(resolve_tool)"
+_driver_path="$CLOD_TOOL_DIR/${CLOD_ACTIVE_TOOL}.sh"
+if [[ ! -f "$_driver_path" ]]; then
+    printf 'ERROR: unknown clod tool %q (looked for %s).\n' \
+        "$CLOD_ACTIVE_TOOL" "$_driver_path" >&2
+    printf 'Set CLOD_TOOL or .clod/tool to one of: ' >&2
+    ls "$CLOD_TOOL_DIR"/*.sh 2>/dev/null \
+        | sed -E 's|.*/([^/]+)\.sh$|\1|' \
+        | tr '\n' ' ' >&2
+    printf '\n' >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "$_driver_path"
+
 # Compute hash of all files in .clod directory (not subdirectories)
 compute_clod_hash() {
   # Hash all regular files in .clod (excluding subdirs like claude/)
@@ -57,25 +95,80 @@ version_gt() {
   return 1
 }
 
-# Seed .clod/claude/claude.json from the host config if it isn't already
-# populated. Runs on every invocation, not just first-time init, so that a
-# user who authenticates on the host *after* .clod was created still gets
-# their credentials picked up on the next run. Never overwrites an existing
-# file — the bot persists permission grants there and we must not clobber
-# them.
-sync_claude_config() {
-  mkdir -p .clod/claude
-  if [[ ! -f .clod/claude/claude.json && -f "$config" ]]; then
-    cp "$config" .clod/claude/claude.json
-  fi
+# Common Dockerfile_wrapper sections the active tool driver wraps
+# around. Centralised so every driver gets the same user/group setup,
+# PATH plumbing, and SSH known_hosts pinning.
+emit_common_user_setup() {
+    cat <<'EOF'
+
+ARG GROUP_ID
+ARG GROUP_NAME
+ARG USER_ID
+ARG USER_NAME
+
+# Skip user/group operations if running as root (UID 0)
+RUN if [ "$USER_ID" != "0" ]; then \
+      (groupdel $(getent group "$GROUP_ID" | cut -d: -f1) || true) \
+      && (userdel $(getent passwd "$USER_ID" | cut -d: -f1) || true) \
+      && groupadd -g "$GROUP_ID" "$GROUP_NAME" \
+      && useradd -m -u "$USER_ID" -g "$GROUP_NAME" "$USER_NAME"; \
+    fi
+
+# Set home directory based on user (root uses /root, others use /home/$USER_NAME)
+ARG USER_HOME
+USER $USER_NAME
+WORKDIR $USER_HOME
+
+# Set environment before install so the native installer finds the right paths
+ENV HOME="$USER_HOME"
+ENV USER="$USER_NAME"
+ENV PATH="$PATH:$USER_HOME/bin:$USER_HOME/.local/bin"
+
+EOF
+}
+
+# Pre-populate ~/.ssh/known_hosts with the published SSH host keys
+# for the major git forges so the agent doesn't get an interactive
+# "Are you sure you want to continue connecting?" prompt the first
+# time it runs git over ssh. Keys are pinned verbatim from each
+# forge's official documentation rather than fetched via
+# ssh-keyscan, which would trust whatever IP responded during the
+# build.
+emit_common_known_hosts() {
+    cat <<'EOF'
+
+RUN mkdir -p $USER_HOME/.ssh && chmod 700 $USER_HOME/.ssh && \
+    printf '%s\n' \
+      'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+      'github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=' \
+      'github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=' \
+      'gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf' \
+      'gitlab.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFSMqzJeV9rUzU4kWitGjeR4PWSa29SPqJ1fVkhtj3Hw9xjLVXVYrU9QlYWrOLXBpQ6KWjbjTDTdDkoohFzgbEY=' \
+      'gitlab.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCsj2bNKTBSpIYDEGk9KxsGh3mySTRgMtXL583qmBpzeQ+jqCMRgBqB98u3z++J1sKlXHWfM9dyhSevkMwSbhoR8XIq/U0tCNyokEi/ueaBMCvbcTHhO7FcwzY92WK4Yt0aGROY5qX2UKSeOvuP4D6TPqKF1onrSzH9bx9XUf2lEdWT/ia1NEKjunUqu1xOB/StKDHMoX4/OKyIzuS0q/T1zOATthvasJFoPrAjkohTyaDUz2LN5JoH839hViyEG82yB+MjcFV5MU3N1l1QL3cVUCh93xSaua1N85qivl+siMkPGbO5xR/En4iEY6K2XPASUEMaieWVNTRCtJ4S8H+9' \
+      'bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO' \
+      'bitbucket.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPIQmuzMBuKdWeF4+a2sjSSpBK0iqitSQ+5BM9KhpexuGt20JpTVM7u5BDZngncgrqDMbWdxMWWOGtZ9UgbqgZE=' \
+      'bitbucket.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDQeJzhupRu0u0cdegZIa8e86EG2qOCsIsD1Xw0xSeiPDlCr7kq97NLmMbpKTX6Esc30NuoqEEHCuc7yWtwp8dI76EEEB1VqY9QJq6vk+aySyboD5QF61I/1WeTwu+deCbgKMGbUijeXhtfbxSxm6JwGrXrhBdofTsbKRUsrN1WoNgUa8uqN1Vx6WAJw1JHPhglEGGHea6QICwJOAr/6mrui/oB7pkaWKHj3z7d1IC4KWLtY47elvjbaTlkN04Kc/5LFEirorGYVbt15kAUlqGM65pk6ZBxtaO3+30LVlORZkxOh+LKL/BvbZ/iRNhItLqNyieoQj/uh/7Iv4uyH/cV/0b4WDSd3DptigWq84lJubb9t/DnZlrJazxyDCulTmKdOR7vs9gMTo+uoIrPSb8ScTtvw65+odKAlBj59dhnVp9zd7QUojOpXlL62Aw56U4oO+FALuevvMjiWeavKhJqlR7i5n9srYcrNV7ttmDw7kf/97P5zauIhxcjX+xHv4M=' \
+      > $USER_HOME/.ssh/known_hosts && \
+    chmod 644 $USER_HOME/.ssh/known_hosts
+EOF
 }
 
 # Is this directory initialized?
 initialize() {
-  mkdir -p .clod/claude
   mkdir -p .clod/system
 
-  sync_claude_config
+  # Persist the active tool so subsequent invocations (and bot-side
+  # consumers) don't have to re-resolve. Skipped when CLOD_TOOL is
+  # set so a one-shot env override doesn't accidentally rewrite a
+  # committed `.clod/tool`.
+  if [[ -z "${CLOD_TOOL:-}" ]]; then
+    printf '%s\n' "$CLOD_ACTIVE_TOOL" > .clod/tool
+  fi
+
+  # Tool driver gets first crack — sets up its host-side state dirs,
+  # picks defaults that depend on the host (e.g. crush picks an
+  # Ollama model based on detected GPU VRAM).
+  tool_init
 
   local cwd=$(pwd)
 
@@ -125,84 +218,24 @@ FROM base AS project
 EOF
   fi
 
-  cat <<'EOF' > .clod/system/Dockerfile_wrapper
-FROM project AS wrapper
-
-COPY <<DEOF /usr/bin/claude-wrapper
-#!/bin/bash
-set -euo pipefail
-
-if [[ -f ~/.claude/claude.json ]]; then
-  cp ~/.claude/claude.json ~/.claude.json
-fi
-
-# Note: We intentionally do NOT copy ~/.claude.json back on exit.
-# The bot saves permissions directly to ~/.claude/claude.json (via volume mount),
-# and copying back would overwrite those saves with the stale copy made at startup.
-
-# Read default flags from .clod/claude-default-flags if it exists.
-if [[ -f .clod/claude-default-flags ]]; then
-  eval "claude \$(<.clod/claude-default-flags) \"\$@\""
-else
-  claude "\$@"
-fi
-DEOF
-RUN chmod u+x /usr/bin/claude-wrapper
-
-ARG GROUP_ID
-ARG GROUP_NAME
-ARG USER_ID
-ARG USER_NAME
-
-# Skip user/group operations if running as root (UID 0)
-RUN if [ "$USER_ID" != "0" ]; then \
-      (groupdel $(getent group "$GROUP_ID" | cut -d: -f1) || true) \
-      && (userdel $(getent passwd "$USER_ID" | cut -d: -f1) || true) \
-      && groupadd -g "$GROUP_ID" "$GROUP_NAME" \
-      && useradd -m -u "$USER_ID" -g "$GROUP_NAME" "$USER_NAME"; \
-    fi
-
-# Set home directory based on user (root uses /root, others use /home/$USER_NAME)
-ARG USER_HOME
-USER $USER_NAME
-WORKDIR $USER_HOME
-
-# Set environment before install so the native installer finds the right paths
-ENV HOME="$USER_HOME"
-ENV USER="$USER_NAME"
-ENV PATH="$PATH:$USER_HOME/bin:$USER_HOME/.local/bin"
-
-# Install Claude Code using native installer
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
-# Pre-populate ~/.ssh/known_hosts with the published SSH host keys
-# for the major git forges so the agent doesn't get an interactive
-# "Are you sure you want to continue connecting?" prompt the first
-# time it runs git over ssh. Keys are pinned verbatim from each
-# forge's official documentation rather than fetched via
-# ssh-keyscan, which would trust whatever IP responded during the
-# build.
-#
-# Sources (rotate these whenever a forge announces a key change):
-#   github.com    https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
-#   gitlab.com    https://docs.gitlab.com/ee/user/gitlab_com/#ssh-host-keys-fingerprints
-#   bitbucket.org https://support.atlassian.com/bitbucket-cloud/docs/configure-ssh-and-two-step-verification/
-RUN mkdir -p $USER_HOME/.ssh && chmod 700 $USER_HOME/.ssh && \
-    printf '%s\n' \
-      'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
-      'github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=' \
-      'github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=' \
-      'gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf' \
-      'gitlab.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFSMqzJeV9rUzU4kWitGjeR4PWSa29SPqJ1fVkhtj3Hw9xjLVXVYrU9QlYWrOLXBpQ6KWjbjTDTdDkoohFzgbEY=' \
-      'gitlab.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCsj2bNKTBSpIYDEGk9KxsGh3mySTRgMtXL583qmBpzeQ+jqCMRgBqB98u3z++J1sKlXHWfM9dyhSevkMwSbhoR8XIq/U0tCNyokEi/ueaBMCvbcTHhO7FcwzY92WK4Yt0aGROY5qX2UKSeOvuP4D6TPqKF1onrSzH9bx9XUf2lEdWT/ia1NEKjunUqu1xOB/StKDHMoX4/OKyIzuS0q/T1zOATthvasJFoPrAjkohTyaDUz2LN5JoH839hViyEG82yB+MjcFV5MU3N1l1QL3cVUCh93xSaua1N85qivl+siMkPGbO5xR/En4iEY6K2XPASUEMaieWVNTRCtJ4S8H+9' \
-      'bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO' \
-      'bitbucket.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPIQmuzMBuKdWeF4+a2sjSSpBK0iqitSQ+5BM9KhpexuGt20JpTVM7u5BDZngncgrqDMbWdxMWWOGtZ9UgbqgZE=' \
-      'bitbucket.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDQeJzhupRu0u0cdegZIa8e86EG2qOCsIsD1Xw0xSeiPDlCr7kq97NLmMbpKTX6Esc30NuoqEEHCuc7yWtwp8dI76EEEB1VqY9QJq6vk+aySyboD5QF61I/1WeTwu+deCbgKMGbUijeXhtfbxSxm6JwGrXrhBdofTsbKRUsrN1WoNgUa8uqN1Vx6WAJw1JHPhglEGGHea6QICwJOAr/6mrui/oB7pkaWKHj3z7d1IC4KWLtY47elvjbaTlkN04Kc/5LFEirorGYVbt15kAUlqGM65pk6ZBxtaO3+30LVlORZkxOh+LKL/BvbZ/iRNhItLqNyieoQj/uh/7Iv4uyH/cV/0b4WDSd3DptigWq84lJubb9t/DnZlrJazxyDCulTmKdOR7vs9gMTo+uoIrPSb8ScTtvw65+odKAlBj59dhnVp9zd7QUojOpXlL62Aw56U4oO+FALuevvMjiWeavKhJqlR7i5n9srYcrNV7ttmDw7kf/97P5zauIhxcjX+xHv4M=' \
-      > $USER_HOME/.ssh/known_hosts && \
-    chmod 644 $USER_HOME/.ssh/known_hosts
-
-ENTRYPOINT ["claude-wrapper"]
-EOF
+  # Dockerfile_wrapper is now assembled from common bits + tool
+  # driver hooks. Order:
+  #   FROM project AS wrapper
+  #   <tool root section: install daemons, write entrypoint script>
+  #   <common: user/group setup + USER switch + PATH>
+  #   <tool user-side install (claude lives in user's home; crush is
+  #     system-installed so this is a no-op for it)>
+  #   <common: SSH known_hosts pinning>
+  #   <tool ENTRYPOINT>
+  {
+    printf 'FROM project AS wrapper\n\n'
+    tool_dockerfile_root_section
+    emit_common_user_setup
+    tool_dockerfile_user_install
+    emit_common_known_hosts
+    printf '\n'
+    tool_dockerfile_entrypoint
+  } > .clod/system/Dockerfile_wrapper
 
   if [[ ! -f .clod/Dockerfile_user ]]; then
     cat <<'EOF' > .clod/Dockerfile_user
@@ -266,6 +299,28 @@ exec docker build \
   . >&2
 EOF
   chmod u+x .clod/system/build
+
+  # The run script is generated per-tool: tool_run_volume_args /
+  # tool_run_env_args / tool_run_extra_setup are interpolated into
+  # the heredoc at init time. The volume / env helpers emit lines
+  # with literal `$cwd`, `$user_home`, etc. that get expanded when
+  # the run script itself executes.
+  #
+  # The `; echo .` + `${var%.}` dance preserves trailing newlines that
+  # `$()` would otherwise strip — `tool_run_volume_args` outputs lines
+  # ending with `\<newline>` (shell line continuation) and the
+  # trailing newline is what separates the last volume from the next
+  # docker run argument.
+  local tool_volumes
+  tool_volumes="$(tool_run_volume_args; echo .)"
+  tool_volumes="${tool_volumes%.}"
+  local tool_envs
+  tool_envs="$(tool_run_env_args; echo .)"
+  tool_envs="${tool_envs%.}"
+  local tool_extra_setup=""
+  if declare -F tool_run_extra_setup >/dev/null; then
+    tool_extra_setup="$(tool_run_extra_setup)"
+  fi
 
   cat <<EOF > .clod/system/run
 #!/bin/env bash
@@ -477,17 +532,18 @@ trap cleanup EXIT
 # Always name the container, adding suffix in concurrent mode
 container_name="--name clod-\${name,,}-\$id\${runtime_suffix}"
 
+${tool_extra_setup}
+
 docker run \${tty_flag:-} --rm \\
   \${container_name} \\
   --hostname "clod-\$name-\$id" \\
   -v "\$cwd:\$cwd" \\
   -v "\$cwd/.clod:\$cwd/.clod:ro" \\
   -v "\$cwd/\$runtime_dir:\$cwd/\$runtime_dir:rw" \\
-  -v "\$cwd/.clod/claude:\$user_home/.claude" \\
-  \${ssh_volume:-} \\
+${tool_volumes}  \${ssh_volume:-} \\
   -w "\$cwd" \\
   -e "CLOD_RUNTIME_DIR=\$runtime_dir" \\
-  \${mcp_env:-} \\
+${tool_envs}  \${mcp_env:-} \\
   \${ssh_env:-} \\
   \${gpus_flag:-} \\
   \${entrypoint:-} \\
@@ -558,7 +614,7 @@ if [[ $needs_init == 'true' ]]; then
   read -p "Initialize the .clod directory? [Y/n] " yn
   case $yn in
     [Yy]* | '')
-      printf 'Initializing clod v%s...\n' "$CLOD_VERSION" >&2
+      printf 'Initializing clod v%s (tool: %s)...\n' "$CLOD_VERSION" "$CLOD_ACTIVE_TOOL" >&2
       initialize
       ;;
     *)
@@ -567,12 +623,14 @@ if [[ $needs_init == 'true' ]]; then
   esac
 elif [[ $needs_upgrade == 'true' ]]; then
   installed_version=${installed_version:-"unknown"}
-  printf 'Upgrading clod from v%s to v%s...\n' "$installed_version" "$CLOD_VERSION" >&2
+  printf 'Upgrading clod from v%s to v%s (tool: %s)...\n' "$installed_version" "$CLOD_VERSION" "$CLOD_ACTIVE_TOOL" >&2
   initialize
 fi
 
-# Pick up host credentials if they appeared after the initial init.
-sync_claude_config
+# Tool-side housekeeping that runs every invocation, not just init —
+# e.g. claude re-syncs ~/.claude.json into .clod/claude/ if the host
+# config appeared between init and now.
+tool_sync
 
 # It's go time!
 .clod/system/build
