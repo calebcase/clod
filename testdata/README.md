@@ -41,16 +41,28 @@ clod                           # interactive — Ctrl-C to exit
 
 The first run takes longer than claude mode because it downloads
 Ollama and the configured model. The model is auto-picked from the
-host's largest GPU VRAM (see the README's *Switching the underlying
-tool* section for the table); to keep iteration fast on a workstation
-with lots of VRAM, override before the first run:
+host's largest GPU VRAM (see the README's *Crush mode* section for
+the full table); on a B300-class box the default is
+`qwen3-coder:480b` (~270 GB pull), on a typical workstation it's
+`qwen3-coder:30b` (~17 GB pull). To keep iteration fast — at the
+cost of agentic capability, since the smaller fallbacks aren't
+tool-trained — override before the first run:
 
 ```bash
-mkdir -p .clod/crush
-echo 'qwen2.5-coder:0.5b' > .clod/crush/model
+mkdir -p .clod/crush/config
+echo 'qwen3:8b' > .clod/crush/config/model    # ~5 GB, decent tool-calling
+# or, smaller still (will start the stack but agentic UX gets shaky):
+echo 'qwen3:1.7b' > .clod/crush/config/model  # ~1.4 GB, CPU-friendly
 ```
 
-That pulls ~400 MB instead of 60+ GB.
+You can verify the auto-picker without pulling anything by sourcing
+the driver into a throwaway dir:
+
+```bash
+( cd $(mktemp -d) && \
+  source ~/src/github.com/calebcase/clod/bin/clod-tool/crush.sh && \
+  tool_init && cat .clod/crush/config/model )
+```
 
 ## Switching back
 

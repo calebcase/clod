@@ -126,24 +126,28 @@ The first time you run clod with a new tool selection, it re-initializes
 #### Crush mode (local-first)
 
 When `crush` is selected and the directory has no existing crush config,
-`clod` picks a coding model based on the largest GPU's VRAM:
+`clod` picks a coding model based on the largest GPU's VRAM. The default
+family is **Qwen3-Coder**, which is tuned specifically for the agentic
+function-calling shape Crush drives tools through (Bash, file edits,
+etc.). Earlier Qwen2.5-Coder generations are good at writing code but
+unreliable at issuing structured tool calls — they tend to print a bash
+command as prose and never run it.
 
-| Largest GPU VRAM | Model (Ollama tag) |
-| --- | --- |
-| ≥ 80 GB | `qwen2.5-coder:32b-instruct-fp16` |
-| ≥ 40 GB | `qwen2.5-coder:32b-instruct-q8_0` |
-| ≥ 24 GB | `qwen2.5-coder:32b` (default Q4_K_M) |
-| ≥ 12 GB | `qwen2.5-coder:14b` |
-| ≥ 6 GB | `qwen2.5-coder:7b` |
-| ≥ 3 GB | `qwen2.5-coder:3b` |
-| no GPU / unknown | `qwen2.5-coder:3b` (CPU fallback, slow) |
+| Largest GPU VRAM | Model (Ollama tag) | Notes |
+| --- | --- | --- |
+| ≥ 256 GB | `qwen3-coder:480b` | 480B MoE / 35B active. Closest open-weight analogue to Claude Code. |
+| ≥ 16 GB | `qwen3-coder:30b` | 30B MoE / 3B active. Sweet spot — fast and tool-capable on a single 24 GB GPU. |
+| ≥ 6 GB | `qwen3:8b` | General-purpose Qwen3 — decent tool-calling, smaller footprint. |
+| ≥ 3 GB | `qwen3:4b` | Smaller still; agentic UX gets shaky here. |
+| no GPU / smaller | `qwen3:1.7b` | CPU fallback. Stack starts but agentic work will feel sluggish and unreliable. |
 
-The choice is written to `.clod/crush/model` — edit that file (or the
-generated `.clod/crush/config/crush.json`) to override. Model blobs are
-cached on the host at `~/.cache/clod/ollama/` so a 20 GB pull only happens
-once on a given machine and is shared across every clod domain. The
-container starts an Ollama daemon on `127.0.0.1:11434`, pulls the
-configured model on first run, then runs `crush` in the foreground.
+The choice is written to `.clod/crush/config/model` — edit that file
+(or the generated `.clod/crush/config/crush.json`) to override.
+Model blobs are cached on the host at `~/.cache/clod/ollama/` so a
+multi-GB pull only happens once on a given machine and is shared
+across every clod domain. The container starts an Ollama daemon on
+`127.0.0.1:11434`, pulls the configured model on first run, then
+runs `crush` in the foreground.
 
 To switch back to Claude Code:
 

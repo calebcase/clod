@@ -17,26 +17,43 @@ TOOL_STATE_DIR=".clod/crush"
 # Bind-mounted into the container at $USER_HOME/.ollama/.
 OLLAMA_HOST_CACHE="${HOME}/.cache/clod/ollama"
 
-# Qwen2.5-Coder via Ollama is the default coding-tuned local model
-# family. Sizes (Q4_K_M unless noted) and approximate disk/VRAM:
-#   3b  ~ 2.0 GB
-#   7b  ~ 4.7 GB
-#   14b ~ 9.0 GB
-#   32b ~ 20  GB (default Q4_K_M)
+# Default-model picker.
 #
-# Higher-precision quants (q8_0, fp16) are pulled when the GPU has
-# the headroom — they noticeably improve coding quality. Edit
-# .clod/crush/model after init to override.
+# Qwen3-Coder is the default family because Crush is an *agentic*
+# tool — it expects the model to issue structured tool calls (Bash,
+# file edits, etc.) rather than narrate commands in prose. Qwen2.5-
+# Coder generates code well but isn't reliably tuned for the
+# function-call protocol Crush drives tools through, which surfaces
+# as the model echoing a `bash some-cmd` line in plain text instead
+# of actually running it. Qwen3-Coder was built specifically for
+# this agentic shape and is the closest open-weight analogue to
+# Claude Code today.
+#
+# Tag sizes (Ollama default Q4_K_M unless noted):
+#   qwen3-coder:480b   ~ 270 GB  (480B MoE, 35B active — only fits
+#                                 on hardware with hundreds of GB
+#                                 single-GPU VRAM; closest to a
+#                                 Claude-shaped experience)
+#   qwen3-coder:30b    ~  17 GB  (30B MoE, 3B active — sweet spot:
+#                                 fast, capable, fits on a single
+#                                 24 GB GPU)
+#   qwen3:8b           ~   5 GB  (general-purpose Qwen3, decent
+#                                 tool-calling, falls back when no
+#                                 GPU has room for qwen3-coder:30b)
+#   qwen3:4b           ~   2.5 GB
+#   qwen3:1.7b         ~   1.4 GB (CPU fallback — agentic UX will
+#                                  feel slow / unreliable, but at
+#                                  least the stack starts)
+#
+# Edit .clod/crush/config/model after init to override.
 pick_default_model_for_vram() {
     local vram_mib="$1"
     local vram_gib=$(( vram_mib / 1024 ))
-    if   (( vram_gib >= 80 )); then printf 'qwen2.5-coder:32b-instruct-fp16\n'
-    elif (( vram_gib >= 40 )); then printf 'qwen2.5-coder:32b-instruct-q8_0\n'
-    elif (( vram_gib >= 24 )); then printf 'qwen2.5-coder:32b\n'
-    elif (( vram_gib >= 12 )); then printf 'qwen2.5-coder:14b\n'
-    elif (( vram_gib >=  6 )); then printf 'qwen2.5-coder:7b\n'
-    elif (( vram_gib >=  3 )); then printf 'qwen2.5-coder:3b\n'
-    else                            printf 'qwen2.5-coder:3b\n'  # CPU fallback (slow)
+    if   (( vram_gib >= 256 )); then printf 'qwen3-coder:480b\n'
+    elif (( vram_gib >=  16 )); then printf 'qwen3-coder:30b\n'
+    elif (( vram_gib >=   6 )); then printf 'qwen3:8b\n'
+    elif (( vram_gib >=   3 )); then printf 'qwen3:4b\n'
+    else                             printf 'qwen3:1.7b\n'  # CPU fallback
     fi
 }
 
@@ -246,7 +263,7 @@ model_file="$HOME/.config/crush/model"
 if [[ -f "$model_file" ]]; then
   model=$(<"$model_file")
 else
-  model="qwen2.5-coder:7b"
+  model="qwen3-coder:30b"
 fi
 
 if ! curl -sSf "$ollama_url/api/tags" \
