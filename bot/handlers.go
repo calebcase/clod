@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -3583,7 +3584,7 @@ func (h *Handler) runClod(
 				flushBuffer() // Flush any pending output first.
 				var msgTS string
 				// Special case: AskUserQuestion gets a CLI-style picker.
-				if custom := h.tryPostAskUserQuestionPrompt(req, channelID, threadTS, progressKey, logger); custom != "" {
+				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, logger); custom != "" {
 					msgTS = custom
 				} else {
 					// For ExitPlanMode with a long plan, upload the full
@@ -3591,10 +3592,18 @@ func (h *Handler) runClod(
 					// portion that won't fit in the truncated prompt.
 					planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
 					blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
+					postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
 					var err error
-					msgTS, err = h.bot.PostMessageBlocks(channelID, blocks, threadTS)
+					msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
+					cancelPost()
 					if err != nil {
-						logger.Error().Err(err).Msg("failed to post permission prompt")
+						if errors.Is(err, context.DeadlineExceeded) {
+							logger.Error().Dur("deadline", permissionPostTimeout).
+								Str("tool_name", req.ToolName).
+								Msg("permission prompt post hit deadline; denying so claude doesn't hang")
+						} else {
+							logger.Error().Err(err).Msg("failed to post permission prompt")
+						}
 						// Send deny on failure to post.
 						task.SendPermissionResponse(
 							PermissionResponse{Behavior: "deny", Message: "Failed to prompt user"},
@@ -3640,15 +3649,23 @@ func (h *Handler) runClod(
 				flushBuffer() // Flush any pending output first.
 				var msgTS string
 				// Special case: AskUserQuestion gets a CLI-style picker.
-				if custom := h.tryPostAskUserQuestionPrompt(req, channelID, threadTS, progressKey, logger); custom != "" {
+				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, logger); custom != "" {
 					msgTS = custom
 				} else {
 					planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
 					blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
+					postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
 					var err error
-					msgTS, err = h.bot.PostMessageBlocks(channelID, blocks, threadTS)
+					msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
+					cancelPost()
 					if err != nil {
-						logger.Error().Err(err).Msg("failed to post control permission prompt")
+						if errors.Is(err, context.DeadlineExceeded) {
+							logger.Error().Dur("deadline", permissionPostTimeout).
+								Str("tool_name", req.ToolName).
+								Msg("control permission prompt post hit deadline; denying so claude doesn't hang")
+						} else {
+							logger.Error().Err(err).Msg("failed to post control permission prompt")
+						}
 						// Send deny on failure to post.
 						if err := task.SendControlResponse(task.pendingControlRequestID, "deny", "Failed to prompt user"); err != nil {
 							logger.Error().Err(err).Msg("failed to send deny control response")
@@ -3972,28 +3989,71 @@ func (h *Handler) buildPermissionBlocks(req PermissionRequest, progressKey strin
 	return blocks
 }
 
+// permissionPostTimeout bounds Slack chat.postMessage calls in the
+// permission-request handlers. Without this, a slow Slack API or a
+// network hiccup will wedge the runClod select-loop indefinitely
+// (the loop processes one case at a time, and a stuck PostMessage
+// call inside one case starves all the others — text streaming,
+// other permissions, ticker, ctx.Done).
+//
+// 30s is loose enough that ordinary Slack latency is fine, tight
+// enough that the user sees something happen ("failed to post …
+// retry by mentioning") instead of a silent dormant thread.
+const permissionPostTimeout = 30 * time.Second
+
 // tryPostAskUserQuestionPrompt renders the CLI-style Q&A picker in Slack when
 // the tool is AskUserQuestion and the input parses into a valid question set.
 // Returns the Slack message TS if a custom prompt was posted (and the caller
 // should NOT fall back to the generic permission prompt). Returns "" when the
 // tool/input doesn't qualify so the caller can use the generic path.
+//
+// Tracing: the AskUserQuestion path used to be a black box — if the
+// Slack call hung or the parser silently returned no questions, the
+// only log was "received permission request" from permission_fifo
+// upstream and then nothing until the next event. Now every branch
+// emits a debug-level breadcrumb so future failures show which step
+// dropped the request.
 func (h *Handler) tryPostAskUserQuestionPrompt(
+	ctx context.Context,
 	req PermissionRequest,
 	channelID, threadTS, progressKey string,
 	logger zerolog.Logger,
 ) string {
+	logger = logger.With().Str("phase", "askuserquestion").Logger()
 	if req.ToolName != "AskUserQuestion" {
+		logger.Debug().Str("tool_name", req.ToolName).Msg("not an AskUserQuestion; falling back to generic permission prompt")
 		return ""
 	}
+	logger.Debug().Msg("entered AskUserQuestion handler")
+
 	questions := parseAskUserQuestionInput(req.ToolInput)
 	if len(questions) == 0 {
+		logger.Warn().
+			Int("input_keys", len(req.ToolInput)).
+			Msg("AskUserQuestion input did not parse into any questions; falling back to generic permission prompt")
 		return ""
 	}
+	logger.Debug().Int("num_questions", len(questions)).Msg("parsed AskUserQuestion input")
 
 	blocks := buildAskUserQuestionBlocks(questions, progressKey)
-	msgTS, err := h.bot.PostMessageBlocks(channelID, blocks, threadTS)
+	logger.Debug().
+		Int("num_questions", len(questions)).
+		Int("num_blocks", len(blocks)).
+		Msg("posting AskUserQuestion prompt to slack")
+
+	postCtx, cancel := context.WithTimeout(ctx, permissionPostTimeout)
+	defer cancel()
+	msgTS, err := h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to post AskUserQuestion prompt")
+		// Distinguish deadline from other failures so the operator
+		// can tell "Slack was slow" from "Slack rejected the
+		// payload" — they call for different fixes.
+		if errors.Is(err, context.DeadlineExceeded) {
+			logger.Error().Dur("deadline", permissionPostTimeout).
+				Msg("AskUserQuestion post hit deadline; falling back to generic permission prompt")
+		} else {
+			logger.Error().Err(err).Msg("failed to post AskUserQuestion prompt; falling back to generic permission prompt")
+		}
 		return ""
 	}
 
