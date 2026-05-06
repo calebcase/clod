@@ -129,3 +129,49 @@ For more info, see [the docs](https://example.com).
 		t.Error("Link not converted")
 	}
 }
+
+// TestGFMTableRendersAsCodeBlock guards the regression the bot saw
+// in 0.31.x: a GFM pipe-table from claude/agent output had no
+// `*ast.Table` case in mrkdwnRenderer, so cells fell through and
+// concatenated with no separator. Bold markers around adjacent
+// cells (`**14.40**` and `**2.30×**`) ended up touching, which
+// rendered as the gibberish `*14.40**2.30×*` in Slack.
+//
+// Expected behaviour now: tables render as a fenced code block
+// with space-padded columns. We don't pin the exact spacing —
+// just check the cells appear as separate tokens, the bold-
+// adjacency artefact is gone, and the result is wrapped in a
+// fence so Slack treats it as monospace.
+func TestGFMTableRendersAsCodeBlock(t *testing.T) {
+	input := `| Config             | Time  | Speedup |
+| ------------------ | ----- | ------- |
+| BF16+compile       | 33.11 | 1.00×   |
+| BF16+compile+FA4   | 19.16 | 1.73×   |
+| TE+compile+FA4+fqkv | **14.40** | **2.30×** |
+`
+	result := ConvertMarkdownToMrkdwn(input)
+
+	// Wrapped in a fenced code block.
+	if !strings.HasPrefix(strings.TrimLeft(result, "\n"), "```") {
+		t.Errorf("expected table to start with ```; got:\n%s", result)
+	}
+	// Separator row under the header.
+	if !strings.Contains(result, "---") {
+		t.Errorf("expected dashed header separator; got:\n%s", result)
+	}
+	// Cells must not be smushed together. Pick a transition that
+	// the bug specifically manifested on:
+	if strings.Contains(result, "33.111.00") || strings.Contains(result, "compile33.11") {
+		t.Errorf("table cells appear concatenated without whitespace; got:\n%s", result)
+	}
+	// And the bold-adjacency artefact ("*14.40**2.30×*") must be gone.
+	if strings.Contains(result, "*14.40**2.30") {
+		t.Errorf("adjacent-bold collapse regression; got:\n%s", result)
+	}
+	// Cells should still be there.
+	for _, cell := range []string{"BF16+compile", "33.11", "1.73×", "TE+compile+FA4+fqkv"} {
+		if !strings.Contains(result, cell) {
+			t.Errorf("missing cell %q in output:\n%s", cell, result)
+		}
+	}
+}
