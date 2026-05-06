@@ -365,6 +365,15 @@ func (b *Bot) RemoveReaction(channelID, messageTS, name string) error {
 
 // PostMessageBlocks sends a message with blocks to a channel.
 func (b *Bot) PostMessageBlocks(channelID string, blocks []slack.Block, threadTS string) (string, error) {
+	return b.PostMessageBlocksContext(context.Background(), channelID, blocks, threadTS)
+}
+
+// PostMessageBlocksContext is the context-aware variant. Use this from
+// hot loops (like the permission-request handler in runClod) where a
+// hung Slack call would otherwise wedge the entire loop and stop the
+// bot from servicing other events on the thread. Pass a deadline-
+// bounded context so transient Slack issues don't wedge the bot.
+func (b *Bot) PostMessageBlocksContext(ctx context.Context, channelID string, blocks []slack.Block, threadTS string) (string, error) {
 	opts := []slack.MsgOption{
 		slack.MsgOptionBlocks(blocks...),
 	}
@@ -372,7 +381,7 @@ func (b *Bot) PostMessageBlocks(channelID string, blocks []slack.Block, threadTS
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 
-	_, ts, err := b.client.PostMessage(channelID, opts...)
+	_, ts, err := b.client.PostMessageContext(ctx, channelID, opts...)
 	if err != nil {
 		return "", oops.Trace(err)
 	}
