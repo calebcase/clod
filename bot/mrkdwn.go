@@ -190,6 +190,35 @@ func (r *mrkdwnRenderer) RenderNode(w io.Writer, node ast.Node, entering bool) a
 		}
 		return ast.GoToNext
 
+	case *ast.Table:
+		// GFM pipe tables don't have a Slack-mrkdwn equivalent — Slack
+		// has no native table syntax. The cleanest fallback is to
+		// render as a fenced code block with space-padded columns:
+		// monospace alignment carries the structure, the column gaps
+		// are visually obvious, and the agent's `**bold**` markers
+		// degrade to literal asterisks (less informative but readable
+		// and unambiguous).
+		//
+		// Without this case the default walker descends through
+		// Table → {Header,Body,Footer} → Row → Cell with no separator
+		// emission, smushing every cell's text together. That's the
+		// bug this case fixes — a table like
+		//   | Config             | Time  | Speedup |
+		//   | BF16+compile       | 33.11 | 1.00×   |
+		//   | BF16+compile+FA4   | 19.16 | 1.73×   |
+		// would otherwise render as
+		//   `Config Time SpeedupBF16+compile33.111.00×...`
+		// in Slack.
+		if !entering {
+			return ast.GoToNext
+		}
+		rows := collectTableRows(n, r)
+		if len(rows) == 0 {
+			return ast.SkipChildren
+		}
+		_, _ = fmt.Fprint(w, formatTableAsCodeBlock(rows))
+		return ast.SkipChildren
+
 	case *ast.Softbreak:
 		if entering {
 			_, _ = fmt.Fprint(w, "\n")
@@ -225,3 +254,98 @@ func (r *mrkdwnRenderer) RenderNode(w io.Writer, node ast.Node, entering bool) a
 func (r *mrkdwnRenderer) RenderHeader(w io.Writer, node ast.Node) {}
 
 func (r *mrkdwnRenderer) RenderFooter(w io.Writer, node ast.Node) {}
+
+// collectTableRows walks an *ast.Table subtree and returns its cells
+// as a [][]string, header row first (when present), then body rows,
+// then footer rows. Cell content is rendered through the same
+// mrkdwn renderer (so `**bold**` becomes `*bold*`, links keep their
+// `<url|text>` form, etc.) and then trimmed of surrounding
+// whitespace and newlines so it fits a single table row.
+func collectTableRows(table *ast.Table, r *mrkdwnRenderer) [][]string {
+	var rows [][]string
+	for _, section := range table.GetChildren() {
+		// section is *ast.TableHeader, *ast.TableBody, or *ast.TableFooter
+		for _, rowNode := range section.GetChildren() {
+			row, ok := rowNode.(*ast.TableRow)
+			if !ok {
+				continue
+			}
+			var cells []string
+			for _, cellNode := range row.GetChildren() {
+				cell, ok := cellNode.(*ast.TableCell)
+				if !ok {
+					continue
+				}
+				var buf strings.Builder
+				for _, child := range cell.GetChildren() {
+					buf.Write(markdown.Render(child, r))
+				}
+				cells = append(cells, strings.TrimSpace(buf.String()))
+			}
+			rows = append(rows, cells)
+		}
+	}
+	return rows
+}
+
+// formatTableAsCodeBlock renders rows into a fenced ``` block with
+// space-padded columns. Header row (if any) is followed by a dashed
+// separator so the eye finds the data section quickly.
+func formatTableAsCodeBlock(rows [][]string) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	// Column widths: max len of any cell in that column.
+	cols := 0
+	for _, row := range rows {
+		if len(row) > cols {
+			cols = len(row)
+		}
+	}
+	widths := make([]int, cols)
+	for _, row := range rows {
+		for i, cell := range row {
+			if l := len(cell); l > widths[i] {
+				widths[i] = l
+			}
+		}
+	}
+
+	var out strings.Builder
+	out.WriteString("```\n")
+	const colGap = "  "
+	writeRow := func(row []string) {
+		for i := 0; i < cols; i++ {
+			if i > 0 {
+				out.WriteString(colGap)
+			}
+			cell := ""
+			if i < len(row) {
+				cell = row[i]
+			}
+			out.WriteString(cell)
+			for p := len(cell); p < widths[i]; p++ {
+				out.WriteByte(' ')
+			}
+		}
+		out.WriteByte('\n')
+	}
+	writeRow(rows[0])
+	if len(rows) > 1 {
+		// dashed separator under the header
+		for i := 0; i < cols; i++ {
+			if i > 0 {
+				out.WriteString(colGap)
+			}
+			for p := 0; p < widths[i]; p++ {
+				out.WriteByte('-')
+			}
+		}
+		out.WriteByte('\n')
+	}
+	for _, row := range rows[1:] {
+		writeRow(row)
+	}
+	out.WriteString("```\n")
+	return out.String()
+}
