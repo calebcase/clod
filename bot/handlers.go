@@ -5525,14 +5525,25 @@ type TaskStats struct {
 
 // postStatsMessage posts a formatted stats message using Slack blocks.
 //
-// Each stream-json `result` event carries per-interaction stats (one
-// user message's cost/turns/duration), NOT a running total for the
-// claude process — confirmed both by the Agent SDK cost-tracking docs
-// and empirically (e.g. successive `num_turns` values of 79, 22, 1 in
-// one process's results would be non-monotonic if cumulative). So we
-// add each event into the session's running totals and render those.
-// That scheme also survives process restarts: a `--resume` run's new
-// per-interaction stats simply keep adding to the prior totals.
+// Cost and turns have different aggregation semantics in claude's
+// stream-json output:
+//
+//   - `total_cost_usd` is cumulative-since-process-start, AND
+//     `--resume` restores it from saved session state (verified by
+//     disassembling the claude binary: `cL()` returns the global
+//     `F$.totalCostUSD`, the reset path `uU4()` has no call sites
+//     in `-p --input-format stream-json` mode, and the resume
+//     restore writes `F$.totalCostUSD = H` from a saved blob).
+//     So we forward it as-is and let SessionStore.AddStats compute
+//     the per-result delta against its own LastClaudeCostUSD.
+//   - `num_turns` is per-call (`mutableMessages.length` /
+//     `O$.turnCount`), so AddStats just adds it.
+//
+// The pre-fix code treated `total_cost_usd` as per-result and
+// `+=`'d cumulative-into-cumulative, producing quadratic-ish growth
+// — that bug is what put $60k+ into sessions.json and is also why
+// existing CumulativeCostUSD values get reset on first start after
+// the migration in session.go (runCostMigrationV1Locked).
 func (h *Handler) postStatsMessage(channelID, threadTS, statsJSON string) {
 	var stats TaskStats
 	if err := json.Unmarshal([]byte(statsJSON), &stats); err != nil {
