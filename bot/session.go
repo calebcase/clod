@@ -91,8 +91,30 @@ type SessionMapping struct {
 	// would otherwise reset cost/turn counters — the user loses the big
 	// picture of what the thread is spending. These fields persist the
 	// running total so the stats block always shows lifetime numbers.
+	//
+	// Cost has different aggregation semantics than turns: claude reports
+	// `total_cost_usd` as cumulative-since-process-start (and restores it
+	// on `--resume`), while `num_turns` is per-call. So `CumulativeTurns`
+	// is just `+= num_turns`, but `CumulativeCostUSD` is fed deltas
+	// against `LastClaudeCostUSD` (see AddStats). The pre-fix code
+	// `+=`'d cumulative-into-cumulative, producing quadratic-ish growth
+	// — that's how we ended up with $60k+ figures in sessions.json.
 	CumulativeCostUSD float64 `json:"cumulative_cost_usd,omitempty"`
 	CumulativeTurns   int     `json:"cumulative_turns,omitempty"`
+	// LastClaudeCostUSD is the most recent `total_cost_usd` we observed
+	// from claude for this thread's process chain. Used to compute the
+	// per-result delta to add to CumulativeCostUSD. Persists across
+	// bot restarts so a resumed claude process (which restores its
+	// internal totalCostUSD from saved state) lines up with our last
+	// observation.
+	LastClaudeCostUSD float64 `json:"last_claude_cost_usd,omitempty"`
+	// CostBaselinePending is set during the one-time cost-bug migration
+	// (sessions.json had inflated CumulativeCostUSD values from the
+	// quadratic-growth bug). When true, the next observed cost
+	// establishes the baseline without crediting anything to
+	// CumulativeCostUSD — we don't know the true prior cumulative,
+	// only that further deltas should accumulate from this point on.
+	CostBaselinePending bool `json:"cost_baseline_pending,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 }
@@ -587,11 +609,23 @@ func (s *SessionStore) SetModel(channelID, threadTS, model string) {
 	session.UpdatedAt = time.Now()
 }
 
-// AddStats increments the thread's cumulative cost and turn counters
-// and returns the new totals. Called after each clod invocation's
-// `result` stream message so the stats block reflects lifetime
-// numbers rather than just the current process's run.
-func (s *SessionStore) AddStats(channelID, threadTS string, costUSD float64, turns int) (float64, int) {
+// AddStats folds a `result` stream event's stats into the thread's
+// running totals and returns the new totals.
+//
+// `claudeCumulativeCostUSD` is claude's `total_cost_usd` field as-is:
+// cumulative-since-process-start (and restored across `--resume` from
+// saved session state). We delta against `LastClaudeCostUSD` to
+// extract this result's contribution. `turns` is per-call (claude's
+// `num_turns` is `mutableMessages.length`), so it just adds.
+//
+// On the first observation of a fresh session, `LastClaudeCostUSD`
+// is 0 and the full cumulative is credited (correct). On the first
+// observation after the one-time migration, `CostBaselinePending`
+// short-circuits crediting and just records the baseline so future
+// deltas accumulate cleanly — we deliberately lose this single
+// result's cost contribution to avoid double-counting the prior
+// inflated total.
+func (s *SessionStore) AddStats(channelID, threadTS string, claudeCumulativeCostUSD float64, turns int) (float64, int) {
 	s.mu.Lock()
 	k := key(channelID, threadTS)
 	session := s.sessions[k]
@@ -603,21 +637,51 @@ func (s *SessionStore) AddStats(channelID, threadTS string, costUSD float64, tur
 		}
 		s.sessions[k] = session
 	}
-	session.CumulativeCostUSD += costUSD
+
+	var costDelta float64
+	switch {
+	case session.CostBaselinePending:
+		// Migration handoff: don't credit anything; just record where
+		// claude's cumulative is now, so subsequent results delta
+		// cleanly off this point.
+		session.CostBaselinePending = false
+		costDelta = 0
+	case claudeCumulativeCostUSD < session.LastClaudeCostUSD:
+		// Claude reported a cumulative value lower than what we last
+		// saw. This shouldn't happen in normal operation (cumulative
+		// is monotonic within a process and resume restores the
+		// prior total), but if it does — e.g. a session-state file
+		// got rolled back, or we somehow associated stats with the
+		// wrong session — treat it as a fresh baseline rather than
+		// crediting a negative delta.
+		s.logger.Warn().
+			Str("channel", channelID).
+			Str("thread", threadTS).
+			Float64("observed", claudeCumulativeCostUSD).
+			Float64("last", session.LastClaudeCostUSD).
+			Msg("claude cumulative cost decreased; resetting baseline without credit")
+		costDelta = 0
+	default:
+		costDelta = claudeCumulativeCostUSD - session.LastClaudeCostUSD
+	}
+	session.LastClaudeCostUSD = claudeCumulativeCostUSD
+	session.CumulativeCostUSD += costDelta
 	session.CumulativeTurns += turns
 	session.UpdatedAt = time.Now()
 	cumulativeCost := session.CumulativeCostUSD
 	cumulativeTurns := session.CumulativeTurns
 	// Append a usage sample under the same lock so readers see a
-	// consistent cumulative-plus-sample pair. UserID must be set on
-	// the session for the sample to count toward the per-user
+	// consistent cumulative-plus-sample pair. The sample carries the
+	// per-result delta — same value we just added to the thread
+	// total — so windowed rollups sum correctly. UserID must be set
+	// on the session for the sample to count toward the per-user
 	// Workspace rollup; anonymous sessions contribute to lifetime
 	// cumulatives but not to the windowed rollup.
 	userID := session.UserID
 	if userID != "" {
 		s.usage = append(s.usage, &UsageSample{
 			UserID:  userID,
-			CostUSD: costUSD,
+			CostUSD: costDelta,
 			Turns:   turns,
 			At:      time.Now(),
 		})
@@ -845,17 +909,66 @@ func (s *SessionStore) Load() error {
 		s.sessions[key(session.ChannelID, session.ThreadTS)] = session
 	}
 
+	if err := s.runCostMigrationV1Locked(); err != nil {
+		s.logger.Warn().Err(err).Msg("cost migration v1 sidecar write failed; will retry on next start")
+	}
+
+	return nil
+}
+
+// runCostMigrationV1Locked performs the one-time reset of inflated
+// CumulativeCostUSD values caused by the AddStats `+=`-of-cumulative
+// bug. Idempotent via a sidecar marker file: if the marker exists,
+// no-op. Otherwise zero every session's CumulativeCostUSD, set
+// CostBaselinePending=true so the next observed cost establishes
+// the baseline without crediting, and write the marker.
+//
+// Caller holds s.mu (Load takes it for the whole load + migration).
+func (s *SessionStore) runCostMigrationV1Locked() error {
+	marker := s.path + ".cost-migration-v1.done"
+	if _, err := os.Stat(marker); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return oops.Trace(err)
+	}
+
+	for _, session := range s.sessions {
+		session.CumulativeCostUSD = 0
+		session.LastClaudeCostUSD = 0
+		session.CostBaselinePending = true
+	}
+	s.logger.Info().
+		Int("sessions", len(s.sessions)).
+		Msg("cost migration v1: zeroed CumulativeCostUSD; baselines pending on next result")
+
+	// Persist the reset values before dropping the marker so a crash
+	// between save and marker write doesn't leave us in a half-migrated
+	// state. saveLocked avoids the s.mu re-acquire that Save would do.
+	if err := s.saveLocked(); err != nil {
+		return oops.Trace(err)
+	}
+
+	if err := os.WriteFile(marker, []byte("v1\n"), 0o644); err != nil {
+		return oops.Trace(err)
+	}
 	return nil
 }
 
 // Save writes sessions to the JSON file atomically.
 func (s *SessionStore) Save() error {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.saveLocked()
+}
+
+// saveLocked writes sessions to disk without taking s.mu. Caller
+// must already hold s.mu (read or write lock both work — we only
+// read s.sessions here).
+func (s *SessionStore) saveLocked() error {
 	sessions := make([]*SessionMapping, 0, len(s.sessions))
 	for _, session := range s.sessions {
 		sessions = append(sessions, session)
 	}
-	s.mu.RUnlock()
 
 	data, err := json.MarshalIndent(sessions, "", "  ")
 	if err != nil {
