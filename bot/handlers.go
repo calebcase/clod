@@ -108,6 +108,21 @@ type Handler struct {
 	// gets reported.
 	expectedTaskCancels sync.Map
 
+	// shutdownForResume marks progressKeys whose task is being
+	// stopped via Bot.Shutdown — i.e. the bot is going down and
+	// wants the session auto-resumed on next start. finalizeTask
+	// reads this to skip the usual cleanExit "clear Active flag"
+	// step, leaving Active=true on disk so ResumeActiveSessions
+	// picks the thread up after the next boot.
+	//
+	// Why this is needed even though graceful shutdown is "clean":
+	// the agent processes the save-state message, emits a clean
+	// `result`, and exits — runClod sees no error, so cleanExit
+	// is true and finalizeTask would otherwise clear Active. The
+	// `@bot close` and model-restart paths set Active=false
+	// explicitly themselves, so they don't go through this map.
+	shutdownForResume sync.Map
+
 	// userNameCache memoizes Slack user_id → display name lookups for
 	// the session. Slack's team/users.info is rate-limited and we call
 	// it once per distinct author when formatting referenced threads.
@@ -363,6 +378,11 @@ func NewHandler(bot *Bot, verboseTools []string, defaultVerbosityLevel int, defa
 // or been forcefully killed. Used by Bot.Shutdown for SIGTERM-driven
 // stops; per-thread close/restart paths call Shutdown directly with
 // their own message.
+//
+// Each thread is tagged in shutdownForResume before its Shutdown
+// runs, so finalizeTask preserves Active=true on the way out.
+// That makes ResumeActiveSessions on the next bot start pick the
+// thread up automatically — the whole point of saving state.
 func (h *Handler) ShutdownAllTasks(ctx context.Context, gracePeriod time.Duration) {
 	var wg sync.WaitGroup
 	h.runningTasks.Range(func(k, v any) bool {
@@ -370,6 +390,7 @@ func (h *Handler) ShutdownAllTasks(ctx context.Context, gracePeriod time.Duratio
 		if !ok {
 			return true
 		}
+		h.shutdownForResume.Store(k, true)
 		wg.Add(1)
 		go func(key any, t *RunningTask) {
 			defer wg.Done()
@@ -3127,37 +3148,29 @@ func (h *Handler) handleContinuation(
 	}
 }
 
-// ResumeActiveSessions is called once at bot startup. Any session still
-// flagged Active in sessions.json (the bot previously crashed / was killed
-// / timed out without a clean completion) gets revived: we post a notice
-// in the thread and spawn runClod with --resume + a nudge prompt that
-// tells the agent to pick up where it left off. Sessions whose UpdatedAt
-// is older than maxAge are considered stale — we clear the flag without
-// resuming so stopped-then-left-overnight threads don't all wake up at
-// once. Sessions where the agent was idle (between turns) when the bot
-// died are also skipped: there was no work in progress, so waking the
-// thread would be pure noise. The next user message in the thread will
-// pick up via the normal resume-on-mention path.
+// ResumeActiveSessions is called once at bot startup. Any session
+// still flagged Active in sessions.json (the bot previously
+// shut-down-for-resume / crashed / was killed / timed out without
+// fully wrapping up) gets revived: we post a notice in the thread
+// and spawn runClod with --resume + a nudge prompt that tells the
+// agent to re-read whatever state it saved and re-establish any
+// interrupted work. Sessions whose UpdatedAt is older than maxAge
+// are considered stale — we clear the flag without resuming so
+// stopped-then-left-overnight threads don't all wake up at once
+// (e.g. the bot was offline for the weekend).
+//
+// Idle sessions are NOT skipped. With graceful shutdown in place,
+// even an "idle between turns" session has a session ID and
+// conversation history worth re-establishing — and the agent's
+// own save-state response to the shutdown message may have left
+// notes worth re-reading. The next mention-driven turn would
+// resume anyway; doing it eagerly here keeps the home tab's
+// "active" indicator honest.
 func (h *Handler) ResumeActiveSessions(ctx context.Context, maxAge time.Duration) {
 	fresh, stale := h.bot.sessions.ActiveSessions(maxAge)
 
-	// Partition fresh into actually-busy (resume) vs idle (skip without
-	// a wake-up notice). The Idle flag was true on disk iff the agent
-	// emitted its `result` for the previous turn and no further user
-	// input arrived before the bot exited.
-	var busy []*SessionMapping
-	var idle []*SessionMapping
-	for _, s := range fresh {
-		if s.Idle {
-			idle = append(idle, s)
-		} else {
-			busy = append(busy, s)
-		}
-	}
-
 	logger := h.logger.With().
-		Int("busy", len(busy)).
-		Int("idle", len(idle)).
+		Int("fresh", len(fresh)).
 		Int("stale", len(stale)).
 		Dur("max_age", maxAge).
 		Logger()
@@ -3174,34 +3187,20 @@ func (h *Handler) ResumeActiveSessions(ctx context.Context, maxAge time.Duration
 			Msg("skipping stale active session")
 		h.bot.sessions.SetActive(s.ChannelID, s.ThreadTS, false)
 	}
-	// Idle sessions: the process is gone (died with the bot), so the
-	// on-disk Active=true is misleading. Clear it so subsequent
-	// startups don't keep re-evaluating these threads, and so the
-	// home tab's "active" indicator reflects reality. Idle stays as
-	// last-known state for diagnostic value; the next runClod start
-	// will reset it.
-	for _, s := range idle {
-		h.logger.Info().
-			Str("channel", s.ChannelID).
-			Str("thread_ts", s.ThreadTS).
-			Str("task", s.TaskName).
-			Msg("skipping idle active session — no work was in progress when bot exited")
-		h.bot.sessions.SetActive(s.ChannelID, s.ThreadTS, false)
-	}
-	if len(stale)+len(idle) > 0 {
+	if len(stale) > 0 {
 		if err := h.bot.sessions.Save(); err != nil {
 			logger.Error().Err(err).Msg("failed to persist cleared active flags")
 		}
 	}
 
-	if len(busy) == 0 {
-		logger.Debug().Msg("no busy active sessions to resume")
+	if len(fresh) == 0 {
+		logger.Debug().Msg("no fresh active sessions to resume")
 		return
 	}
 
 	logger.Info().Msg("resuming active sessions after bot restart")
 
-	for _, s := range busy {
+	for _, s := range fresh {
 		s := s // capture for goroutine
 		go h.resumeOneSession(ctx, s)
 	}
@@ -3269,10 +3268,14 @@ func (h *Handler) resumeOneSession(ctx context.Context, s *SessionMapping) {
 		logger.Debug().Err(err).Msg("failed to post resume notice")
 	}
 
-	nudge := "The bot was restarted while this task was in progress. " +
-		"Continue where you left off: if you had state worth saving, check it now; " +
-		"if you were monitoring a background process, verify it's still alive and restart it if needed; " +
-		"otherwise simply resume the work. Do not redo steps that already completed."
+	nudge := "You are being resumed after a bot shutdown. Before doing anything else: " +
+		"re-read any state, notes, or progress markers you saved under the current " +
+		"working directory (a graceful shutdown gave you a chance to flush these to disk; " +
+		"`.clod/` is wrapper-owned, so look in your own subdirs). " +
+		"Re-establish work that was interrupted: if you had background processes under " +
+		"the Monitor tool, they died with the previous container — verify their on-disk " +
+		"state and restart them if still needed. Then continue from where you left off. " +
+		"Do not redo steps that already completed."
 
 	h.runClod(
 		ctx,
@@ -3766,6 +3769,11 @@ done:
 // and clears the Active flag *only* on clean completion. An error exit
 // (crash, timeout, shutdown cancel) leaves Active set so the next bot
 // startup can resume-or-skip based on the staleness threshold.
+//
+// One additional case preserves Active=true even on clean exit: when
+// the task ended because Bot.Shutdown asked it to save state and
+// stop. The shutdownForResume marker (set by ShutdownAllTasks) tells
+// us to leave the flag alone so the next bot start auto-resumes.
 func (h *Handler) finalizeTask(
 	channelID, threadTS, taskName, taskPath, userID string,
 	result *Result,
@@ -3777,6 +3785,10 @@ func (h *Handler) finalizeTask(
 	expectedCancel := false
 	if _, ok := h.expectedTaskCancels.LoadAndDelete(progressKey); ok {
 		expectedCancel = true
+	}
+	shutdownForResume := false
+	if _, ok := h.shutdownForResume.LoadAndDelete(progressKey); ok {
+		shutdownForResume = true
 	}
 	if result.Error != nil {
 		logger.Error().Err(result.Error).Bool("expected_cancel", expectedCancel).Msg("clod returned error")
@@ -3825,15 +3837,18 @@ func (h *Handler) finalizeTask(
 		session.TaskName = taskName
 		session.TaskPath = taskPath
 		h.bot.sessions.Set(session)
-		if cleanExit {
+		if cleanExit && !shutdownForResume {
 			// Route through SetActive so the transition is logged
 			// alongside every other clear of the Active flag.
 			h.bot.sessions.SetActive(channelID, threadTS, false)
 		}
+		if shutdownForResume {
+			logger.Info().Msg("preserving Active=true: bot is shutting down, will auto-resume on next start")
+		}
 		if err := h.bot.sessions.Save(); err != nil {
 			logger.Error().Err(err).Msg("failed to save sessions")
 		}
-	} else if cleanExit {
+	} else if cleanExit && !shutdownForResume {
 		// No session_id captured (e.g., failure before init). Clear
 		// the Active flag anyway so we don't try to resume a task
 		// claude never accepted.
