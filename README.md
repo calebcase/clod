@@ -558,7 +558,7 @@ new teammate joining the team.
 
 - **Socket Mode** — no public endpoint needed; the bot dials out to Slack
 - **Multiple ways to start a session** — pick an existing domain, auto-name a new domain (with optional template), run in the workspace root itself, or use "host-direct" mode that bypasses the docker sandbox
-- **Session persistence** — continue conversations across Slack threads; auto-resumes mid-turn work when the bot restarts, but skips threads that were idle (last turn ended cleanly with no outstanding `AskUserQuestion` or permission prompt) so a deploy doesn't wake every dormant thread
+- **Session persistence** — continue conversations across Slack threads; on bot restart every active session is auto-resumed (mid-turn work AND idle-between-turns), with a prompt that tells the agent to re-read whatever state it saved during graceful shutdown. Sessions that haven't been touched within `CLOD_BOT_RESUME_STALE_AFTER` (default 30m) are skipped to keep an overnight outage from waking every thread at once
 - **Permission prompts** — interactive Slack buttons for tool approvals, with persistent allow/deny patterns
 - **Per-session settings** — model (`opus` / `sonnet` / `haiku` / point releases / 1M-context variants), effort level, plan mode, verbosity, file-sync toggle, per-session allowlist
 - **File handling** — Slack attachments come into the domain dir; new/changed files in the domain dir flow back to Slack as snippets (toggleable). `@bot upload <path>` pushes host files into the thread, zipping anything over the threshold
@@ -837,12 +837,12 @@ All bot-specific configuration uses the `CLOD_BOT_` prefix.
 - `CLOD_BOT_VERBOSITY_LEVEL` — default verbosity: `-1` (silent), `0` (summary), `1` (full) (default: `0`).
 - `CLOD_BOT_VERBOSE_TOOLS` — tools affected by the verbosity toggle (default: `Read,Glob,Grep,WebFetch,WebSearch,TodoWrite,Write,Edit,EnterPlanMode`).
 - `CLOD_BOT_TIMEOUT` — per-invocation timeout for `clod` execution (default: `24h`).
-- `CLOD_BOT_RESUME_STALE_AFTER` — active sessions older than this on startup are treated as stale and not auto-resumed (default: `30m`). Set to `0` to disable auto-resume entirely. Independent of the idle-skip logic: idle threads (turn ended, no outstanding tool call) are skipped regardless of staleness, since the agent had genuinely finished its work.
+- `CLOD_BOT_RESUME_STALE_AFTER` — active sessions whose last update is older than this on startup are treated as stale and not auto-resumed (default: `30m`). Set to `0` to disable auto-resume entirely. Sessions within the window are resumed regardless of whether they were mid-turn or idle when the bot stopped — a graceful shutdown gives the agent a chance to save state, and the resume nudge tells it to re-read those notes.
 
 **Storage + lifecycle:**
 
 - `CLOD_BOT_SESSION_STORE_PATH` — path to the session JSON file (default: `sessions.json`). Per-user usage samples are stored in a sidecar `usage.json` next to it.
-- `CLOD_BOT_GRACEFUL_SHUTDOWN_TTL` — graceful shutdown window before forcing exit (default: `30s`). Send a second `SIGINT` / `SIGTERM` to force exit immediately.
+- `CLOD_BOT_GRACEFUL_SHUTDOWN_TTL` — graceful shutdown window before forcing exit (default: `30s`). On `SIGINT` / `SIGTERM` the bot sends every running session a "save your state and stop" message via stream-json, waits up to this many seconds for each to exit naturally, then force-kills (process-group SIGKILL + `docker stop` of the container). The same TTL bounds per-thread `@bot close` and mid-task model/effort restarts. Send a second signal to force exit immediately.
 - `CLOD_BOT_LOG_LEVEL` — `trace` / `debug` / `info` / `warn` / `error` / `fatal` / `panic` (default: `info`).
 - `CLOD_BOT_LOG_FORMAT` — `json` or `console` (default: `json`).
 
