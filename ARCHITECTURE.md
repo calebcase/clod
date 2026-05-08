@@ -570,8 +570,12 @@ type SessionMapping struct {
     ExtraAllowedUsers []string
 
     // Liveness + resume
-    Active           bool   // true while runClod is executing; cleared on clean exit
-    Idle             bool   // true between turns (agent emitted result, waiting for input)
+    Active           bool   // true while runClod is executing; cleared on clean
+                            // exit, EXCEPT during Bot.Shutdown — that path
+                            // preserves Active=true so the next start can resume.
+    Idle             bool   // true between turns (agent emitted result, waiting
+                            // for input). Tracked for diagnostics / home-tab
+                            // display; the resume path no longer skips on it.
     ReactionAnchorTS string // first @-mention TS — anchor for status reactions; pinned for life
 
     // Reactions the bot has placed on the anchor (so we can remove them later;
@@ -582,15 +586,36 @@ type SessionMapping struct {
     // Background watchers spawned by the agent's Monitor tool
     ActiveMonitors []string
 
-    // Lifetime totals across resumes (claude's per-result stats only cover
-    // the current process, so we accumulate here)
-    CumulativeCostUSD float64
-    CumulativeTurns   int
+    // Lifetime totals across resumes. claude's per-result stats have
+    // mixed semantics: `total_cost_usd` is cumulative-since-process-
+    // start (and `--resume` restores it from saved state), while
+    // `num_turns` is per-call. So CumulativeCostUSD accumulates a
+    // delta computed against LastClaudeCostUSD on each `result`
+    // event, while CumulativeTurns is a straight `+= num_turns`.
+    CumulativeCostUSD   float64
+    CumulativeTurns     int
+    // LastClaudeCostUSD is the most recent total_cost_usd we observed
+    // from claude. AddStats subtracts this from each new observation
+    // to credit the per-result delta only.
+    LastClaudeCostUSD   float64
+    // CostBaselinePending was set during the v1 cost migration that
+    // zeroed inflated CumulativeCostUSD values (the pre-fix code
+    // `+=`'d cumulative-into-cumulative, producing quadratic-ish
+    // growth — sessions.json had reached $60k+ totals against an
+    // actual spend in the low hundreds). When true, the next observed
+    // cost establishes the baseline without crediting anything.
+    CostBaselinePending bool
 
     CreatedAt time.Time
     UpdatedAt time.Time // bumped on every heartbeat / mutation
 }
 ```
+
+The cost migration is gated by a sidecar marker file
+`<session-store>.cost-migration-v1.done` so it runs exactly once per
+deployment. Existing in-memory `CumulativeCostUSD` values are zeroed
+on first load after upgrade, then deltas accumulate cleanly from the
+next `result` event onward.
 
 `SessionStore` keeps a map keyed by `channelID:threadTS`. The store also
 tracks per-result usage samples (user, cost USD, turns, timestamp) in a
@@ -754,48 +779,80 @@ records the cancel as expected (so the synthesized "task cancelled"
 message is suppressed), cancels the running task, and immediately resumes
 with the new `--model` / effort applied.
 
-### 11. Auto-resume on bot restart (busy vs idle)
+### 11. Graceful shutdown + auto-resume on bot restart
 
-`SessionMapping.Active` flips to `true` when `runClod` starts and only
-back to `false` on a clean exit. An unclean exit (crash, shutdown,
-timeout) leaves it set so the next bot startup can pick up where the
-previous run left off.
+The lifecycle splits into two halves: a graceful shutdown that
+gives the agent a chance to flush state, and a startup resume that
+picks up every session that was active when the bot stopped.
 
-`SessionMapping.Idle` rides alongside `Active` to track turn-level
-state:
+#### Shutdown (Bot.Shutdown → ShutdownAllTasks → RunningTask.Shutdown)
 
-- `false` while a turn is in progress — set by `runClod` at start,
-  reset by the `sendUserInput` helper that wraps every user-driven
-  `task.SendInput` (initial prompt, thread reply, ambig redirect).
-- `true` between turns — set when claude emits the per-turn `result`
-  / stats message. Because claude doesn't emit `result` until every
-  tool call in the turn has resolved, an outstanding permission
-  prompt or `AskUserQuestion` modal naturally keeps `Idle=false`
-  (the agent is paused on the FIFO / tool result, no result yet).
+When the bot receives `SIGTERM` / `SIGINT` (or any per-thread close
+or restart path is invoked), each running task goes through:
 
-`ResumeActiveSessions` partitions `Active=true` sessions on startup:
+1. The bot tags the thread's `progressKey` in the
+   `shutdownForResume` set, then sends a stream-json input message
+   (`DefaultSaveStateMessage`) asking the agent to save in-progress
+   notes, progress markers, and any state worth resuming under
+   cwd. The wrapper-owned `.clod/` is off-limits.
+2. The bot closes its end of stdin so claude sees EOF and exits
+   after processing the save-state turn (without EOF claude's
+   stream-json loop blocks forever waiting for more input).
+3. The bot waits up to `CLOD_BOT_GRACEFUL_SHUTDOWN_TTL` (default
+   30s) for the runner to finish.
+4. On timeout: `forceKill` SIGKILLs the process group (relies on
+   `Setpgid: true` set when the cmd was constructed, which puts
+   `bash` + `docker run` + descendants in one group) AND
+   `docker stop`s the container by runtime-suffix lookup. The
+   second step matters because a SIGKILL'd `docker run` client
+   leaves the daemon-managed container running — the daemon
+   never received a stop request, since SIGKILL'd clients can't
+   send one. There's a safety check that skips group-kill when
+   the cmd's pgid matches the bot's own pgid, so a pre-Setpgid
+   task during a one-time migration restart can't suicide the
+   bot.
 
-- **Stale** (UpdatedAt older than `CLOD_BOT_RESUME_STALE_AFTER`) —
-  flag cleared, no resume. Prevents stopped-then-left-overnight
-  threads from all waking up at once.
-- **Idle** (`Active && Idle`) — flag cleared, no resume notice. The
-  agent had finished its last turn cleanly, so the bot considers the
-  task complete. The next user mention in the thread takes the
-  existing resume-on-mention path, which posts the standard
-  *"Resuming task X..."* notice — i.e. an active user re-engagement,
-  not a deploy-time wake-up.
-- **Busy** (`Active && !Idle`) — resumed via `runClod` with the
-  saved `SessionID` plus a "continue where you left off" nudge.
-  Covers mid-stream computation as well as outstanding permission
-  / `AskUserQuestion` prompts: claude's `--resume` re-evaluates the
-  conversation and re-issues any unresolved tool call, which the
-  bot intercepts and re-posts.
+When `runClod` exits, `finalizeTask` checks the
+`shutdownForResume` marker before clearing `Active`. If set, the
+flag is preserved so `ResumeActiveSessions` picks the thread up on
+the next start. The `@bot close` and model-restart paths set
+`Active=false` explicitly themselves — they don't go through this
+map.
 
-This convention works in concert with workspace guidance to use
-`AskUserQuestion` for any user-input request (rather than asking in
-prose) so the "result with no pending tool call = task complete"
-signal stays reliable. See the workspace README's *"When you need
-user input"* section.
+#### Resume (ResumeActiveSessions, on startup)
+
+`SessionMapping.Active` flips to `true` when `runClod` starts. It
+clears on a clean exit EXCEPT during `Bot.Shutdown` (see above);
+crashes, timeouts, and force-kills also leave it set. So at
+startup, `Active=true` is the union of "we shut you down for
+resume" + "you ended unexpectedly" — both should resume.
+
+`SessionMapping.Idle` rides alongside `Active` for diagnostic /
+home-tab display. It's `true` between turns (claude emitted a
+`result` and is waiting for the next input), `false` while a turn
+is in progress. The resume path no longer branches on it: with
+graceful shutdown in place, even an idle session has saved state
+worth re-establishing.
+
+`ResumeActiveSessions` does:
+
+- **Stale** (`Active=true` AND UpdatedAt older than
+  `CLOD_BOT_RESUME_STALE_AFTER`, default 30m) — flag cleared, no
+  resume. Prevents an overnight outage from waking every dormant
+  thread at once.
+- **Fresh** (`Active=true` within the staleness window) — resumed
+  via `runClod` with the saved `SessionID` and a nudge prompt
+  that tells the agent to re-read state it saved under cwd,
+  verify Monitor-tool background processes (which die with the
+  previous container), and continue without redoing completed
+  steps.
+
+The "saved state under cwd" half of this loop relies on workspace
+guidance instructing the agent to use `AskUserQuestion` for any
+user-input request (rather than asking in prose) so the
+"result with no pending tool call = task complete" signal stays
+reliable. See the workspace README's *"When you need user input"*
+section.
 
 ### Anchor message stability
 
