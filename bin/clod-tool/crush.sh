@@ -71,39 +71,20 @@ detect_largest_gpu_vram_mib() {
     printf '%s\n' "${mib:-0}"
 }
 
-# tool_init runs during initialize() before the Dockerfile is
-# generated. Picks a default model based on host VRAM (one-time;
-# overridable by editing .clod/crush/model afterwards), seeds an
-# initial crush.json pointing crush at the in-container Ollama, and
-# ensures the host-side Ollama model cache exists so the bind mount
-# in .clod/system/run doesn't fail with "no such file".
-tool_init() {
-    mkdir -p "$TOOL_STATE_DIR/config" "$TOOL_STATE_DIR/data" "$TOOL_STATE_DIR/cache"
-    mkdir -p "$OLLAMA_HOST_CACHE"
-
-    # Default model: pick once based on host hardware. Don't clobber
-    # an existing pick — the user may have overridden it. Lives under
-    # config/ so the bind-mount that maps `.clod/crush/config` →
-    # container `$HOME/.config/crush/` lands the file where the
-    # crush-wrapper expects it (`$HOME/.config/crush/model`).
-    if [[ ! -f "$TOOL_STATE_DIR/config/model" ]]; then
-        local vram
-        vram=$(detect_largest_gpu_vram_mib)
-        local model
-        model=$(pick_default_model_for_vram "$vram")
-        printf '%s\n' "$model" > "$TOOL_STATE_DIR/config/model"
-        printf '[clod] crush: detected %s MiB VRAM, defaulting to model %s\n' "$vram" "$model" >&2
-        printf '[clod] crush: edit .clod/crush/config/model to override\n' >&2
-    fi
-
-    # Seed crush.json with an Ollama provider pointed at the in-
-    # container daemon. Crush picks the provider listed first as the
-    # default; only one provider here so it's unambiguous. Don't
-    # clobber an existing config — the user may have customised it.
-    if [[ ! -f "$TOOL_STATE_DIR/config/crush.json" ]]; then
-        local model
-        model=$(<"$TOOL_STATE_DIR/config/model")
-        cat > "$TOOL_STATE_DIR/config/crush.json" <<JSON
+# Render crush.json with the configured model and the in-container
+# Ollama provider. The model id appears twice (id + name) because
+# crush keys lookups by id but displays name in the picker.
+#
+# `crush.json` is treated as a derived artifact of `.clod/crush/
+# config/model`: the wrapper relies on the embedded model id matching
+# what `ollama pull` was told to fetch, so edits to the id field on
+# the host don't survive a regen. Other fields (context_window,
+# default_max_tokens, supports_images) are preserved across runs by
+# `_ensure_crush_json_matches_model`, which only regenerates when
+# the embedded model id has drifted from the `model` file.
+_render_crush_json() {
+    local model="$1"
+    cat > "$TOOL_STATE_DIR/config/crush.json" <<JSON
 {
   "\$schema": "https://charm.land/crush.json",
   "providers": {
@@ -126,18 +107,69 @@ tool_init() {
   }
 }
 JSON
-        printf '[clod] crush: wrote initial config %s\n' \
-            "$TOOL_STATE_DIR/config/crush.json" >&2
-    fi
 }
 
-# tool_sync runs on every clod invocation. For crush there's no host
-# credential to mirror (everything runs locally), but we make sure
-# the Ollama cache dir still exists so a manual `rm` doesn't break
-# the next run.
+# Idempotent crush.json regen. Reads the current model from
+# .clod/crush/config/model and rewrites crush.json only if its
+# embedded model id doesn't already match. Called on every invocation
+# from tool_sync so a host-side `echo qwen3-coder:30b > model` takes
+# effect on the next clod run without requiring CLOD_REINIT.
+_ensure_crush_json_matches_model() {
+    local cfg="$TOOL_STATE_DIR/config/crush.json"
+    local model
+    model=$(<"$TOOL_STATE_DIR/config/model")
+    if [[ -f "$cfg" ]] && grep -q "\"id\": *\"$model\"" "$cfg"; then
+        return
+    fi
+    _render_crush_json "$model"
+    printf '[clod] crush: regenerated %s for model=%s\n' "$cfg" "$model" >&2
+}
+
+# tool_init runs during initialize() before the Dockerfile is
+# generated. Picks a default model based on host VRAM (one-time;
+# overridable by editing .clod/crush/config/model afterwards), seeds
+# crush.json pointing crush at the in-container Ollama, and ensures
+# the host-side Ollama model cache exists so the bind mount in
+# .clod/system/run doesn't fail with "no such file".
+tool_init() {
+    mkdir -p "$TOOL_STATE_DIR/config" "$TOOL_STATE_DIR/data" "$TOOL_STATE_DIR/cache"
+    mkdir -p "$OLLAMA_HOST_CACHE"
+
+    # Default model: pick once based on host hardware. Don't clobber
+    # an existing pick — the user may have overridden it. Lives under
+    # config/ so the bind-mount that maps `.clod/crush/config` →
+    # container `$HOME/.config/crush/` lands the file where the
+    # crush-wrapper expects it (`$HOME/.config/crush/model`).
+    if [[ ! -f "$TOOL_STATE_DIR/config/model" ]]; then
+        local vram
+        vram=$(detect_largest_gpu_vram_mib)
+        local model
+        model=$(pick_default_model_for_vram "$vram")
+        printf '%s\n' "$model" > "$TOOL_STATE_DIR/config/model"
+        printf '[clod] crush: detected %s MiB VRAM, defaulting to model %s\n' "$vram" "$model" >&2
+        printf '[clod] crush: edit .clod/crush/config/model to override\n' >&2
+    fi
+
+    # Always regenerate crush.json from the current model. Under
+    # CLOD_REINIT this whole function reruns; we want the config to
+    # reflect any model edits the user made between init runs. Use
+    # the plain renderer (not _ensure_) so any out-of-band hand-edits
+    # to crush.json get reset — reinit means "rebuild from scratch".
+    local model
+    model=$(<"$TOOL_STATE_DIR/config/model")
+    _render_crush_json "$model"
+    printf '[clod] crush: wrote %s for model=%s\n' \
+        "$TOOL_STATE_DIR/config/crush.json" "$model" >&2
+}
+
+# tool_sync runs on every clod invocation. For crush we ensure
+# crush.json is in sync with the model file (catches model edits
+# that didn't go through CLOD_REINIT), and reassert the host-side
+# state dirs in case a manual `rm` removed any of them.
 tool_sync() {
     mkdir -p "$OLLAMA_HOST_CACHE"
     mkdir -p "$TOOL_STATE_DIR/config" "$TOOL_STATE_DIR/data" "$TOOL_STATE_DIR/cache"
+    _ensure_crush_json_matches_model
 }
 
 # tool_dockerfile_root_section: install Ollama + Crush as root, write
