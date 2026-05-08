@@ -238,6 +238,16 @@ type RunningTask struct {
 	permissionFIFO            *PermissionFIFO
 	controlPermissionRequests chan PermissionRequest
 	pendingControlRequestID   string
+	// runtimeSuffix is the unique suffix the bot generated for this
+	// task's container name (the trailing `-<6hex>` of
+	// `clod-<task>-<id>-<suffix>`). Used by forceKill to find and
+	// `docker stop` the container in the rare cases where SIGKILL'ing
+	// the host process group doesn't propagate cleanly — e.g.
+	// `docker run` already orphaned to init, or the daemon is holding
+	// the container alive past its shim's death. Empty when claude is
+	// running directly on the host (--use-claude-direct), which is
+	// also the only mode where there's no container to stop.
+	runtimeSuffix string
 	// sessionIDCaptured receives the session ID exactly once, as soon as the
 	// stream parser observes it (normally the first system/init message). The
 	// handler uses it to persist the thread → session mapping early so that
@@ -398,10 +408,139 @@ func (t *RunningTask) Done() <-chan *Result {
 	return t.done
 }
 
-// Cancel cancels the running task.
+// Cancel cancels the running task without giving the agent a chance
+// to save state. Prefer Shutdown for ordinary stop/restart flows;
+// reserve Cancel for paths where the process is already known dead
+// or no save-state attempt is wanted (e.g. crashed-out cleanup).
 func (t *RunningTask) Cancel() {
 	if t.cancel != nil {
 		t.cancel()
+	}
+}
+
+// DefaultSaveStateMessage is the message Shutdown sends to the agent
+// before forcing a kill. It mirrors the ephemeral-container guidance
+// already in the system prompt (save progress notes / state under
+// cwd) so the agent has a clear cue to flush in-flight work to disk.
+const DefaultSaveStateMessage = "We are shutting down this task. Please immediately save any in-progress notes, progress markers, or state you'd want on resume into files under the current working directory (avoid `.clod/`, which the wrapper owns). Then stop. You have a limited grace period before forced shutdown."
+
+// Shutdown attempts a graceful stop:
+//
+//  1. Send `saveStateMsg` as a stream-json input — the agent
+//     processes it as the next user turn and gets a chance to
+//     persist anything important.
+//  2. Close the bot's end of stdin so claude sees EOF after that
+//     turn and exits cleanly (without EOF, claude's stream-json
+//     loop blocks on stdin even after the result is emitted).
+//  3. Wait up to `gracePeriod` for the runner goroutine to finish
+//     (Done()).
+//  4. On timeout — or any send error — fall through to forceKill:
+//     SIGKILL the process group + `docker stop` by runtime suffix.
+//
+// `ctx` lets the caller cancel the wait early (e.g. a second
+// shutdown signal). Returns true when the agent exited within the
+// grace period, false when the kill path was taken.
+func (t *RunningTask) Shutdown(ctx context.Context, saveStateMsg string, gracePeriod time.Duration) bool {
+	log := t.logger.With().Dur("grace_period", gracePeriod).Logger()
+	log.Info().Msg("graceful shutdown requested")
+
+	if err := t.SendInput(saveStateMsg); err != nil {
+		log.Warn().Err(err).Msg("save-state SendInput failed; force-killing")
+		t.forceKill()
+		return false
+	}
+	t.closeStdin()
+
+	timer := time.NewTimer(gracePeriod)
+	defer timer.Stop()
+	select {
+	case <-t.done:
+		log.Info().Msg("task exited gracefully within grace period")
+		return true
+	case <-timer.C:
+		log.Warn().Msg("grace period expired; forcing")
+	case <-ctx.Done():
+		log.Warn().Err(ctx.Err()).Msg("shutdown context cancelled before grace; forcing")
+	}
+	t.forceKill()
+	return false
+}
+
+// forceKill takes the host process tree down and ensures the docker
+// container goes with it. Two paths because docker has two failure
+// modes:
+//
+//  1. SIGKILL to the bash wrapper's process group catches the
+//     `docker run` foreground client alongside it, and `--rm` fires
+//     when the client dies cleanly. This handles the common case.
+//  2. `docker stop` by runtime-suffix lookup catches the cases
+//     SIGKILL can't: `docker run` already init-orphaned (the bash
+//     parent died earlier), or the docker daemon holding the
+//     container alive past its shim's SIGKILL'd death (the daemon
+//     never received a stop request — SIGKILL'd clients can't send
+//     one).
+func (t *RunningTask) forceKill() {
+	// Process-group SIGKILL. Setpgid was set in Start so the cmd
+	// is its own process-group leader; SIGKILL'ing that group
+	// catches bash + docker run + descendants together. Safety
+	// check: only kill the group when its pgid differs from the
+	// bot's own pgid. They match if Setpgid wasn't set (or for
+	// tasks that pre-date this code), and SIGKILL'ing the bot's
+	// own group would suicide the bot.
+	if t.cmd != nil && t.cmd.Process != nil {
+		cmdPgid, err1 := syscall.Getpgid(t.cmd.Process.Pid)
+		myPgid, err2 := syscall.Getpgid(os.Getpid())
+		switch {
+		case err1 != nil:
+			t.logger.Debug().Err(err1).Msg("getpgid(cmd) failed; skipping group kill")
+		case err2 == nil && cmdPgid == myPgid:
+			t.logger.Warn().Int("pgid", cmdPgid).Msg("cmd shares bot's process group (Setpgid was not set); skipping group kill to avoid suicide")
+		default:
+			if err := syscall.Kill(-cmdPgid, syscall.SIGKILL); err != nil {
+				t.logger.Debug().Err(err).Int("pgid", cmdPgid).Msg("kill -pgid SIGKILL failed (probably already dead)")
+			} else {
+				t.logger.Info().Int("pgid", cmdPgid).Msg("SIGKILL sent to process group")
+			}
+		}
+	}
+	// Always run the runCtx cancel too — it propagates timeouts
+	// upstream and unblocks any goroutine waiting on runCtx.Done().
+	if t.cancel != nil {
+		t.cancel()
+	}
+
+	// Stop the container directly. Tolerate every failure mode:
+	// claude-direct mode (no suffix), container already gone,
+	// docker daemon unreachable.
+	if t.runtimeSuffix == "" {
+		return
+	}
+	// Filter by container name suffix. The bash wrapper builds
+	// names as `clod-<task>-<id>-<suffix>`, so `name=<suffix>$`
+	// (an exact-tail match via regex anchor) hits exactly our
+	// container. Use a short timeout on docker ps so a hung
+	// daemon doesn't stall shutdown.
+	psCtx, psCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer psCancel()
+	psOut, err := exec.CommandContext(psCtx, "docker", "ps", "-q", "--filter", "name="+t.runtimeSuffix+"$").Output()
+	if err != nil {
+		t.logger.Debug().Err(err).Str("suffix", t.runtimeSuffix).Msg("docker ps lookup failed; skipping explicit container stop")
+		return
+	}
+	cids := strings.Fields(string(psOut))
+	if len(cids) == 0 {
+		t.logger.Debug().Str("suffix", t.runtimeSuffix).Msg("no running container matched runtime suffix")
+		return
+	}
+	for _, cid := range cids {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := exec.CommandContext(stopCtx, "docker", "stop", "-t", "5", cid).Run()
+		stopCancel()
+		if err != nil {
+			t.logger.Warn().Err(err).Str("cid", cid).Msg("docker stop failed (force path)")
+		} else {
+			t.logger.Info().Str("cid", cid).Msg("docker stop ok (force path)")
+		}
 	}
 }
 
@@ -645,6 +784,18 @@ func (r *Runner) Start(
 	//nolint:gosec
 	cmd := exec.CommandContext(runCtx, exe, args...)
 	cmd.Dir = taskPath
+	// Setpgid puts the bash wrapper + its docker-run child + every
+	// other descendant in the same process group, so a SIGKILL to
+	// -pgid takes the whole tree down at once. Without this, Go's
+	// exec.CommandContext SIGKILLs only the bash PID; `docker run`
+	// gets reparented to init and keeps the container alive
+	// indefinitely (and `--rm` never fires because docker-run is
+	// the foreground holder, not the container's PID 1). The
+	// process-group kill is paired with an explicit `docker stop`
+	// in forceKill — belt and suspenders, since SIGKILL'ing
+	// docker-run still leaves the daemon-managed container running
+	// (the daemon never gets a stop request from a SIGKILL'd client).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// Set MCP tool timeout generously so permission prompts waiting on a
 	// human in Slack don't fail with "technical issues" when the approver
@@ -851,6 +1002,7 @@ func (r *Runner) Start(
 		permissionFIFO:            permFIFO,
 		controlPermissionRequests: make(chan PermissionRequest, 10),
 		sessionIDCaptured:         make(chan string, 1),
+		runtimeSuffix:             permFIFO.RuntimeSuffix(),
 	}
 	// Publish the task so the stderr drain can forward progress lines.
 	*taskPtr = task

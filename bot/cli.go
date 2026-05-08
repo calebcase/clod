@@ -100,6 +100,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		cli.VerboseTools,
 		cli.VerbosityLevel,
 		cli.DefaultModel,
+		cli.GracefulShutdownTTL,
 		logger,
 	)
 	if err != nil {
@@ -130,7 +131,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 			Float64("ttl", cli.GracefulShutdownTTL.Seconds()).
 			Msg("shutting down gracefully (send again to force)")
 
-		bot.Shutdown()
+		bot.Shutdown(*ctx)
 
 		select {
 		case err = <-errors:
