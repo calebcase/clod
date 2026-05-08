@@ -71,8 +71,27 @@ detect_largest_gpu_vram_mib() {
     printf '%s\n' "${mib:-0}"
 }
 
-# Render crush.json with the configured model and the in-container
-# Ollama provider. The model id appears twice (id + name) because
+# Template version embedded in crush.json so we can detect when an
+# older clod left a config behind that's missing newer fields (e.g.
+# the `mcp` block, an updated context window). _ensure_crush_json_
+# matches_model regenerates when this drifts from CRUSH_JSON_TEMPLATE_VERSION.
+# Bump on every backwards-incompatible change to _render_crush_json.
+CRUSH_JSON_TEMPLATE_VERSION="v2"
+
+# Crush context window. Coding workflows routinely splatter long
+# files + diff context + tool transcripts into the prompt; 32K runs
+# out fast. 128K is the comfortable "modern coding tool" target —
+# claude code defaults to 200K, copilot to ~64-128K — and qwen3-coder:
+# {30b,480b} both train natively at 256K, so this is well within
+# their ranges. Smaller fallbacks (qwen3:8b/4b/1.7b) run shorter
+# native contexts; Ollama silently truncates above each model's max,
+# so over-asking is harmless except for the slightly larger KV-cache
+# VRAM allocation.
+CRUSH_DEFAULT_CONTEXT_WINDOW=131072
+
+# Render crush.json with the configured model, the in-container
+# Ollama provider, and the DuckDuckGo MCP server for web search /
+# page fetching. The model id appears twice (id + name) because
 # crush keys lookups by id but displays name in the picker.
 #
 # `crush.json` is treated as a derived artifact of `.clod/crush/
@@ -81,12 +100,13 @@ detect_largest_gpu_vram_mib() {
 # the host don't survive a regen. Other fields (context_window,
 # default_max_tokens, supports_images) are preserved across runs by
 # `_ensure_crush_json_matches_model`, which only regenerates when
-# the embedded model id has drifted from the `model` file.
+# the embedded model id or the template version has drifted.
 _render_crush_json() {
     local model="$1"
     cat > "$TOOL_STATE_DIR/config/crush.json" <<JSON
 {
   "\$schema": "https://charm.land/crush.json",
+  "_clod_template_version": "$CRUSH_JSON_TEMPLATE_VERSION",
   "providers": {
     "ollama": {
       "id": "ollama",
@@ -98,11 +118,17 @@ _render_crush_json() {
         {
           "id": "$model",
           "name": "$model",
-          "context_window": 32768,
+          "context_window": $CRUSH_DEFAULT_CONTEXT_WINDOW,
           "default_max_tokens": 4096,
           "supports_images": false
         }
       ]
+    }
+  },
+  "mcp": {
+    "web-search": {
+      "type": "stdio",
+      "command": "duckduckgo-mcp-server"
     }
   }
 }
@@ -110,19 +136,28 @@ JSON
 }
 
 # Idempotent crush.json regen. Reads the current model from
-# .clod/crush/config/model and rewrites crush.json only if its
-# embedded model id doesn't already match. Called on every invocation
-# from tool_sync so a host-side `echo qwen3-coder:30b > model` takes
-# effect on the next clod run without requiring CLOD_REINIT.
+# .clod/crush/config/model and rewrites crush.json when either the
+# embedded model id or the clod template version has drifted from
+# what _render_crush_json would emit today. Called on every
+# invocation from tool_sync so:
+#
+#   - A host-side `echo qwen3-coder:30b > model` takes effect on
+#     the next clod run without requiring CLOD_REINIT.
+#   - A clod upgrade that adds new fields to crush.json (e.g.
+#     adding the `mcp` block in v2) propagates without requiring
+#     CLOD_REINIT either.
 _ensure_crush_json_matches_model() {
     local cfg="$TOOL_STATE_DIR/config/crush.json"
     local model
     model=$(<"$TOOL_STATE_DIR/config/model")
-    if [[ -f "$cfg" ]] && grep -q "\"id\": *\"$model\"" "$cfg"; then
+    if [[ -f "$cfg" ]] \
+       && grep -q "\"id\": *\"$model\"" "$cfg" \
+       && grep -q "\"_clod_template_version\": *\"$CRUSH_JSON_TEMPLATE_VERSION\"" "$cfg"; then
         return
     fi
     _render_crush_json "$model"
-    printf '[clod] crush: regenerated %s for model=%s\n' "$cfg" "$model" >&2
+    printf '[clod] crush: regenerated %s for model=%s template=%s\n' \
+        "$cfg" "$model" "$CRUSH_JSON_TEMPLATE_VERSION" >&2
 }
 
 # tool_init runs during initialize() before the Dockerfile is
@@ -222,6 +257,50 @@ RUN set -eux; \
     fi; \
     rm -rf /tmp/ollama.tar.zst /tmp/ollama-extract; \
     /usr/local/bin/ollama --version
+
+# Install uv (fast Python package manager) — needed to bring in the
+# DuckDuckGo MCP server below. Same direct-binary-fetch shape as
+# Ollama; we don't use the upstream `astral.sh/uv/install.sh` shim
+# because it writes to ~/.local/bin and we want a system-wide path
+# that the unprivileged container user can hit without PATH gymnastics.
+# The release tarball is `uv-<arch>-unknown-linux-gnu.tar.gz`,
+# extracting to a single nested dir containing `uv` + `uvx`.
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+        x86_64)  asset=uv-x86_64-unknown-linux-gnu.tar.gz ;; \
+        aarch64) asset=uv-aarch64-unknown-linux-gnu.tar.gz ;; \
+        *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/astral-sh/uv/releases/latest/download/$asset"; \
+    curl -fsSL "$url" -o /tmp/uv.tar.gz; \
+    mkdir -p /tmp/uv-extract; \
+    tar -xz -C /tmp/uv-extract -f /tmp/uv.tar.gz; \
+    cp /tmp/uv-extract/*/uv  /usr/local/bin/uv; \
+    cp /tmp/uv-extract/*/uvx /usr/local/bin/uvx; \
+    chmod +x /usr/local/bin/uv /usr/local/bin/uvx; \
+    rm -rf /tmp/uv.tar.gz /tmp/uv-extract; \
+    /usr/local/bin/uv --version
+
+# Install the DuckDuckGo MCP server so crush has a `web_search`
+# tool. duckduckgo-mcp-server (PyPI) is a stdio MCP server: crush
+# spawns it on demand via the `mcp.web-search` block in crush.json
+# and pipes JSON-RPC over stdin/stdout. uv installs it into a
+# managed venv under UV_TOOL_DIR and drops the entry-point script
+# into UV_TOOL_BIN_DIR (set system-wide so the unprivileged
+# container user can exec it without owning the venv).
+#
+# UV_PYTHON_PREFERENCE=only-managed forces uv to download a Python
+# rather than relying on a system python3 that ubuntu:24.04 may or
+# may not have installed depending on the base image variant. Adds
+# ~50 MB but makes the install reproducible across base-image
+# upgrades.
+ENV UV_TOOL_DIR=/opt/uv-tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_PYTHON_PREFERENCE=only-managed
+RUN set -eux; \
+    uv tool install duckduckgo-mcp-server; \
+    test -x /usr/local/bin/duckduckgo-mcp-server
 
 # Install Crush from the latest GitHub release. The release tarball
 # nests its files under `crush_<ver>_<arch>/`, so we extract to a
