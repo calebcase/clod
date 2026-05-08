@@ -357,6 +357,31 @@ func NewHandler(bot *Bot, verboseTools []string, defaultVerbosityLevel int, defa
 	}
 }
 
+// ShutdownAllTasks drives every task currently in runningTasks
+// through RunningTask.Shutdown concurrently, capped per-task by
+// gracePeriod. Returns when every task has either exited gracefully
+// or been forcefully killed. Used by Bot.Shutdown for SIGTERM-driven
+// stops; per-thread close/restart paths call Shutdown directly with
+// their own message.
+func (h *Handler) ShutdownAllTasks(ctx context.Context, gracePeriod time.Duration) {
+	var wg sync.WaitGroup
+	h.runningTasks.Range(func(k, v any) bool {
+		task, ok := v.(*RunningTask)
+		if !ok {
+			return true
+		}
+		wg.Add(1)
+		go func(key any, t *RunningTask) {
+			defer wg.Done()
+			h.logger.Info().Str("thread_key", fmt.Sprint(key)).Msg("graceful shutdown: signaling task")
+			t.Shutdown(ctx, DefaultSaveStateMessage, gracePeriod)
+		}(k, task)
+		return true
+	})
+	wg.Wait()
+	h.logger.Info().Msg("graceful shutdown: all tasks settled")
+}
+
 // mentionPattern matches @mentions at the start of a message
 var otherMentionPattern = regexp.MustCompile(`^<@([A-Z0-9]+)>`)
 
@@ -1388,9 +1413,13 @@ func (h *Handler) handleCloseCommand(
 	var wasRunning bool
 	if taskVal, ok := h.runningTasks.Load(progressKey); ok {
 		task := taskVal.(*RunningTask)
-		task.Cancel()
 		wasRunning = true
-		logger.Info().Msg("cancelling running task due to close command")
+		logger.Info().Dur("grace_period", h.bot.gracefulShutdownTTL).Msg("graceful shutdown: close command")
+		// Run the shutdown in a goroutine so the close confirmation
+		// posts immediately. The task's own runClod loop drains
+		// output and updates state until it exits, so we don't need
+		// to block here.
+		go task.Shutdown(context.Background(), "Session closing per `@bot close`. "+DefaultSaveStateMessage, h.bot.gracefulShutdownTTL)
 	}
 
 	var msg string
@@ -1657,12 +1686,19 @@ func (h *Handler) restartRunningTaskForSettingChange(channelID, threadTS, reason
 	// Mark this cancel as expected so finalizeTask suppresses
 	// its "task completed with error" Slack post.
 	h.expectedTaskCancels.Store(progressKey, true)
-	runningTask.Cancel()
 
 	// Spin off the resume in a goroutine so handleSetCommand can
-	// return — the cancel + wind-down can take several seconds
+	// return — the shutdown + wind-down can take several seconds
 	// and we don't want to block the Slack event handler.
 	go func() {
+		// Graceful shutdown so the agent has a chance to flush any
+		// in-progress notes/state before we restart with the new
+		// model/effort. The TTL caps how long we'll wait; on
+		// timeout, Shutdown force-kills (process group + docker
+		// stop), which then unblocks runningTask.Done() below.
+		runningTask.Shutdown(context.Background(),
+			fmt.Sprintf("Restarting with %s. ", reason)+DefaultSaveStateMessage,
+			h.bot.gracefulShutdownTTL)
 		// Wait for the old runClod loop to exit. task.Done()
 		// fires when the runner's process completes; the
 		// runClod goroutine's defer-cleanup runs immediately

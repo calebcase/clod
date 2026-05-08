@@ -28,6 +28,13 @@ type Bot struct {
 	files         *FileHandler
 	logger        zerolog.Logger
 	handler       *Handler
+	// gracefulShutdownTTL bounds how long any single graceful task
+	// shutdown may take before the runner forces a kill. Used by
+	// Bot.Shutdown for SIGTERM-driven stops, and by per-task
+	// shutdowns (close command, model/effort restart) so all paths
+	// share a single tunable. Configured via
+	// CLOD_BOT_GRACEFUL_SHUTDOWN_TTL.
+	gracefulShutdownTTL time.Duration
 	// latestPostTS tracks the TS of the most-recent bot post per
 	// (channel, thread). Updated by every helper that posts a new
 	// message (PostMessage, PostMessageBlocks, file uploads); NOT
@@ -57,6 +64,7 @@ func NewBot(
 	verboseTools []string,
 	verbosityLevel int,
 	defaultModel string,
+	gracefulShutdownTTL time.Duration,
 	logger zerolog.Logger,
 ) (*Bot, error) {
 	client := slack.New(
@@ -73,15 +81,16 @@ func NewBot(
 	socketHandler := socketmode.NewSocketmodeHandler(socket)
 
 	bot := &Bot{
-		client:        client,
-		socket:        socket,
-		socketHandler: socketHandler,
-		auth:          auth,
-		domains:       domains,
-		sessions:      sessions,
-		runner:        runner,
-		files:         NewFileHandler(client, logger),
-		logger:        logger.With().Str("component", "bot").Logger(),
+		client:              client,
+		socket:              socket,
+		socketHandler:       socketHandler,
+		auth:                auth,
+		domains:             domains,
+		sessions:            sessions,
+		runner:              runner,
+		files:               NewFileHandler(client, logger),
+		logger:              logger.With().Str("component", "bot").Logger(),
+		gracefulShutdownTTL: gracefulShutdownTTL,
 	}
 
 	bot.handler = NewHandler(bot, verboseTools, verbosityLevel, defaultModel)
@@ -116,9 +125,19 @@ func (b *Bot) Run(ctx context.Context) error {
 	return nil
 }
 
-// Shutdown gracefully shuts down the bot.
-func (b *Bot) Shutdown() {
-	b.logger.Info().Msg("shutting down bot")
+// Shutdown gracefully shuts down the bot. Drives every running task
+// through the same save-state-then-force-kill pattern used for
+// per-thread close/restart, capped by the configured
+// gracefulShutdownTTL. Returns when all tasks have either exited
+// gracefully or been forcefully killed; cli.go's outer
+// time.After(GracefulShutdownTTL) bounds the whole shutdown so a
+// single stuck task can't block process exit.
+func (b *Bot) Shutdown(ctx context.Context) {
+	b.logger.Info().Dur("grace_period", b.gracefulShutdownTTL).Msg("shutting down bot")
+	if b.handler == nil {
+		return
+	}
+	b.handler.ShutdownAllTasks(ctx, b.gracefulShutdownTTL)
 }
 
 // registerEventHandlers sets up all the socketmode handler callbacks.
