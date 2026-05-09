@@ -248,6 +248,21 @@ type RunningTask struct {
 	// running directly on the host (--use-claude-direct), which is
 	// also the only mode where there's no container to stop.
 	runtimeSuffix string
+
+	// wakeupTimer holds the active bot-side ScheduleWakeup timer, if
+	// any. claude's built-in ScheduleWakeup tool returns its
+	// "scheduled for…" text but the actual harness for firing the
+	// wakeup only exists in /loop / interactive mode — `-p
+	// stream-json` callers (us) get the string but no actual wake.
+	// The bot intercepts ScheduleWakeup tool_use blocks (see
+	// scheduleWakeup) and arms this timer instead, which fires
+	// SendInput(prompt) when the delay expires. A second
+	// ScheduleWakeup call within the same task replaces the prior
+	// timer; cancelWakeupTimer is called on task teardown so a
+	// dying task doesn't leave a stray timer hanging onto its
+	// SendInput goroutine.
+	wakeupMu    sync.Mutex
+	wakeupTimer *time.Timer
 	// sessionIDCaptured receives the session ID exactly once, as soon as the
 	// stream parser observes it (normally the first system/init message). The
 	// handler uses it to persist the thread → session mapping early so that
@@ -262,6 +277,91 @@ func (t *RunningTask) closeStdin() {
 	if t.stdin != nil {
 		_ = t.stdin.Close()
 		t.stdin = nil
+	}
+}
+
+// scheduleWakeup arms (or replaces) the bot-side wake-up timer for
+// this task in response to a ScheduleWakeup tool_use the agent
+// emitted. claude's built-in ScheduleWakeup is a /loop-mode harness
+// hook; under `-p --input-format stream-json` (which the bot uses)
+// it returns its "scheduled for…" tool_result text but no actual
+// wake fires. We bypass the gap by arming our own timer here:
+// when it expires, SendInput(prompt) feeds `prompt` back as a fresh
+// user message, which wakes the agent through the same path a Slack
+// reply would.
+//
+// Bounds: clamped to [60, 3600] seconds to match the documented
+// range of the upstream ScheduleWakeup tool — a single call should
+// never push beyond an hour, and anything under a minute is the
+// model misusing the tool for a busy-wait.
+//
+// Only one wakeup is armed per task at a time. A second call wins;
+// the prior timer is stopped so we don't get duplicate wake inputs.
+func (t *RunningTask) scheduleWakeup(input map[string]any) {
+	prompt, _ := input["prompt"].(string)
+	reason, _ := input["reason"].(string)
+
+	// delaySeconds may arrive as float64 (json.Unmarshal default for
+	// numeric JSON) or json.Number (if a decoder was set to
+	// UseNumber). Handle both so we don't silently treat it as 0.
+	var delaySeconds float64
+	switch v := input["delaySeconds"].(type) {
+	case float64:
+		delaySeconds = v
+	case json.Number:
+		delaySeconds, _ = v.Float64()
+	case int:
+		delaySeconds = float64(v)
+	}
+
+	const minDelay, maxDelay = 60.0, 3600.0
+	if delaySeconds < minDelay {
+		delaySeconds = minDelay
+	}
+	if delaySeconds > maxDelay {
+		delaySeconds = maxDelay
+	}
+
+	log := t.logger.With().
+		Float64("delay_s", delaySeconds).
+		Str("reason", reason).
+		Int("prompt_len", len(prompt)).
+		Logger()
+
+	if prompt == "" {
+		log.Warn().Msg("ScheduleWakeup with empty prompt; not arming timer")
+		return
+	}
+
+	t.wakeupMu.Lock()
+	if t.wakeupTimer != nil {
+		// Latest call wins. Stop returns false if the timer already
+		// fired or was already stopped, which is fine — we replace
+		// it unconditionally.
+		t.wakeupTimer.Stop()
+	}
+	delay := time.Duration(delaySeconds * float64(time.Second))
+	t.wakeupTimer = time.AfterFunc(delay, func() {
+		log.Info().Msg("ScheduleWakeup timer fired; sending prompt as user input")
+		if err := t.SendInput(prompt); err != nil {
+			log.Error().Err(err).Msg("ScheduleWakeup SendInput failed")
+		}
+	})
+	t.wakeupMu.Unlock()
+
+	log.Info().Time("fires_at", time.Now().Add(delay)).Msg("ScheduleWakeup intercepted; bot-side timer armed")
+}
+
+// cancelWakeupTimer stops any active wakeup timer for this task. Safe
+// to call multiple times. Used by the runner-goroutine teardown so a
+// dying task doesn't leave a stray timer hanging onto its SendInput
+// goroutine.
+func (t *RunningTask) cancelWakeupTimer() {
+	t.wakeupMu.Lock()
+	defer t.wakeupMu.Unlock()
+	if t.wakeupTimer != nil {
+		t.wakeupTimer.Stop()
+		t.wakeupTimer = nil
 	}
 }
 
@@ -1040,6 +1140,7 @@ func (r *Runner) Start(
 		defer close(task.done)
 		defer func() { _ = ptmx.Close() }()
 		defer task.closeStdin()
+		defer task.cancelWakeupTimer()
 		defer permFIFO.Close()
 
 		var outputBuilder strings.Builder
@@ -1139,6 +1240,19 @@ func (r *Runner) Start(
 							toolInfos[block.ID] = toolInfo{
 								Name:  block.Name,
 								Input: block.Input,
+							}
+							// Bot-side ScheduleWakeup interception. claude's
+							// built-in tool only really fires under /loop or
+							// interactive mode; in `-p stream-json` the
+							// "scheduled for…" tool_result text comes back
+							// but no wake actually arrives. We arm our own
+							// timer so SendInput(prompt) re-feeds the agent
+							// when the delay expires. claude's tool_result
+							// flows through unchanged (the user still sees
+							// the "scheduled for HH:MM" message), and the
+							// bot owns the actual wake.
+							if block.Name == "ScheduleWakeup" {
+								task.scheduleWakeup(block.Input)
 							}
 							// Log tool use but don't send to Slack - we'll show a summary
 							// with the result instead (avoids duplicate "Using tool" + "result" messages).
