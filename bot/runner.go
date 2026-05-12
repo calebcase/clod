@@ -261,8 +261,18 @@ type RunningTask struct {
 	// timer; cancelWakeupTimer is called on task teardown so a
 	// dying task doesn't leave a stray timer hanging onto its
 	// SendInput goroutine.
-	wakeupMu    sync.Mutex
-	wakeupTimer *time.Timer
+	//
+	// wakeupFireID is the id of the currently-armed timer's
+	// expected fire. Each arming bumps it; the timer closure
+	// captures the value at arming time and skips its SendInput
+	// when the captured id doesn't match the live one (timer was
+	// superseded between arming and firing). Defensive: Timer.Stop
+	// returns false when the fire goroutine has already started
+	// but not yet completed, so two timers can race to fire if
+	// arming happens at exactly the wrong moment.
+	wakeupMu     sync.Mutex
+	wakeupTimer  *time.Timer
+	wakeupFireID uint64
 	// sessionIDCaptured receives the session ID exactly once, as soon as the
 	// stream parser observes it (normally the first system/init message). The
 	// handler uses it to persist the thread → session mapping early so that
@@ -337,19 +347,31 @@ func (t *RunningTask) scheduleWakeup(input map[string]any) {
 	if t.wakeupTimer != nil {
 		// Latest call wins. Stop returns false if the timer already
 		// fired or was already stopped, which is fine — we replace
-		// it unconditionally.
+		// it unconditionally and rely on the fire-id check below to
+		// skip any stale firing already in flight.
 		t.wakeupTimer.Stop()
 	}
+	t.wakeupFireID++
+	fireID := t.wakeupFireID
 	delay := time.Duration(delaySeconds * float64(time.Second))
 	t.wakeupTimer = time.AfterFunc(delay, func() {
-		log.Info().Msg("ScheduleWakeup timer fired; sending prompt as user input")
+		t.wakeupMu.Lock()
+		stale := fireID != t.wakeupFireID
+		t.wakeupMu.Unlock()
+		if stale {
+			// A later scheduleWakeup superseded us between arming
+			// and firing. Don't double-send.
+			log.Warn().Uint64("fire_id", fireID).Uint64("live_id", t.wakeupFireID).Msg("ScheduleWakeup timer fired but is stale; skipping")
+			return
+		}
+		log.Info().Uint64("fire_id", fireID).Msg("ScheduleWakeup timer fired; sending prompt as user input")
 		if err := t.SendInput(prompt); err != nil {
-			log.Error().Err(err).Msg("ScheduleWakeup SendInput failed")
+			log.Error().Err(err).Uint64("fire_id", fireID).Msg("ScheduleWakeup SendInput failed")
 		}
 	})
 	t.wakeupMu.Unlock()
 
-	log.Info().Time("fires_at", time.Now().Add(delay)).Msg("ScheduleWakeup intercepted; bot-side timer armed")
+	log.Info().Uint64("fire_id", fireID).Time("fires_at", time.Now().Add(delay)).Msg("ScheduleWakeup intercepted; bot-side timer armed")
 }
 
 // cancelWakeupTimer stops any active wakeup timer for this task. Safe
@@ -439,9 +461,19 @@ func (t *RunningTask) SendInputWithImages(text string, images []ImageData) error
 		return oops.Trace(err)
 	}
 
-	t.logger.Debug().
+	// Info-level on purpose: we currently have an open question about
+	// whether SendInput is being called more often than expected (the
+	// ScheduleWakeup duplicate-fire investigation in May 2026). Promote
+	// to Debug once we've root-caused it.
+	preview := text
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+	t.logger.Info().
 		Int("num_images", len(images)).
 		Int("json_len", len(data)).
+		Int("text_len", len(text)).
+		Str("text_preview", preview).
 		Msg("sending input to claude")
 
 	if _, err := t.stdin.Write(append(data, '\n')); err != nil {
