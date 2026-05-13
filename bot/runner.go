@@ -777,7 +777,10 @@ func readAllowedTools(taskPath string, logger zerolog.Logger) []string {
 		logger.Info().Msg("no permissions map in project")
 	}
 
-	// Deduplicate tools (since we read from both arrays)
+	// Deduplicate the user-saved entries; the runtime caller in
+	// Start() unions these with builtinAlwaysAllowedTools so the
+	// final --allowedTools list always includes the task-lifecycle
+	// helpers even when claude.json has nothing saved yet.
 	seen := make(map[string]bool)
 	var uniqueTools []string
 	for _, t := range tools {
@@ -794,6 +797,45 @@ func readAllowedTools(taskPath string, logger zerolog.Logger) []string {
 		Msg("read allowed tools from claude.json")
 
 	return uniqueTools
+}
+
+// builtinAlwaysAllowedTools are unioned into every task's allowed-
+// tools list at runtime. They're internal claude-code task-harness
+// tools that have no business going through the permission FIFO
+// every time — and without them the agent can start background
+// processes with Monitor but has no way to stop, inspect, or list
+// them, so the bot's active-monitor count grows monotonically until
+// the next session resume's ClearMonitors. Listed here rather than
+// written into claude.json so the union is computed every start;
+// bumping this list takes effect for in-flight tasks on their next
+// runClod invocation without touching saved state.
+var builtinAlwaysAllowedTools = []string{
+	"TaskStop",
+	"TaskGet",
+	"TaskList",
+	"TaskOutput",
+}
+
+// mergeBuiltinAllowedTools appends the builtin task-harness tools
+// to whatever the per-task config supplied, deduplicating while it
+// goes. Always returns a non-empty slice; if the per-task config
+// has nothing saved, the result is just the builtins.
+func mergeBuiltinAllowedTools(perTask []string) []string {
+	seen := make(map[string]bool, len(perTask)+len(builtinAlwaysAllowedTools))
+	out := make([]string, 0, len(perTask)+len(builtinAlwaysAllowedTools))
+	for _, t := range perTask {
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	for _, t := range builtinAlwaysAllowedTools {
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // Start begins executing clod in a task directory with the given prompt.
@@ -869,18 +911,20 @@ func (r *Runner) Start(
 		args = append(args, "--append-system-prompt-file", ctxPath)
 	}
 
-	// Pass any saved allowed tools so they're respected immediately.
-	allowedTools := readAllowedTools(taskPath, r.logger)
+	// Pass any saved allowed tools — plus the builtin task-harness
+	// helpers (TaskStop / TaskGet / TaskList / TaskOutput) — so
+	// they're available immediately. The builtins are merged at
+	// runtime rather than written into claude.json, so a bump to
+	// the builtin list takes effect on the next start without
+	// touching saved state.
+	allowedTools := mergeBuiltinAllowedTools(readAllowedTools(taskPath, r.logger))
 	for _, tool := range allowedTools {
 		args = append(args, "--allowedTools", tool)
 	}
-	if len(allowedTools) > 0 {
-		r.logger.Info().
-			Strs("allowed_tools", allowedTools).
-			Msg("passing saved allowed tools to claude")
-	} else {
-		r.logger.Info().Msg("no saved allowed tools found")
-	}
+	r.logger.Info().
+		Strs("allowed_tools", allowedTools).
+		Int("count", len(allowedTools)).
+		Msg("passing allowed tools to claude (saved + builtins)")
 
 	// Per-call permissionMode beats the Runner-wide default so callers can
 	// flip plan mode on/off per thread. Empty falls through to the Runner's
