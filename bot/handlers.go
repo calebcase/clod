@@ -3367,9 +3367,35 @@ func (h *Handler) runClod(
 	// via Touch+Save. See the ticker case for the gating rationale.
 	lastHeartbeat := time.Now()
 
+	// incompleteSince tracks how long we've been holding back a
+	// flush because the buffer looks mid-table or mid-code-fence.
+	// Resetting it to the zero value means "buffer is currently
+	// clean / nothing to hold". See bufferLooksIncomplete for the
+	// detection rules.
+	var incompleteSince time.Time
+	const maxIncompleteHold = 10 * time.Second
+
 	// Function to flush the buffer with message consolidation.
+	// When force is false, the flush is deferred if the buffer
+	// looks like it's mid-stream of a markdown table or code
+	// fence — wait for the closing rows / fence to arrive so the
+	// AST parser sees the complete construct. The hold is capped
+	// at maxIncompleteHold so a genuinely-unclosed stream can't
+	// stall forever. force=true is for callers that need the
+	// buffer drained right now (task done, stats break, snippet
+	// break, permission prompt) regardless of completeness.
 	threadKey := key(channelID, threadTS)
-	flushBuffer := func() {
+	flushBuffer := func(force bool) {
+		if !force && outputBuffer.Len() > 0 && bufferLooksIncomplete(outputBuffer.String()) {
+			if incompleteSince.IsZero() {
+				incompleteSince = time.Now()
+			}
+			if time.Since(incompleteSince) < maxIncompleteHold {
+				return
+			}
+			// Held long enough; fall through and render what we have.
+		}
+		incompleteSince = time.Time{}
 		if outputBuffer.Len() > 0 {
 			// Trim only leading/trailing NEWLINES, tabs, and carriage
 			// returns — not spaces. A streaming chunk often begins with
@@ -3521,7 +3547,7 @@ func (h *Handler) runClod(
 		case content, ok := <-task.Output():
 			if !ok {
 				// Channel closed, task is done.
-				flushBuffer()
+				flushBuffer(true)
 				goto done
 			}
 
@@ -3552,7 +3578,7 @@ func (h *Handler) runClod(
 			// Check for special stats message.
 			if strings.HasPrefix(content, "__STATS__") {
 				h.clearProgressMessage(channelID, threadTS, logger)
-				flushBuffer() // Flush any pending output first.
+				flushBuffer(true) // Flush any pending output first.
 				h.postStatsMessage(channelID, threadTS, content[9:]) // Skip "__STATS__" prefix.
 				// Clear consolidation since stats message breaks the chain.
 				h.lastOutputMsg.Delete(threadKey)
@@ -3570,7 +3596,7 @@ func (h *Handler) runClod(
 			// Check for snippet message (tool output to upload as collapsible file).
 			if strings.HasPrefix(content, "__SNIPPET__") {
 				h.clearProgressMessage(channelID, threadTS, logger)
-				flushBuffer() // Flush any pending output first.
+				flushBuffer(true) // Flush any pending output first.
 				// Format: __SNIPPET__toolName\x00inputJSON\x00content
 				payload := content[11:] // Skip "__SNIPPET__" prefix.
 				parts := strings.SplitN(payload, "\x00", 3)
@@ -3603,9 +3629,12 @@ func (h *Handler) runClod(
 
 			outputBuffer.WriteString(content)
 
-			// Flush if buffer is getting large.
+			// Flush if buffer is getting large. Soft flush — if we're
+			// mid-table or mid-fence, flushBuffer will hold for up
+			// to maxIncompleteHold so a streaming GFM table doesn't
+			// get cut in half by the size trigger.
 			if outputBuffer.Len() >= maxBatchLen {
-				flushBuffer()
+				flushBuffer(false)
 			}
 
 		case req, ok := <-permRequests:
@@ -3620,7 +3649,7 @@ func (h *Handler) runClod(
 				}
 
 				// Post formatted permission prompt with buttons to Slack.
-				flushBuffer() // Flush any pending output first.
+				flushBuffer(true) // Flush any pending output first.
 				var msgTS string
 				// Special case: AskUserQuestion gets a CLI-style picker.
 				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, logger); custom != "" {
@@ -3685,7 +3714,7 @@ func (h *Handler) runClod(
 				}
 
 				// Post formatted permission prompt with buttons to Slack.
-				flushBuffer() // Flush any pending output first.
+				flushBuffer(true) // Flush any pending output first.
 				var msgTS string
 				// Special case: AskUserQuestion gets a CLI-style picker.
 				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, logger); custom != "" {
@@ -3741,8 +3770,12 @@ func (h *Handler) runClod(
 			// whether an Active session died "just now" (worth
 			// resuming) or "a long time ago" (stale — skip). Gated
 			// at 30s so we're not hammering the sessions.json file
-			// every 2s tick.
-			flushBuffer()
+			// every 2s tick. Soft flush so a mid-table buffer holds
+			// for up to maxIncompleteHold; without this the 2s
+			// ticker can cut a streaming GFM table in half, and the
+			// continuation rows get rendered as a separate plain-
+			// text block downstream.
+			flushBuffer(false)
 			if time.Since(lastHeartbeat) >= 30*time.Second {
 				h.bot.sessions.Touch(channelID, threadTS)
 				if err := h.bot.sessions.Save(); err != nil {
@@ -3753,7 +3786,7 @@ func (h *Handler) runClod(
 
 		case result := <-task.Done():
 			// Task completed
-			flushBuffer()
+			flushBuffer(true)
 			h.finalizeTask(channelID, threadTS, taskName, taskPath, userID, result, logger)
 			return
 		}

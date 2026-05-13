@@ -175,3 +175,64 @@ func TestGFMTableRendersAsCodeBlock(t *testing.T) {
 		}
 	}
 }
+
+// TestBufferLooksIncomplete guards the streaming-flush heuristic that
+// holds back a partial flush when claude is mid-table or mid-fence.
+// The bug it prevents: the 2s ticker hits while a GFM table is
+// streaming; the parser sees header+separator+first-row as a complete
+// table and renders it; remaining rows arrive in the next flush as a
+// SEPARATE block and don't merge. See the v0.32.x "Best D…" regression.
+func TestBufferLooksIncomplete(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"empty", "", false},
+		{"plain text", "Hello world", false},
+		{"text with newline", "Hello\nworld\n", false},
+
+		{"open fence at end", "Some text\n```\necho hi", true},
+		{"open fence mid-line", "```bash\nfoo", true},
+		{"closed fence", "```\necho hi\n```\n", false},
+		{"two closed fences", "```\nfoo\n```\n\n```\nbar\n```\n", false},
+		{"three fences (one open)", "```\nfoo\n```\n```open", true},
+		{"backticks but not at line start", "Run `npm install` to install", false},
+
+		{"complete table row", "| a | b | c |\n", false},
+		{"complete table header + separator", "| a | b |\n|---|---|\n", false},
+		{
+			"mid-row (the regression case)",
+			"| Range | LPIPS range | DreamSim range |\n|---|---|---|\n| Best (step 3400) | **0.2086** | 0.1206 |\n| Best D",
+			true,
+		},
+		{
+			"row missing trailing pipe",
+			"| a | b | c",
+			true,
+		},
+		{"indented mid-row", "  | Best D", true},
+
+		// A complete table followed by newlines should not be flagged.
+		{
+			"complete table",
+			"| a | b |\n|---|---|\n| 1 | 2 |\n",
+			false,
+		},
+		// Text after a table is fine.
+		{
+			"table then text",
+			"| a |\n|---|\n| 1 |\n\nDone.",
+			false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := bufferLooksIncomplete(c.in)
+			if got != c.want {
+				t.Errorf("bufferLooksIncomplete(%q) = %v, want %v", c.in, got, c.want)
+			}
+		})
+	}
+}
