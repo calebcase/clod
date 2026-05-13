@@ -349,3 +349,68 @@ func formatTableAsCodeBlock(rows [][]string) string {
 	out.WriteString("```\n")
 	return out.String()
 }
+
+// bufferLooksIncomplete returns true when `s` ends in the middle of
+// a markdown construct that needs more content before it can be
+// rendered correctly. Used by the streaming output flusher in
+// handlers.go to hold back partial flushes (subject to a max-hold
+// timeout) so a GFM table or fenced code block isn't cut in half by
+// the 2-second tick — when that happens the AST parser sees the
+// partial header+separator+first-row as a complete table, renders
+// it, and any rows that arrive in the next flush get rendered as
+// plain text rather than appended.
+//
+// The detection is heuristic but conservative: we only hold when
+// there's strong evidence of an open construct (odd fence count,
+// or last line looks like an unterminated table row). False
+// negatives (don't hold a buffer that's actually incomplete) just
+// reproduce the existing pre-fix behaviour; false positives (hold
+// a buffer that's actually fine) are bounded by the caller's
+// maxIncompleteHold timeout.
+func bufferLooksIncomplete(s string) bool {
+	if s == "" {
+		return false
+	}
+	// Unclosed code fence. Count top-of-line "```" occurrences
+	// (a fence must start at the beginning of a line). An odd
+	// count means there's an open fence at the tail.
+	fenceCount := 0
+	for i := 0; i < len(s); i++ {
+		if (i == 0 || s[i-1] == '\n') && i+3 <= len(s) && s[i:i+3] == "```" {
+			fenceCount++
+		}
+	}
+	if fenceCount%2 != 0 {
+		return true
+	}
+
+	// Unterminated table row. Tables stream line-by-line; a
+	// complete GFM row starts and ends with `|`. If the last
+	// non-empty line starts with `|` but doesn't end with `|`,
+	// claude is mid-row and the next delta will complete it.
+	//
+	// Walk back through trailing newlines to find the last
+	// content-bearing line.
+	end := len(s)
+	for end > 0 && (s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+	if end == 0 {
+		return false
+	}
+	start := end
+	for start > 0 && s[start-1] != '\n' {
+		start--
+	}
+	lastLine := s[start:end]
+	// Tolerate leading whitespace before the `|` (GFM allows
+	// indented tables up to 3 spaces).
+	trimmed := lastLine
+	for len(trimmed) > 0 && (trimmed[0] == ' ' || trimmed[0] == '\t') {
+		trimmed = trimmed[1:]
+	}
+	if len(trimmed) > 0 && trimmed[0] == '|' && trimmed[len(trimmed)-1] != '|' {
+		return true
+	}
+	return false
+}
