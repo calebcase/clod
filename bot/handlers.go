@@ -5720,6 +5720,107 @@ func (h *Handler) maybeHandleMonitorResult(
 	return true
 }
 
+// monitorTerminalStatuses lists status strings that mean a
+// background task is no longer running. Lower-cased; the
+// reconciler compares against the lower-cased input status. Kept
+// inclusive on purpose — different claude-code versions have
+// rebadged this field over time and the cost of treating a still-
+// running task as terminal is low (we'd just remove it from the
+// monitor list; an AddMonitor on the next start re-adds it if
+// it's still relevant).
+var monitorTerminalStatuses = map[string]bool{
+	"completed": true,
+	"complete":  true,
+	"exited":    true,
+	"exit":      true,
+	"failed":    true,
+	"failure":   true,
+	"killed":    true,
+	"stopped":   true,
+	"finished":  true,
+	"done":      true,
+	"cancelled": true,
+	"canceled":  true,
+}
+
+// isMonitorTerminalStatus returns true when the given status string
+// indicates the background task is no longer running. Empty / unknown
+// statuses return false (treated as "still running" / "don't touch
+// the monitor list").
+func isMonitorTerminalStatus(s string) bool {
+	return monitorTerminalStatuses[strings.ToLower(strings.TrimSpace(s))]
+}
+
+// maybeReconcileMonitorsFromTaskResult inspects a TaskGet / TaskList /
+// TaskOutput result and decrements the bot's monitor count for any
+// task that's now in a terminal state. Best-effort parse: if the
+// result doesn't match a known shape, no-op. Without this, monitors
+// only ever decrement on explicit TaskStop calls — agents that
+// instead query state via TaskGet (typical) leave the count
+// growing forever.
+func (h *Handler) maybeReconcileMonitorsFromTaskResult(channelID, threadTS, toolName, content string, logger zerolog.Logger) {
+	type taskEntry struct {
+		TaskID string `json:"task_id"`
+		Status string `json:"status"`
+	}
+
+	var doneIDs []string
+
+	// TaskList shape: {"tasks": [{task_id, status}, ...]}
+	// We use it as authoritative: every monitor not in the list,
+	// or in the list with a terminal status, is dropped. That
+	// reconciles drift in either direction.
+	if toolName == "TaskList" {
+		var list struct {
+			Tasks []taskEntry `json:"tasks"`
+		}
+		if err := json.Unmarshal([]byte(content), &list); err == nil && list.Tasks != nil {
+			running := make(map[string]bool, len(list.Tasks))
+			for _, t := range list.Tasks {
+				if t.TaskID == "" {
+					continue
+				}
+				if !isMonitorTerminalStatus(t.Status) {
+					running[t.TaskID] = true
+				}
+			}
+			session := h.bot.sessions.Get(channelID, threadTS)
+			if session != nil {
+				for _, id := range session.ActiveMonitors {
+					if !running[id] {
+						doneIDs = append(doneIDs, id)
+					}
+				}
+			}
+		}
+	} else {
+		// TaskGet / TaskOutput: single-task shape. Status field
+		// drives the decision. We don't try to parse the prose
+		// fallback — if the JSON shape changes we just no-op.
+		var single taskEntry
+		if err := json.Unmarshal([]byte(content), &single); err == nil &&
+			single.TaskID != "" && isMonitorTerminalStatus(single.Status) {
+			doneIDs = []string{single.TaskID}
+		}
+	}
+
+	if len(doneIDs) == 0 {
+		return
+	}
+
+	for _, id := range doneIDs {
+		h.bot.sessions.RemoveMonitor(channelID, threadTS, id)
+	}
+	if err := h.bot.sessions.Save(); err != nil {
+		logger.Debug().Err(err).Msg("save after reconcile-RemoveMonitor")
+	}
+	h.syncMonitorCountEmoji(channelID, threadTS, logger)
+	logger.Info().
+		Str("via", toolName).
+		Strs("removed", doneIDs).
+		Msg("auto-removed terminal monitors from count")
+}
+
 // maybeHandleTaskStopResult parses the TaskStop JSON result and renders a
 // tidy Slack message (emoji + task id + command in a code span) instead
 // of uploading the raw JSON as a collapsible snippet. Also deregisters
@@ -5799,6 +5900,12 @@ func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, cont
 	// hidden at default verbosity, and TaskStop returns JSON that's
 	// nicer parsed than uploaded as a snippet. Both also adjust the
 	// "active monitor count" reaction on the thread's anchor message.
+	//
+	// TaskGet / TaskList / TaskOutput don't replace the snippet —
+	// the agent (and the user reading the thread) should still see
+	// their output — but their results tell us when a previously-
+	// registered monitor is no longer running, so we use them to
+	// decrement the count without requiring an explicit TaskStop.
 	switch toolName {
 	case "Monitor":
 		if h.maybeHandleMonitorResult(channelID, threadTS, content, input, verbosityLevel, logger) {
@@ -5808,6 +5915,8 @@ func (h *Handler) postToolSnippet(channelID, threadTS, toolName, inputJSON, cont
 		if h.maybeHandleTaskStopResult(channelID, threadTS, content, verbosityLevel, logger) {
 			return
 		}
+	case "TaskGet", "TaskList", "TaskOutput":
+		h.maybeReconcileMonitorsFromTaskResult(channelID, threadTS, toolName, content, logger)
 	}
 
 	var summary string
