@@ -127,25 +127,33 @@ func TestAddStats_BaselinePending_FromMigration(t *testing.T) {
 	approx(t, cost, 0.20, "post-baseline result credits the delta")
 }
 
-// TestAddStats_DecreasingCumulative_Defensive guards the defensive
-// branch: if claude ever reports a cumulative lower than what we
-// last observed (shouldn't happen — claude's totalCostUSD is
-// monotonic within a process and resume restores it — but might if
-// session-state files get rolled back or stats get associated with
-// the wrong thread), don't credit a negative delta. Just reset the
-// baseline.
-func TestAddStats_DecreasingCumulative_Defensive(t *testing.T) {
+// TestAddStats_DecreasingCumulative_FreshProcessBaseline covers the
+// common case of the "observed < last" branch: a claude --resume
+// starts a new process whose `total_cost_usd` begins at 0 (claude
+// does NOT rehydrate the prior process's cumulative on resume — our
+// initial implementation assumed it did and silently dropped the
+// new process's cost). When the observed value falls below the
+// session's last seen, we treat it as a fresh-process baseline and
+// credit the full observed amount as new cost. Within a single
+// process this branch only fires on a true regression (rare) but
+// the semantics are the same: don't undercount.
+func TestAddStats_DecreasingCumulative_FreshProcessBaseline(t *testing.T) {
 	store, _ := newTestStore(t)
 
+	// Process 1: cumulative climbs from 0 to 0.42 over a few turns.
 	store.AddStats("C1", "T1", 0.42, 4)
 
+	// Process 2 (after bot restart + claude --resume): claude's new
+	// process starts cumulative at 0; first observation is the new
+	// process's first turn's cost ($0.10).
 	cost, _ := store.AddStats("C1", "T1", 0.10, 1)
-	approx(t, cost, 0.42, "cumulative should not decrease on a backwards observation")
+	approx(t, cost, 0.52, "fresh process baseline should credit the full observed amount as new cost")
 
-	// And the next forward observation should delta off the new
-	// baseline (0.10), not the prior high-water 0.42.
+	// And the next forward observation continues to delta off the
+	// new process's running cumulative (0.10), not the prior
+	// session's high-water (0.42).
 	cost, _ = store.AddStats("C1", "T1", 0.18, 1)
-	approx(t, cost, 0.50, "forward observation credits delta off the reset baseline")
+	approx(t, cost, 0.60, "subsequent observations within the new process credit only the delta")
 }
 
 // TestCostMigrationV1_RunsOnce verifies the one-time migration: a

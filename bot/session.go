@@ -648,19 +648,26 @@ func (s *SessionStore) AddStats(channelID, threadTS string, claudeCumulativeCost
 		costDelta = 0
 	case claudeCumulativeCostUSD < session.LastClaudeCostUSD:
 		// Claude reported a cumulative value lower than what we last
-		// saw. This shouldn't happen in normal operation (cumulative
-		// is monotonic within a process and resume restores the
-		// prior total), but if it does — e.g. a session-state file
-		// got rolled back, or we somehow associated stats with the
-		// wrong session — treat it as a fresh baseline rather than
-		// crediting a negative delta.
+		// saw. The common cause is a process restart via `--resume`:
+		// contrary to our initial assumption, claude --resume does
+		// NOT rehydrate F$.totalCostUSD from saved state — each new
+		// process starts at 0 and accumulates from there. So a fresh
+		// observation of $0.75 against a prior session high of
+		// $417.67 just means "process 2 has spent $0.75 since it
+		// started", and that $0.75 is real new cost we should
+		// credit. Treat the observed value as the full delta and
+		// reset the baseline to it. Within a single process this
+		// branch only fires on a true regression (e.g. session state
+		// rolled back), in which case crediting the new value as
+		// fresh cost is still safe — the alternative of dropping it
+		// silently undercounts.
 		s.logger.Warn().
 			Str("channel", channelID).
 			Str("thread", threadTS).
 			Float64("observed", claudeCumulativeCostUSD).
 			Float64("last", session.LastClaudeCostUSD).
-			Msg("claude cumulative cost decreased; resetting baseline without credit")
-		costDelta = 0
+			Msg("claude cumulative cost decreased; treating as fresh process baseline")
+		costDelta = claudeCumulativeCostUSD
 	default:
 		costDelta = claudeCumulativeCostUSD - session.LastClaudeCostUSD
 	}
