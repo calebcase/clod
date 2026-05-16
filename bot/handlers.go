@@ -56,6 +56,18 @@ type Handler struct {
 	// Track running tasks by thread key ("channelID:threadTS")
 	runningTasks sync.Map // key -> *RunningTask
 
+	// workReactions tracks user-message TSs that have the
+	// "working on it" reaction (workInProgressEmoji) pending
+	// removal. Keyed by progressKey ("channel:thread"). One queue
+	// per thread, FIFO so the oldest pending reaction is the one
+	// cleared by the next task `result` event. Lets the user tell
+	// at a glance whether their message reached the bot AND
+	// whether the agent is still working on it — a message
+	// without an hourglass means delivery never happened (Slack-
+	// side delivery gap, bot down, etc.); a message stuck with an
+	// hourglass means the agent is still processing.
+	workReactions sync.Map // key -> *workReactionQueue
+
 	// Track threads waiting for permission responses
 	pendingPermissions sync.Map // key -> *PendingPermission
 
@@ -580,7 +592,7 @@ func (h *Handler) HandleAppMention(ctx context.Context, ev *slackevents.AppMenti
 		if input != "" {
 			send := func(finalInput string) {
 				logger.Debug().Str("input", finalInput).Msg("sending input to running task")
-				if err := h.sendUserInput(task, ev.Channel, threadTS, finalInput); err != nil {
+				if err := h.sendUserInput(task, ev.Channel, threadTS, ev.TimeStamp, finalInput); err != nil {
 					logger.Error().Err(err).Msg("failed to send input to task")
 				}
 			}
@@ -765,7 +777,7 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 		h.lastOutputMsg.Delete(key(ev.Channel, threadTS))
 		send := func(finalInput string) {
 			logger.Debug().Str("input", finalInput).Msg("sending thread reply to running task")
-			if err := h.sendUserInput(task, ev.Channel, threadTS, finalInput); err != nil {
+			if err := h.sendUserInput(task, ev.Channel, threadTS, ev.TimeStamp, finalInput); err != nil {
 				logger.Error().Err(err).Msg("failed to send input to task")
 			}
 		}
@@ -828,6 +840,7 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 	}
 
 	launch := func(finalPrompt string) {
+		h.markWorkInProgress(ev.Channel, threadTS, ev.TimeStamp)
 		h.runClod(
 			ctx,
 			ev.Channel,
@@ -2844,6 +2857,7 @@ func (h *Handler) runNewTask(
 	// deferred until the user clicks a button; otherwise we splice
 	// the referenced content and start immediately.
 	launch := func(finalPrompt string) {
+		h.markWorkInProgress(ev.Channel, threadTS, ev.TimeStamp)
 		h.runClod(
 			ctx,
 			ev.Channel,
@@ -2906,12 +2920,119 @@ func monitorCountEmojiFor(count int) string {
 // whether the write succeeds, on the basis that the user clearly
 // intends to drive a new turn (a stuck "idle" flag would silently
 // suppress the eventual auto-resume after the next bot restart).
-func (h *Handler) sendUserInput(task *RunningTask, channelID, threadTS, input string) error {
+//
+// userMsgTS is the Slack TS of the user message that triggered this
+// dispatch. When non-empty, the bot adds a "working on it" reaction
+// to it before sending and clears it when the corresponding result
+// fires. Pass "" when the input isn't user-driven (e.g. a bot-
+// generated wakeup nudge from ScheduleWakeup) so no reaction goes
+// on a non-existent message.
+func (h *Handler) sendUserInput(task *RunningTask, channelID, threadTS, userMsgTS, input string) error {
 	h.bot.sessions.SetIdle(channelID, threadTS, false)
 	if err := h.bot.sessions.Save(); err != nil {
 		h.logger.Debug().Err(err).Msg("save before sendUserInput")
 	}
+	if userMsgTS != "" {
+		h.markWorkInProgress(channelID, threadTS, userMsgTS)
+	}
 	return task.SendInput(input)
+}
+
+// workInProgressEmoji is the reaction the bot puts on a user
+// message while the agent is working on the resulting turn. Removed
+// when the turn's `result` event arrives. Chosen for unambiguity:
+// the flowing sand is the most "ongoing work" of the hourglass
+// variants and isn't reused elsewhere in the bot's reaction set.
+const workInProgressEmoji = "hourglass_flowing_sand"
+
+// workReactionQueue holds the per-thread FIFO of user-message TSs
+// awaiting their result event. Each Add appends; each Pop dequeues
+// the front. Two-step (mutate + Slack call) so the lock stays
+// short.
+type workReactionQueue struct {
+	mu  sync.Mutex
+	tss []string
+}
+
+// markWorkInProgress records that we just dispatched a turn to the
+// agent on behalf of `userMsgTS` and posts the work-in-progress
+// reaction on that message. Idempotent against the Slack side via
+// AddReaction's already_reacted tolerance.
+func (h *Handler) markWorkInProgress(channelID, threadTS, userMsgTS string) {
+	if userMsgTS == "" {
+		return
+	}
+	progressKey := key(channelID, threadTS)
+	v, _ := h.workReactions.LoadOrStore(progressKey, &workReactionQueue{})
+	q := v.(*workReactionQueue)
+	q.mu.Lock()
+	q.tss = append(q.tss, userMsgTS)
+	q.mu.Unlock()
+	if err := h.bot.AddReaction(channelID, userMsgTS, workInProgressEmoji); err != nil {
+		h.logger.Debug().
+			Err(err).
+			Str("channel", channelID).
+			Str("ts", userMsgTS).
+			Msg("failed to add work-in-progress reaction")
+	}
+}
+
+// clearOldestWorkInProgress pops the oldest pending user-message TS
+// for this thread and removes the work-in-progress reaction. Called
+// from postStatsMessage so each `result` event clears exactly one
+// pending reaction — the one for the user input it processed.
+// No-op when the queue is empty (e.g. results from bot-generated
+// wakeup nudges, which never marked any user message).
+func (h *Handler) clearOldestWorkInProgress(channelID, threadTS string) {
+	progressKey := key(channelID, threadTS)
+	v, ok := h.workReactions.Load(progressKey)
+	if !ok {
+		return
+	}
+	q := v.(*workReactionQueue)
+	q.mu.Lock()
+	if len(q.tss) == 0 {
+		q.mu.Unlock()
+		return
+	}
+	ts := q.tss[0]
+	q.tss = q.tss[1:]
+	q.mu.Unlock()
+	if err := h.bot.RemoveReaction(channelID, ts, workInProgressEmoji); err != nil {
+		h.logger.Debug().
+			Err(err).
+			Str("channel", channelID).
+			Str("ts", ts).
+			Msg("failed to remove work-in-progress reaction")
+	}
+}
+
+// clearAllWorkInProgress drains the queue for this thread and
+// removes every pending reaction. Called from finalizeTask so a
+// task that exits before all its result events fire (force-kill,
+// timeout, graceful shutdown) doesn't leave hourglass reactions
+// stranded on user messages. On normal completion the queue is
+// already empty here because postStatsMessage popped per-result.
+func (h *Handler) clearAllWorkInProgress(channelID, threadTS string) {
+	progressKey := key(channelID, threadTS)
+	v, ok := h.workReactions.LoadAndDelete(progressKey)
+	if !ok {
+		return
+	}
+	q := v.(*workReactionQueue)
+	q.mu.Lock()
+	tss := q.tss
+	q.tss = nil
+	q.mu.Unlock()
+	for _, ts := range tss {
+		if err := h.bot.RemoveReaction(channelID, ts, workInProgressEmoji); err != nil {
+			h.logger.Debug().
+				Err(err).
+				Str("channel", channelID).
+				Str("ts", ts).
+				Msg("failed to remove work-in-progress reaction (cleanup)")
+		}
+	}
 }
 
 // syncMonitorCountEmoji brings the anchor-message reaction into line with
@@ -3121,6 +3242,7 @@ func (h *Handler) handleContinuation(
 	}
 
 	launch := func(finalPrompt string) {
+		h.markWorkInProgress(ev.Channel, threadTS, ev.TimeStamp)
 		h.runClod(
 			ctx,
 			ev.Channel,
@@ -3812,6 +3934,13 @@ func (h *Handler) finalizeTask(
 	result *Result,
 	logger zerolog.Logger,
 ) {
+	// Clear any work-in-progress reactions that didn't get popped
+	// by their result event — on normal completion this is a no-op
+	// (postStatsMessage already drained the queue per result), but
+	// on force-kill / timeout / shutdown the queue may still hold
+	// entries and we don't want hourglasses stranded on user
+	// messages.
+	h.clearAllWorkInProgress(channelID, threadTS)
 	var finalMsg string
 	cleanExit := result.Error == nil
 	progressKey := key(channelID, threadTS)
@@ -5192,6 +5321,7 @@ func (h *Handler) startTaskAfterInit(ctx context.Context, p *pendingInit, logger
 	}
 
 	launch := func(finalPrompt string) {
+		h.markWorkInProgress(p.ChannelID, p.ThreadTS, p.MentionTS)
 		h.runClod(
 			ctx,
 			p.ChannelID,
@@ -5380,7 +5510,13 @@ func (h *Handler) handleAmbiguousAction(
 	if actionValue.Redirect && ambig.Text != "" {
 		// Clear output consolidation since the user is starting a new turn.
 		h.lastOutputMsg.Delete(actionValue.ThreadKey)
-		if err := h.sendUserInput(task, pending.ChannelID, pending.ThreadTS, ambig.Text); err != nil {
+		// Pass "" for userMsgTS: pendingAmbiguous only stores the
+		// bot's prompt TS, not the user's original message TS.
+		// Skipping the work-in-progress reaction on this path is a
+		// known minor gap; the user has already clicked a button in
+		// the meantime, which provides its own implicit
+		// acknowledgement that the bot received their input.
+		if err := h.sendUserInput(task, pending.ChannelID, pending.ThreadTS, "", ambig.Text); err != nil {
 			logger.Error().Err(err).Msg("failed to send redirected input")
 		}
 	}
@@ -5634,6 +5770,13 @@ func (h *Handler) postStatsMessage(channelID, threadTS, statsJSON string) {
 		h.logger.Error().Err(err).Str("json", statsJSON).Msg("failed to parse stats JSON")
 		return
 	}
+
+	// Clear the oldest pending work-in-progress reaction for this
+	// thread — this result event corresponds to the user input that
+	// took the front of the queue. A no-op when the queue is empty
+	// (e.g. the turn that just ended was a ScheduleWakeup wake or
+	// some other bot-initiated input that never marked a user msg).
+	h.clearOldestWorkInProgress(channelID, threadTS)
 
 	cumulativeCost, cumulativeTurns := h.bot.sessions.AddStats(channelID, threadTS, stats.CostUSD, stats.NumTurns)
 	if err := h.bot.sessions.Save(); err != nil {
