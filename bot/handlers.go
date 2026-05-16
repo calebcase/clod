@@ -3035,6 +3035,153 @@ func (h *Handler) clearAllWorkInProgress(channelID, threadTS string) {
 	}
 }
 
+// pendingUserMessage holds one in-flight user message recovered from
+// Slack reactions on resume. TS is the Slack timestamp (used for
+// the reaction-clear pop after the agent processes it); Text is
+// the parsed continuation (stripped of any leading @-mention) ready
+// to feed to claude.
+type pendingUserMessage struct {
+	TS   string
+	Text string
+}
+
+// findPendingUserMessages scans the thread's recent replies for user
+// messages still bearing the bot's work-in-progress reaction. Those
+// are the messages the bot acknowledged ("I saw it, I'm working on
+// it") but never produced a result event for — typically because the
+// bot died, the Socket Mode connection broke, or the runner was
+// killed mid-turn. They're our "where were we last in sync" boundary:
+// any message without the bot's hourglass is either already handled
+// (reaction cleared on result) or never seen (no reaction to begin
+// with). The latter we can't safely recover here; the former we
+// don't need to replay.
+//
+// Window: oldest = 24h ago. A bot down for >24h is unusual and the
+// session is probably stale by then anyway. Single page (1000 reps)
+// covers a chatty 24h-window thread with room to spare.
+//
+// Output ordering: ascending TS (claude reads stdin sequentially, so
+// the user expects responses in submission order).
+func (h *Handler) findPendingUserMessages(channelID, threadTS, sessionUserID string, logger zerolog.Logger) []pendingUserMessage {
+	botUID, err := h.bot.UserID()
+	if err != nil {
+		logger.Warn().Err(err).Msg("can't resolve bot user id; skipping pending-message recovery")
+		return nil
+	}
+
+	oldest := strconv.FormatInt(time.Now().Add(-24*time.Hour).Unix(), 10)
+	msgs, _, _, err := h.bot.client.GetConversationReplies(&slack.GetConversationRepliesParameters{
+		ChannelID: channelID,
+		Timestamp: threadTS,
+		Oldest:    oldest,
+		Limit:     1000,
+	})
+	if err != nil {
+		logger.Warn().Err(err).Msg("conversations.replies failed; skipping pending-message recovery")
+		return nil
+	}
+
+	var out []pendingUserMessage
+	for _, m := range msgs {
+		// Only consider messages authored by the session's user.
+		// (sessionUserID may be empty on very old sessions that
+		// pre-date the UserID field; in that case we accept any
+		// non-bot human author by checking BotID is empty too.)
+		if sessionUserID != "" {
+			if m.User != sessionUserID {
+				continue
+			}
+		} else if m.BotID != "" {
+			continue
+		}
+		// Must currently bear the work-in-progress reaction added
+		// by THIS bot. Slack returns the full users list per
+		// reaction, so we check explicitly rather than trusting
+		// the count.
+		hasOurMark := false
+		for _, r := range m.Reactions {
+			if r.Name != workInProgressEmoji {
+				continue
+			}
+			for _, u := range r.Users {
+				if u == botUID {
+					hasOurMark = true
+					break
+				}
+			}
+			if hasOurMark {
+				break
+			}
+		}
+		if !hasOurMark {
+			continue
+		}
+		text := ParseContinuation(m.Text)
+		if text == "" {
+			// An empty post (file-only attachment, etc.) — skip
+			// rather than feed claude a blank turn.
+			continue
+		}
+		out = append(out, pendingUserMessage{TS: m.Timestamp, Text: text})
+	}
+	// Slack returns oldest-first by default; sort defensively in
+	// case that contract ever changes.
+	sort.Slice(out, func(i, j int) bool { return out[i].TS < out[j].TS })
+	return out
+}
+
+// replayPendingMessages forwards each recovered pending user message
+// to the resumed task as a fresh user input. Runs as a goroutine
+// alongside runClod: claude's stdin queues the replays after the
+// initial resume nudge, so each becomes its own turn and emits its
+// own result event — which means clearOldestWorkInProgress fires
+// once per replay, popping the hourglass FIFO in order.
+//
+// Waits for runClod to register the task in runningTasks before
+// sending (with a generous timeout); if the task never appears, we
+// log and bail without retrying.
+func (h *Handler) replayPendingMessages(ctx context.Context, progressKey, channelID, threadTS string, pending []pendingUserMessage, logger zerolog.Logger) {
+	if len(pending) == 0 {
+		return
+	}
+
+	var task *RunningTask
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		if v, ok := h.runningTasks.Load(progressKey); ok {
+			task = v.(*RunningTask)
+			break
+		}
+		if time.Now().After(deadline) {
+			logger.Warn().
+				Int("pending", len(pending)).
+				Msg("timeout waiting for resumed task to register; abandoning replay")
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	for _, p := range pending {
+		logger.Info().
+			Str("ts", p.TS).
+			Int("text_len", len(p.Text)).
+			Msg("replaying pending user message after resume")
+		// sendUserInput queues the TS into workReactions and
+		// (re-)posts the hourglass reaction (idempotent on
+		// already_reacted). Each replay's eventual result event
+		// pops the queue in order, clearing the hourglass on
+		// the corresponding Slack message.
+		if err := h.sendUserInput(task, channelID, threadTS, p.TS, p.Text); err != nil {
+			logger.Error().Err(err).Str("ts", p.TS).Msg("replay sendUserInput failed; aborting remaining replays")
+			return
+		}
+	}
+}
+
 // syncMonitorCountEmoji brings the anchor-message reaction into line with
 // the session's current ActiveMonitors count. Idempotent; safe to call
 // whenever monitor state changes.
@@ -3382,11 +3529,23 @@ func (h *Handler) resumeOneSession(ctx context.Context, s *SessionMapping) {
 	h.bot.sessions.ClearMonitors(s.ChannelID, s.ThreadTS)
 	h.bot.sessions.SetMonitorCountEmoji(s.ChannelID, s.ThreadTS, "")
 
-	if _, err := h.bot.PostMessage(
-		s.ChannelID,
-		fmt.Sprintf(":arrows_counterclockwise: Resuming session in `%s` after bot restart…", s.TaskName),
-		s.ThreadTS,
-	); err != nil {
+	// Recover any user messages that still bear the bot's
+	// "working on it" hourglass — those are the messages the bot
+	// saw and queued for the agent but never produced a result
+	// for (because the bot died, was killed, or lost its socket
+	// connection mid-turn). They're our "last in sync" marker:
+	// without this we either silently drop them or, worse, over-
+	// replay every message in the thread.
+	pending := h.findPendingUserMessages(s.ChannelID, s.ThreadTS, s.UserID, logger)
+
+	noticeText := fmt.Sprintf(":arrows_counterclockwise: Resuming session in `%s` after bot restart…", s.TaskName)
+	if len(pending) > 0 {
+		noticeText = fmt.Sprintf(
+			":arrows_counterclockwise: Resuming session in `%s` after bot restart — replaying %d unhandled message%s.",
+			s.TaskName, len(pending), plural(len(pending)),
+		)
+	}
+	if _, err := h.bot.PostMessage(s.ChannelID, noticeText, s.ThreadTS); err != nil {
 		logger.Debug().Err(err).Msg("failed to post resume notice")
 	}
 
@@ -3398,6 +3557,25 @@ func (h *Handler) resumeOneSession(ctx context.Context, s *SessionMapping) {
 		"the Monitor tool, they died with the previous container — verify their on-disk " +
 		"state and restart them if still needed. Then continue from where you left off. " +
 		"Do not redo steps that already completed."
+	if len(pending) > 0 {
+		nudge += fmt.Sprintf(
+			" After your initial state check, %d user message%s that arrived "+
+				"before the restart will be re-delivered as separate user turns; "+
+				"respond to each in order.",
+			len(pending), plural(len(pending)),
+		)
+	}
+
+	// Spawn the replay goroutine BEFORE runClod blocks. It polls
+	// runningTasks for the task to register and then SendInputs
+	// each pending message — claude's stdin queues them after the
+	// resume nudge, so each is processed as its own turn and
+	// emits its own result event (which pops the hourglass FIFO
+	// in order).
+	if len(pending) > 0 {
+		progressKey := key(s.ChannelID, s.ThreadTS)
+		go h.replayPendingMessages(ctx, progressKey, s.ChannelID, s.ThreadTS, pending, logger)
+	}
 
 	h.runClod(
 		ctx,
@@ -3410,6 +3588,17 @@ func (h *Handler) resumeOneSession(ctx context.Context, s *SessionMapping) {
 		s.ThreadTS,
 		logger,
 	)
+}
+
+// plural returns "s" when n != 1 (so callers can write
+// `len(x), plural(len(x))` and get correct subject-verb forms in
+// human-facing strings). Pulled out so the resume-notice template
+// reads cleanly.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // runClod executes clod and streams output to Slack.

@@ -347,6 +347,31 @@ func (b *Bot) UpdateMessageBlocks(channelID, ts string, blocks []slack.Block) er
 	return nil
 }
 
+// botUserIDOnce caches the result of auth.test so we don't hit the
+// Slack API on every reaction-filter lookup. The user id is stable
+// for the lifetime of the bot token; refreshing requires a restart
+// anyway. UserID() resolves it lazily.
+var (
+	botUserIDOnce sync.Once
+	botUserID     string
+	botUserIDErr  error
+)
+
+// UserID returns the bot's Slack user id (the "U…" string a reaction
+// payload's `users` array contains for bot-added reactions). Cached
+// after first successful call; subsequent calls are free.
+func (b *Bot) UserID() (string, error) {
+	botUserIDOnce.Do(func() {
+		resp, err := b.client.AuthTest()
+		if err != nil {
+			botUserIDErr = oops.Trace(err)
+			return
+		}
+		botUserID = resp.UserID
+	})
+	return botUserID, botUserIDErr
+}
+
 // AddReaction adds an emoji reaction to a message. name is without colons
 // (e.g. "musical_score", not ":musical_score:"). Returns nil if the
 // reaction already exists ("already_reacted"), since that's the desired
