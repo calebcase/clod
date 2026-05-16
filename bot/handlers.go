@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1448,6 +1449,13 @@ func (h *Handler) handleCloseCommand(
 	if taskVal, ok := h.runningTasks.Load(progressKey); ok {
 		task := taskVal.(*RunningTask)
 		wasRunning = true
+		// Mark this cancel as expected so finalizeTask suppresses
+		// its trailing message (the ":wave: Session closed." we
+		// post below is the user's confirmation; a follow-up
+		// ":warning: Task completed with error: clod execution
+		// was cancelled" or ":white_check_mark: Task completed!"
+		// 30s later — whichever fires — is just noise).
+		h.expectedTaskCancels.Store(progressKey, true)
 		logger.Info().Dur("grace_period", h.bot.gracefulShutdownTTL).Msg("graceful shutdown: close command")
 		// Run the shutdown in a goroutine so the close confirmation
 		// posts immediately. The task's own runClod loop drains
@@ -4150,11 +4158,16 @@ func (h *Handler) finalizeTask(
 			Msg("task completed successfully")
 		finalMsg = ":white_check_mark: Task completed!"
 	}
-	// Skip the "...cancelled" warning when the bot itself cancelled
-	// the task for a known reason (currently: mid-session model
-	// swap). The follow-up code path posts its own status so the
-	// user knows what's happening.
-	if !(expectedCancel && result.Error != nil) {
+	// Skip the trailing "completed" / "completed with error" post
+	// when the bot itself initiated this shutdown for a known
+	// reason: `@bot close` (the user already saw the ":wave:
+	// Session closed." confirmation), a mid-session model swap
+	// (handleSetCommand posts its own follow-up), etc. Applies
+	// regardless of clean vs. error exit, since whether the
+	// graceful save-state turn finished or the grace period
+	// expired and we force-killed is an internal detail the user
+	// doesn't need a separate Slack post about.
+	if !expectedCancel {
 		if _, err := h.bot.PostMessage(channelID, finalMsg, threadTS); err != nil {
 			logger.Error().Err(err).Msg("failed to post final task message")
 		}
