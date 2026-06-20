@@ -1127,9 +1127,21 @@ func (r *Runner) Start(
 			}
 			stderrTail = append(stderrTail, line)
 			stderrMu.Unlock()
-			r.logger.Debug().
-				Str("stderr", line).
-				Msg("clod wrapper stderr")
+			// permbridge-emitted diagnostic lines need to land in
+			// the default info-level logs — they're the
+			// in-container half of the FIFO handshake and the
+			// only way to debug a deadlock after the fact.
+			// Everything else (docker build chatter, SSH agent
+			// banners) stays at debug to keep the log readable.
+			if strings.HasPrefix(line, "[permbridge]") {
+				r.logger.Info().
+					Str("stderr", line).
+					Msg("permbridge stderr")
+			} else {
+				r.logger.Debug().
+					Str("stderr", line).
+					Msg("clod wrapper stderr")
+			}
 
 			// Forward selected lines as progress so the user can see
 			// the container is being prepared (docker build + SSH agent
