@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/calebcase/oops"
 	"github.com/rs/zerolog"
@@ -293,43 +294,132 @@ func (p *PermissionFIFO) readRequests(ctx context.Context) {
 }
 
 // writeResponses writes permission responses to the FIFO.
+//
+// Each step is logged at Info level with structured fields so the
+// June 2026 FIFO-deadlock recurrence can be diagnosed without
+// having to attach gdb to the running bot. Key fields:
+//
+//   - resp_id: short random tag that ties the log lines for one
+//     response together; pairs with permbridge's per-request id.
+//   - fifo_path: absolute path of the response FIFO we're about
+//     to open. Bot and permbridge MUST log identical paths; if
+//     they diverge that's the bug.
+//   - fifo_inode / fifo_dev / fifo_mode: stat of the FIFO at
+//     open time. If the file got recreated between bot-side
+//     creation and use, inode will differ from what permbridge
+//     sees on its end.
+//   - open_blocked_for_ms / write_blocked_for_ms: time spent in
+//     the open / write syscalls. The deadlock symptom was open
+//     blocking indefinitely; a watchdog goroutine logs "still
+//     blocked on open" every 30s so a hung send is loud in the
+//     log instead of silent.
 func (p *PermissionFIFO) writeResponses(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case resp := <-p.responses:
+			respID := shortHexID()
+			log := p.logger.With().
+				Str("resp_id", respID).
+				Str("behavior", resp.Behavior).
+				Str("fifo_path", p.responsePath).
+				Logger()
+
+			// Stat the FIFO BEFORE attempting to open. If it
+			// doesn't exist (deleted) or is no longer a named
+			// pipe (race with Close removing it and something
+			// creating a regular file), this gives us a
+			// concrete reason for the impending open failure.
+			statBefore, statErr := os.Stat(p.responsePath)
+			if statErr == nil {
+				sys, _ := statBefore.Sys().(*syscall.Stat_t)
+				if sys != nil {
+					log = log.With().
+						Uint64("fifo_inode", sys.Ino).
+						Uint64("fifo_dev", sys.Dev).
+						Str("fifo_mode", statBefore.Mode().String()).
+						Logger()
+				}
+			} else {
+				log.Warn().Err(statErr).Msg("response FIFO stat failed before open")
+			}
+			log.Info().Msg("writing permission response: opening FIFO")
+
+			// Watchdog: if the open hasn't returned in 30s,
+			// shout. Cancelled when openDone fires.
+			openStart := time.Now()
+			openDone := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-openDone:
+						return
+					case <-ticker.C:
+						log.Warn().
+							Dur("blocked_for", time.Since(openStart)).
+							Msg("response FIFO open is still blocked (no reader yet)")
+					}
+				}
+			}()
+
 			// Open FIFO for writing (blocks until reader connects)
 			file, err := os.OpenFile(p.responsePath, os.O_WRONLY, 0)
+			close(openDone)
+			openElapsed := time.Since(openStart)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				p.logger.Error().Err(err).Msg("failed to open response FIFO")
+				log.Error().
+					Err(err).
+					Dur("open_blocked_for", openElapsed).
+					Msg("failed to open response FIFO")
 				continue
 			}
+			log.Info().Dur("open_blocked_for", openElapsed).Msg("response FIFO open succeeded; writing payload")
 
 			data, err := json.Marshal(resp)
 			if err != nil {
-				p.logger.Error().Err(err).Msg("failed to marshal response")
+				log.Error().Err(err).Msg("failed to marshal response")
 				_ = file.Close()
 				continue
 			}
 
-			_, err = file.Write(append(data, '\n'))
+			writeStart := time.Now()
+			n, err := file.Write(append(data, '\n'))
+			writeElapsed := time.Since(writeStart)
 			if err != nil {
-				p.logger.Error().Err(err).Msg("failed to write response")
+				log.Error().Err(err).Dur("write_blocked_for", writeElapsed).Msg("failed to write response")
 			}
 
 			if err := file.Close(); err != nil {
-				p.logger.Error().Err(err).Msg("failed to close response FIFO")
+				log.Error().Err(err).Msg("failed to close response FIFO")
 			}
 
-			p.logger.Debug().
-				Str("behavior", resp.Behavior).
-				Msg("sent permission response")
+			log.Info().
+				Int("bytes", n).
+				Dur("write_blocked_for", writeElapsed).
+				Dur("total_blocked_for", time.Since(openStart)).
+				Msg("permission response delivered")
 		}
 	}
+}
+
+// shortHexID returns an 8-character random hex string. Cheap (one
+// crypto/rand call, four bytes). Used for diagnostic per-response /
+// per-request correlation; not a security identifier.
+func shortHexID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure is essentially impossible on Linux;
+		// fall back to a stable placeholder so the absence of an id
+		// doesn't propagate as a noisy error.
+		return "????????"
+	}
+	return fmt.Sprintf("%x", b[:])
 }
 
 // Requests returns the channel for receiving permission requests.
