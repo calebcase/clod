@@ -4773,10 +4773,15 @@ func (h *Handler) HandleBlockAction(
 	}
 	pending := pendingVal.(*PendingPermission)
 
-	// Send the response to Claude via FIFO or control message
+	// Send the response to Claude via FIFO or control message.
+	// The message field flows straight to claude as the
+	// permission tool result, so it must not name the human —
+	// the agent has no business knowing who clicked the button.
+	// Slack-side audit ("denied by <@user>") happens separately
+	// via the UpdateMessage call below.
 	resp := PermissionResponse{Behavior: actionValue.Behavior}
 	if actionValue.Behavior == "deny" {
-		resp.Message = fmt.Sprintf("User %s denied permission", callback.User.Name)
+		resp.Message = "User denied permission"
 	}
 
 	logger.Info().
@@ -5607,11 +5612,17 @@ func (h *Handler) handleAskQuestionFinal(
 	// answers out of the message body. This keeps the tool invocation from
 	// racing with user input and is the documented pattern for surfacing
 	// user-provided context when a tool can't run.
+	// This message becomes the MCP tool_result for the agent's
+	// request_permission call — strip identity. Surfacing the
+	// Slack username here taught the agent the user's name in
+	// the eerie-eagle session and propagated into agent memory
+	// (June 2026 finding); the human-side audit of who clicked
+	// happens via the Slack message update below.
 	resp := PermissionResponse{}
 	var answerSummary string
 	if isCancel {
 		resp.Behavior = "deny"
-		resp.Message = fmt.Sprintf("User %s cancelled the question prompt.", callback.User.Name)
+		resp.Message = "User cancelled the question prompt."
 	} else {
 		resp.Behavior = "deny"
 		answerSummary = formatAskUserQuestionAnswer(state)
@@ -5682,13 +5693,15 @@ func (h *Handler) handleAmbiguousAction(
 		pending = pendingVal.(*PendingPermission)
 	}
 
-	// Build the permission response.
+	// Build the permission response. Message goes to claude as
+	// the tool result — strip identity. Slack-side audit happens
+	// separately via the prompt-update path below.
 	resp := PermissionResponse{Behavior: actionValue.Behavior}
 	switch {
 	case actionValue.Redirect:
-		resp.Message = fmt.Sprintf("User %s cancelled the pending permission to redirect with new instructions.", callback.User.Name)
+		resp.Message = "User cancelled the pending permission to redirect with new instructions."
 	case actionValue.Behavior == "deny":
-		resp.Message = fmt.Sprintf("User %s denied permission", callback.User.Name)
+		resp.Message = "User denied permission"
 	}
 
 	if hasPending {
