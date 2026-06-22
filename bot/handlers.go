@@ -2985,42 +2985,20 @@ func (h *Handler) markWorkInProgress(channelID, threadTS, userMsgTS string) {
 	}
 }
 
-// clearOldestWorkInProgress pops the oldest pending user-message TS
-// for this thread and removes the work-in-progress reaction. Called
-// from postStatsMessage so each `result` event clears exactly one
-// pending reaction — the one for the user input it processed.
-// No-op when the queue is empty (e.g. results from bot-generated
-// wakeup nudges, which never marked any user message).
-func (h *Handler) clearOldestWorkInProgress(channelID, threadTS string) {
-	progressKey := key(channelID, threadTS)
-	v, ok := h.workReactions.Load(progressKey)
-	if !ok {
-		return
-	}
-	q := v.(*workReactionQueue)
-	q.mu.Lock()
-	if len(q.tss) == 0 {
-		q.mu.Unlock()
-		return
-	}
-	ts := q.tss[0]
-	q.tss = q.tss[1:]
-	q.mu.Unlock()
-	if err := h.bot.RemoveReaction(channelID, ts, workInProgressEmoji); err != nil {
-		h.logger.Debug().
-			Err(err).
-			Str("channel", channelID).
-			Str("ts", ts).
-			Msg("failed to remove work-in-progress reaction")
-	}
-}
-
 // clearAllWorkInProgress drains the queue for this thread and
-// removes every pending reaction. Called from finalizeTask so a
-// task that exits before all its result events fire (force-kill,
-// timeout, graceful shutdown) doesn't leave hourglass reactions
-// stranded on user messages. On normal completion the queue is
-// already empty here because postStatsMessage popped per-result.
+// removes every pending reaction. Called from postStatsMessage on
+// every `result` event, and from finalizeTask on task exit.
+//
+// Pop-all-on-result (not pop-oldest) because claude bundles
+// rapid-fire user inputs into a single turn: messages that arrive
+// while a turn is in flight get drained at the next turn boundary
+// inside Sjp (claude 2.1.185) via `M.messageQueue.remove(_e)`, after
+// being converted to `queued_command` attachments by `oGt`. The
+// model sees them — but as part of the same turn as the seed
+// message, so claude emits one `result` covering N user inputs.
+// Per-result 1:1 popping would leave N-1 hourglasses stranded; this
+// pops all, since by the time a result fires the queue has been
+// fully consumed.
 func (h *Handler) clearAllWorkInProgress(channelID, threadTS string) {
 	progressKey := key(channelID, threadTS)
 	v, ok := h.workReactions.LoadAndDelete(progressKey)
@@ -3141,9 +3119,9 @@ func (h *Handler) findPendingUserMessages(channelID, threadTS, sessionUserID str
 // replayPendingMessages forwards each recovered pending user message
 // to the resumed task as a fresh user input. Runs as a goroutine
 // alongside runClod: claude's stdin queues the replays after the
-// initial resume nudge, so each becomes its own turn and emits its
-// own result event — which means clearOldestWorkInProgress fires
-// once per replay, popping the hourglass FIFO in order.
+// initial resume nudge. Claude will bundle them into one or more
+// turns; clearAllWorkInProgress fires on each `result` and drains
+// the FIFO regardless of how the bundling splits.
 //
 // Waits for runClod to register the task in runningTasks before
 // sending (with a generous timeout); if the task never appears, we
@@ -5986,12 +5964,12 @@ func (h *Handler) postStatsMessage(channelID, threadTS, statsJSON string) {
 		return
 	}
 
-	// Clear the oldest pending work-in-progress reaction for this
-	// thread — this result event corresponds to the user input that
-	// took the front of the queue. A no-op when the queue is empty
-	// (e.g. the turn that just ended was a ScheduleWakeup wake or
-	// some other bot-initiated input that never marked a user msg).
-	h.clearOldestWorkInProgress(channelID, threadTS)
+	// Drain every pending work-in-progress reaction for this thread.
+	// See clearAllWorkInProgress for why this is pop-all rather than
+	// pop-oldest. A no-op when the queue is empty (e.g. the turn that
+	// just ended was a ScheduleWakeup wake or some other
+	// bot-initiated input that never marked a user msg).
+	h.clearAllWorkInProgress(channelID, threadTS)
 
 	cumulativeCost, cumulativeTurns := h.bot.sessions.AddStats(channelID, threadTS, stats.CostUSD, stats.NumTurns)
 	if err := h.bot.sessions.Save(); err != nil {
