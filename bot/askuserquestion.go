@@ -25,6 +25,13 @@ type askOption struct {
 // askUserQuestionState tracks an in-flight AskUserQuestion prompt while the
 // user picks answers. The underlying permission is NOT resolved until the user
 // clicks Submit.
+//
+// IsControlPermission/ControlRequestID are carried here (and not just on
+// the parallel pendingPermissions map entry) so handleAskQuestionFinal can
+// dispatch the response even when the pendingPermissions entry has been
+// lost — a class of inconsistency we observed in eerie-eagle on 2026-06-22
+// where the Submit click silently no-op'd because the pendingPermissions
+// lookup failed.
 type askUserQuestionState struct {
 	MessageTS string // TS of the prompt message (for update after submit)
 	ChannelID string
@@ -34,6 +41,12 @@ type askUserQuestionState struct {
 	// question i. Single-select questions have at most one entry; multi-select
 	// can have multiple. Empty slice = unanswered.
 	Selections [][]string
+	// Dispatch info for resolving the underlying permission, mirrored from
+	// the pendingPermissions entry at creation time. IsControlPermission
+	// is true for the newer control_response protocol; otherwise the
+	// response goes via the MCP permission FIFO.
+	IsControlPermission bool
+	ControlRequestID    string
 }
 
 // parseAskUserQuestionInput extracts the questions array from the tool input
