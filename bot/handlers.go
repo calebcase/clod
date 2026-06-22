@@ -3949,7 +3949,7 @@ func (h *Handler) runClod(
 				flushBuffer(true) // Flush any pending output first.
 				var msgTS string
 				// Special case: AskUserQuestion gets a CLI-style picker.
-				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, logger); custom != "" {
+				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, false, "", logger); custom != "" {
 					msgTS = custom
 				} else {
 					// For ExitPlanMode with a long plan, upload the full
@@ -4014,7 +4014,7 @@ func (h *Handler) runClod(
 				flushBuffer(true) // Flush any pending output first.
 				var msgTS string
 				// Special case: AskUserQuestion gets a CLI-style picker.
-				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, logger); custom != "" {
+				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, true, task.pendingControlRequestID, logger); custom != "" {
 					msgTS = custom
 				} else {
 					planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
@@ -4410,6 +4410,8 @@ func (h *Handler) tryPostAskUserQuestionPrompt(
 	ctx context.Context,
 	req PermissionRequest,
 	channelID, threadTS, progressKey string,
+	isControlPermission bool,
+	controlRequestID string,
 	logger zerolog.Logger,
 ) string {
 	logger = logger.With().Str("phase", "askuserquestion").Logger()
@@ -4465,11 +4467,13 @@ func (h *Handler) tryPostAskUserQuestionPrompt(
 	}
 
 	h.askQuestionStates.Store(progressKey, &askUserQuestionState{
-		MessageTS:  msgTS,
-		ChannelID:  channelID,
-		ThreadTS:   threadTS,
-		Questions:  questions,
-		Selections: selections,
+		MessageTS:           msgTS,
+		ChannelID:           channelID,
+		ThreadTS:            threadTS,
+		Questions:           questions,
+		Selections:          selections,
+		IsControlPermission: isControlPermission,
+		ControlRequestID:    controlRequestID,
 	})
 
 	logger.Info().
@@ -5567,10 +5571,22 @@ func (h *Handler) handleAskQuestionFinal(
 	}
 	task := taskVal.(*RunningTask)
 
+	// pendingPermissions is the parallel bookkeeping map used for the
+	// generic permission button path. For AskUserQuestion we treat
+	// askQuestionStates (already found above) as the source of truth
+	// for dispatch — the IsControlPermission/ControlRequestID fields
+	// were copied there at creation time. Falling back to state-only
+	// dispatch keeps the answer flowing even when the pending entry
+	// has been lost (2026-06-22 eerie-eagle incident: Submit click
+	// silently no-op'd because pendingPermissions lookup failed).
 	pendingVal, hasPending := h.pendingPermissions.LoadAndDelete(actionValue.ThreadKey)
 	var pending *PendingPermission
 	if hasPending {
 		pending = pendingVal.(*PendingPermission)
+	} else {
+		logger.Warn().
+			Str("thread_key", actionValue.ThreadKey).
+			Msg("pendingPermissions missing for askq submit; dispatching from askQuestionStates")
 	}
 
 	isCancel := action.ActionID == "askq_cancel"
@@ -5607,14 +5623,22 @@ func (h *Handler) handleAskQuestionFinal(
 		resp.Message = "AskUserQuestion is unavailable in this environment; the user answered directly:\n" + answerSummary
 	}
 
+	// Dispatch source-of-truth: prefer pendingPermissions (the existing
+	// path) but fall back to the dispatch fields mirrored into
+	// askUserQuestionState so a missing pending entry doesn't strand
+	// claude waiting on the FIFO.
+	isControl := state.IsControlPermission
+	ctrlReqID := state.ControlRequestID
 	if hasPending {
-		if pending.IsControlPermission && pending.ControlRequestID != "" {
-			if err := task.SendControlResponse(pending.ControlRequestID, resp.Behavior, resp.Message); err != nil {
-				logger.Error().Err(err).Msg("failed to send control response for askq")
-			}
-		} else {
-			task.SendPermissionResponse(resp)
+		isControl = pending.IsControlPermission
+		ctrlReqID = pending.ControlRequestID
+	}
+	if isControl && ctrlReqID != "" {
+		if err := task.SendControlResponse(ctrlReqID, resp.Behavior, resp.Message); err != nil {
+			logger.Error().Err(err).Msg("failed to send control response for askq")
 		}
+	} else {
+		task.SendPermissionResponse(resp)
 	}
 
 	// Update the prompt message with the outcome.
