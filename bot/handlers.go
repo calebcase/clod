@@ -5633,6 +5633,14 @@ func (h *Handler) handleAskQuestionFinal(
 		isControl = pending.IsControlPermission
 		ctrlReqID = pending.ControlRequestID
 	}
+	logger.Info().
+		Bool("is_control", isControl).
+		Str("ctrl_req_id", ctrlReqID).
+		Bool("has_pending", hasPending).
+		Bool("is_cancel", isCancel).
+		Str("behavior", resp.Behavior).
+		Int("message_bytes", len(resp.Message)).
+		Msg("dispatching askq response")
 	if isControl && ctrlReqID != "" {
 		if err := task.SendControlResponse(ctrlReqID, resp.Behavior, resp.Message); err != nil {
 			logger.Error().Err(err).Msg("failed to send control response for askq")
