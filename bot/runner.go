@@ -497,9 +497,13 @@ func (t *RunningTask) PermissionRequests() <-chan PermissionRequest {
 
 // SendPermissionResponse sends a response to a permission request.
 func (t *RunningTask) SendPermissionResponse(resp PermissionResponse) {
-	if t.permissionFIFO != nil {
-		t.permissionFIFO.SendResponse(resp)
+	if t.permissionFIFO == nil {
+		t.logger.Warn().
+			Str("behavior", resp.Behavior).
+			Msg("SendPermissionResponse called with nil permissionFIFO; dropping silently would strand claude")
+		return
 	}
+	t.permissionFIFO.SendResponse(resp)
 }
 
 // ControlPermissionRequests returns the channel for receiving permission requests

@@ -428,10 +428,19 @@ func (p *PermissionFIFO) Requests() <-chan PermissionRequest {
 }
 
 // SendResponse sends a permission response (non-blocking).
+//
+// Logs at Info on the success path so we can see, in the absence of
+// "writing permission response: opening FIFO" from the writer
+// goroutine, whether the queue happened at all. Without this trail
+// a silently-stalled writer is indistinguishable from a never-queued
+// response (2026-06-25 eerie-eagle incident).
 func (p *PermissionFIFO) SendResponse(resp PermissionResponse) {
 	select {
 	case p.responses <- resp:
-		p.logger.Debug().Str("behavior", resp.Behavior).Msg("queued permission response")
+		p.logger.Info().
+			Str("behavior", resp.Behavior).
+			Int("buffered", len(p.responses)).
+			Msg("queued permission response for writer")
 	default:
 		p.logger.Warn().Str("behavior", resp.Behavior).Msg("response channel full, dropping")
 	}
