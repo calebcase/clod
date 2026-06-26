@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,6 +16,26 @@ import (
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
+
+// slackHTTPTimeout is the per-request deadline applied to every
+// Slack JSON API call (chat.postMessage, chat.update, files.upload,
+// etc.) via the shared *http.Client. Slack's p99 for these endpoints
+// is comfortably under 5s; anything past 30s is a hung connection
+// or a backend stall, not slow processing.
+//
+// Why this matters: the runClod main loop (handlers.go:3788+) does
+// PostMessage / UpdateMessage inline from its task.Output() case
+// body. Without a deadline a single hung HTTP call wedges the entire
+// select — including the permRequests case — so AskUserQuestion
+// prompts never reach Slack and the agent stalls. Observed in
+// eerie-eagle on 2026-06-26: a flushBuffer post hung at 11:23, the
+// agent's tool_use:AskUserQuestion that came 3 seconds later sat
+// unprocessed for 16 minutes until manual FIFO injection.
+//
+// WebSocket connections are hijacked from net/http after upgrade and
+// are NOT subject to this deadline, so Socket Mode stays connected
+// indefinitely; only the JSON API hop inherits the limit.
+const slackHTTPTimeout = 30 * time.Second
 
 // Bot manages the Slack connection and event handling.
 type Bot struct {
@@ -70,6 +91,7 @@ func NewBot(
 	client := slack.New(
 		botToken,
 		slack.OptionAppLevelToken(appToken),
+		slack.OptionHTTPClient(&http.Client{Timeout: slackHTTPTimeout}),
 	)
 
 	socket := socketmode.New(
