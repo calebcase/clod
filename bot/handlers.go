@@ -4639,7 +4639,8 @@ func (h *Handler) HandleBlockAction(
 	isAskQuestionSelect := action.ActionID == "askq_radio" ||
 		action.ActionID == "askq_checkbox"
 	isAskQuestionFinal := action.ActionID == "askq_submit" ||
-		action.ActionID == "askq_cancel"
+		action.ActionID == "askq_cancel" ||
+		action.ActionID == "askq_discuss"
 	isInitSelect := action.ActionID == "init_image" ||
 		action.ActionID == "init_ssh" ||
 		action.ActionID == "init_model" ||
@@ -5590,6 +5591,7 @@ func (h *Handler) handleAskQuestionFinal(
 	}
 
 	isCancel := action.ActionID == "askq_cancel"
+	isDiscuss := action.ActionID == "askq_discuss"
 
 	// Build the permission response.
 	//
@@ -5614,10 +5616,14 @@ func (h *Handler) handleAskQuestionFinal(
 	// happens via the Slack message update below.
 	resp := PermissionResponse{}
 	var answerSummary string
-	if isCancel {
+	switch {
+	case isCancel:
 		resp.Behavior = "deny"
 		resp.Message = "User cancelled the question prompt."
-	} else {
+	case isDiscuss:
+		resp.Behavior = "deny"
+		resp.Message = "The user wants to discuss the question before answering. Don't re-invoke AskUserQuestion immediately — continue the conversation in the thread: share your reasoning behind each option, ask whatever follow-ups you need, and wait for their reply."
+	default:
 		resp.Behavior = "deny"
 		answerSummary = formatAskUserQuestionAnswer(state)
 		resp.Message = "AskUserQuestion is unavailable in this environment; the user answered directly:\n" + answerSummary
@@ -5651,9 +5657,12 @@ func (h *Handler) handleAskQuestionFinal(
 
 	// Update the prompt message with the outcome.
 	var updated string
-	if isCancel {
+	switch {
+	case isCancel:
 		updated = fmt.Sprintf(":x: *Question cancelled* by <@%s>", callback.User.ID)
-	} else {
+	case isDiscuss:
+		updated = fmt.Sprintf(":speech_balloon: *Discussion requested* by <@%s> — reply in this thread to continue.", callback.User.ID)
+	default:
 		updated = fmt.Sprintf(":white_check_mark: *Answer submitted* by <@%s>\n%s",
 			callback.User.ID, answerSummary)
 	}
