@@ -150,22 +150,34 @@ func buildAskUserQuestionBlocks(
 			nil, nil,
 		))
 
-		// Options. Option values are option indices as strings so we don't
-		// hit Slack's 75-char plain_text limit via the label.
+		// Render each option as its own mrkdwn section block above the
+		// picker. Slack's option-object `description` field is plain_text
+		// capped at 75 chars; rendering the full description as a section
+		// (3000 char mrkdwn limit) lets the user actually read what
+		// they're picking. The radio/checkbox buttons below carry just
+		// the short label so the picker stays compact.
+		for j, opt := range q.Options {
+			line := fmt.Sprintf("*[%d] %s*", j, opt.Label)
+			if opt.Description != "" {
+				line += "\n" + opt.Description
+			}
+			blocks = append(blocks, slack.NewSectionBlock(
+				slack.NewTextBlockObject("mrkdwn", line, false, false),
+				nil, nil,
+			))
+		}
+
+		// Picker options. Value is the option index as a string so we
+		// avoid Slack's 75-char plain_text cap leaking into the value
+		// channel. Label is prefixed with the index so the picker and
+		// the section blocks above are easy to cross-reference. Drop
+		// the description here — it's already in the section block.
 		options := make([]*slack.OptionBlockObject, 0, len(q.Options))
 		var recommended []*slack.OptionBlockObject
 		for j, opt := range q.Options {
-			label := truncateForSlackText(opt.Label, 75)
-			text := slack.NewTextBlockObject("plain_text", label, false, false)
-			var desc *slack.TextBlockObject
-			if opt.Description != "" {
-				desc = slack.NewTextBlockObject(
-					"plain_text",
-					truncateForSlackText(opt.Description, 75),
-					false, false,
-				)
-			}
-			obj := slack.NewOptionBlockObject(strconv.Itoa(j), text, desc)
+			short := truncateForSlackText(fmt.Sprintf("[%d] %s", j, opt.Label), 75)
+			text := slack.NewTextBlockObject("plain_text", short, false, false)
+			obj := slack.NewOptionBlockObject(strconv.Itoa(j), text, nil)
 			options = append(options, obj)
 			if strings.Contains(strings.ToLower(opt.Label), "(recommended)") {
 				recommended = append(recommended, obj)
@@ -205,6 +217,17 @@ func buildAskUserQuestionBlocks(
 	)
 	submit.Style = "primary"
 
+	// Discuss button: dismisses the AskUserQuestion tool call but tells
+	// claude to keep the conversation alive in-thread instead of
+	// abandoning the question. Mirrors claude's TUI escape-to-chat
+	// experience — pick later, after we've talked it through.
+	discussValue := fmt.Sprintf(`{"k":%q,"b":"deny"}`, progressKey)
+	discuss := slack.NewButtonBlockElement(
+		"askq_discuss",
+		discussValue,
+		slack.NewTextBlockObject("plain_text", "Discuss", false, false),
+	)
+
 	cancelValue := fmt.Sprintf(`{"k":%q,"b":"deny"}`, progressKey)
 	cancel := slack.NewButtonBlockElement(
 		"askq_cancel",
@@ -213,7 +236,7 @@ func buildAskUserQuestionBlocks(
 	)
 	cancel.Style = "danger"
 
-	blocks = append(blocks, slack.NewActionBlock("askq_submit_row", submit, cancel))
+	blocks = append(blocks, slack.NewActionBlock("askq_submit_row", submit, discuss, cancel))
 	return blocks
 }
 
