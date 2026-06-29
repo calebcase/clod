@@ -3784,6 +3784,39 @@ func (h *Handler) runClod(
 	ctrlPermRequests := task.ControlPermissionRequests()
 	sessionCaptured := task.SessionIDCaptured()
 
+	// Drain permission requests in a dedicated goroutine so they
+	// can't be starved by anything blocking the output-flushing path.
+	// Observed in eerie-eagle 2026-06-29: runClod's main select sat
+	// for 24 minutes inside the task.Output() case body while a
+	// permission request was buffered and unprocessed, and Slack
+	// never saw the AskUserQuestion prompt. The HTTP timeout we
+	// added in v0.32.4 didn't catch whatever was blocking — moving
+	// permission posting onto its own goroutine sidesteps the
+	// question of what specifically was wedged.
+	//
+	// permRequests closes when the runner's PermissionFIFO closes
+	// on task exit, which is how this goroutine knows to leave.
+	// ctrlPermRequests is never explicitly closed; ctx cancellation
+	// handles it.
+	go func() {
+		for {
+			select {
+			case req, ok := <-permRequests:
+				if !ok {
+					return
+				}
+				h.handlePermissionRequest(ctx, req, task, channelID, threadTS, threadKey, progressKey, logger)
+			case req, ok := <-ctrlPermRequests:
+				if !ok {
+					return
+				}
+				h.handleControlPermissionRequest(ctx, req, task, channelID, threadTS, threadKey, progressKey, logger)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	// Process output and wait for completion
 	for {
 		select {
@@ -3932,133 +3965,6 @@ func (h *Handler) runClod(
 			// get cut in half by the size trigger.
 			if outputBuffer.Len() >= maxBatchLen {
 				flushBuffer(false)
-			}
-
-		case req, ok := <-permRequests:
-			if ok {
-				// Check if this permission is already allowed by saved rules.
-				if h.isPermissionAllowed(task.taskPath, req.ToolName, req.ToolInput) {
-					logger.Info().
-						Str("tool_name", req.ToolName).
-						Msg("auto-allowing permission based on saved rule")
-					task.SendPermissionResponse(PermissionResponse{Behavior: "allow"})
-					continue
-				}
-
-				// Post formatted permission prompt with buttons to Slack.
-				flushBuffer(true) // Flush any pending output first.
-				var msgTS string
-				// Special case: AskUserQuestion gets a CLI-style picker.
-				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, false, "", logger); custom != "" {
-					msgTS = custom
-				} else {
-					// For ExitPlanMode with a long plan, upload the full
-					// plan as a snippet first so the user can read the
-					// portion that won't fit in the truncated prompt.
-					planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
-					blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
-					postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
-					var err error
-					msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
-					cancelPost()
-					if err != nil {
-						if errors.Is(err, context.DeadlineExceeded) {
-							logger.Error().Dur("deadline", permissionPostTimeout).
-								Str("tool_name", req.ToolName).
-								Msg("permission prompt post hit deadline; denying so claude doesn't hang")
-						} else {
-							logger.Error().Err(err).Msg("failed to post permission prompt")
-						}
-						// Send deny on failure to post.
-						task.SendPermissionResponse(
-							PermissionResponse{Behavior: "deny", Message: "Failed to prompt user"},
-						)
-						continue
-					}
-				}
-
-				// Track the pending permission with its message timestamp and tool details.
-				h.pendingPermissions.Store(progressKey, &PendingPermission{
-					MessageTS: msgTS,
-					ChannelID: channelID,
-					ThreadTS:  threadTS,
-					ToolName:  req.ToolName,
-					ToolInput: req.ToolInput,
-				})
-
-				// Clear consolidation since permission prompt breaks the chain.
-				h.lastOutputMsg.Delete(threadKey)
-
-				logger.Info().
-					Str("tool_name", req.ToolName).
-					Str("tool_use_id", req.ToolUseID).
-					Str("message_ts", msgTS).
-					Msg("posted permission prompt to slack, waiting for response (MCP)")
-			}
-
-		case req, ok := <-ctrlPermRequests:
-			if ok {
-				// Handle permission requests from control messages (newer protocol).
-				// Check if this permission is already allowed by saved rules.
-				if h.isPermissionAllowed(task.taskPath, req.ToolName, req.ToolInput) {
-					logger.Info().
-						Str("tool_name", req.ToolName).
-						Msg("auto-allowing control permission based on saved rule")
-					if err := task.SendControlResponse(task.pendingControlRequestID, "allow", ""); err != nil {
-						logger.Error().Err(err).Msg("failed to send auto-allow control response")
-					}
-					continue
-				}
-
-				// Post formatted permission prompt with buttons to Slack.
-				flushBuffer(true) // Flush any pending output first.
-				var msgTS string
-				// Special case: AskUserQuestion gets a CLI-style picker.
-				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, true, task.pendingControlRequestID, logger); custom != "" {
-					msgTS = custom
-				} else {
-					planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
-					blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
-					postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
-					var err error
-					msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
-					cancelPost()
-					if err != nil {
-						if errors.Is(err, context.DeadlineExceeded) {
-							logger.Error().Dur("deadline", permissionPostTimeout).
-								Str("tool_name", req.ToolName).
-								Msg("control permission prompt post hit deadline; denying so claude doesn't hang")
-						} else {
-							logger.Error().Err(err).Msg("failed to post control permission prompt")
-						}
-						// Send deny on failure to post.
-						if err := task.SendControlResponse(task.pendingControlRequestID, "deny", "Failed to prompt user"); err != nil {
-							logger.Error().Err(err).Msg("failed to send deny control response")
-						}
-						continue
-					}
-				}
-
-				// Track the pending permission with its message timestamp, tool details, and control request ID.
-				h.pendingPermissions.Store(progressKey, &PendingPermission{
-					MessageTS:           msgTS,
-					ChannelID:           channelID,
-					ThreadTS:            threadTS,
-					ToolName:            req.ToolName,
-					ToolInput:           req.ToolInput,
-					ControlRequestID:    task.pendingControlRequestID,
-					IsControlPermission: true,
-				})
-
-				// Clear consolidation since permission prompt breaks the chain.
-				h.lastOutputMsg.Delete(threadKey)
-
-				logger.Info().
-					Str("tool_name", req.ToolName).
-					Str("tool_use_id", req.ToolUseID).
-					Str("request_id", task.pendingControlRequestID).
-					Str("message_ts", msgTS).
-					Msg("posted permission prompt to slack, waiting for response (control)")
 			}
 
 		case <-ticker.C:
@@ -4419,6 +4325,146 @@ const permissionPostTimeout = 30 * time.Second
 // upstream and then nothing until the next event. Now every branch
 // emits a debug-level breadcrumb so future failures show which step
 // dropped the request.
+// handlePermissionRequest is the MCP-FIFO permission path extracted
+// from runClod so it can run in its own goroutine. Posts the
+// permission prompt (AskUserQuestion picker or generic blocks) to
+// Slack, records the pending entry, and sends a deny on failure so
+// claude doesn't hang.
+//
+// Decoupled from output flushing — the inline flushBuffer(true) call
+// that used to precede the post is gone; the ticker will catch any
+// trailing buffered output within ~2s. Worst case the prompt
+// appears in Slack just ahead of the final assistant chunk; that's
+// a much smaller failure mode than the entire prompt being lost
+// because output flushing is stuck.
+func (h *Handler) handlePermissionRequest(
+	ctx context.Context,
+	req PermissionRequest,
+	task *RunningTask,
+	channelID, threadTS, threadKey, progressKey string,
+	logger zerolog.Logger,
+) {
+	// Auto-allow via saved rules.
+	if h.isPermissionAllowed(task.taskPath, req.ToolName, req.ToolInput) {
+		logger.Info().
+			Str("tool_name", req.ToolName).
+			Msg("auto-allowing permission based on saved rule")
+		task.SendPermissionResponse(PermissionResponse{Behavior: "allow"})
+		return
+	}
+
+	var msgTS string
+	if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, false, "", logger); custom != "" {
+		msgTS = custom
+	} else {
+		// For ExitPlanMode with a long plan, upload the full plan as
+		// a snippet first so the user can read the portion that
+		// won't fit in the truncated prompt.
+		planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
+		blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
+		postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
+		var err error
+		msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
+		cancelPost()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				logger.Error().Dur("deadline", permissionPostTimeout).
+					Str("tool_name", req.ToolName).
+					Msg("permission prompt post hit deadline; denying so claude doesn't hang")
+			} else {
+				logger.Error().Err(err).Msg("failed to post permission prompt")
+			}
+			task.SendPermissionResponse(
+				PermissionResponse{Behavior: "deny", Message: "Failed to prompt user"},
+			)
+			return
+		}
+	}
+
+	h.pendingPermissions.Store(progressKey, &PendingPermission{
+		MessageTS: msgTS,
+		ChannelID: channelID,
+		ThreadTS:  threadTS,
+		ToolName:  req.ToolName,
+		ToolInput: req.ToolInput,
+	})
+
+	// Clear consolidation since permission prompt breaks the chain.
+	h.lastOutputMsg.Delete(threadKey)
+
+	logger.Info().
+		Str("tool_name", req.ToolName).
+		Str("tool_use_id", req.ToolUseID).
+		Str("message_ts", msgTS).
+		Msg("posted permission prompt to slack, waiting for response (MCP)")
+}
+
+// handleControlPermissionRequest is the control_response permission
+// path extracted from runClod so it can run in its own goroutine.
+// Same shape as handlePermissionRequest but dispatches via
+// task.SendControlResponse instead of the MCP FIFO.
+func (h *Handler) handleControlPermissionRequest(
+	ctx context.Context,
+	req PermissionRequest,
+	task *RunningTask,
+	channelID, threadTS, threadKey, progressKey string,
+	logger zerolog.Logger,
+) {
+	if h.isPermissionAllowed(task.taskPath, req.ToolName, req.ToolInput) {
+		logger.Info().
+			Str("tool_name", req.ToolName).
+			Msg("auto-allowing control permission based on saved rule")
+		if err := task.SendControlResponse(task.pendingControlRequestID, "allow", ""); err != nil {
+			logger.Error().Err(err).Msg("failed to send auto-allow control response")
+		}
+		return
+	}
+
+	var msgTS string
+	if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, true, task.pendingControlRequestID, logger); custom != "" {
+		msgTS = custom
+	} else {
+		planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
+		blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
+		postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
+		var err error
+		msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
+		cancelPost()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				logger.Error().Dur("deadline", permissionPostTimeout).
+					Str("tool_name", req.ToolName).
+					Msg("control permission prompt post hit deadline; denying so claude doesn't hang")
+			} else {
+				logger.Error().Err(err).Msg("failed to post control permission prompt")
+			}
+			if err := task.SendControlResponse(task.pendingControlRequestID, "deny", "Failed to prompt user"); err != nil {
+				logger.Error().Err(err).Msg("failed to send deny control response")
+			}
+			return
+		}
+	}
+
+	h.pendingPermissions.Store(progressKey, &PendingPermission{
+		MessageTS:           msgTS,
+		ChannelID:           channelID,
+		ThreadTS:            threadTS,
+		ToolName:            req.ToolName,
+		ToolInput:           req.ToolInput,
+		ControlRequestID:    task.pendingControlRequestID,
+		IsControlPermission: true,
+	})
+
+	h.lastOutputMsg.Delete(threadKey)
+
+	logger.Info().
+		Str("tool_name", req.ToolName).
+		Str("tool_use_id", req.ToolUseID).
+		Str("request_id", task.pendingControlRequestID).
+		Str("message_ts", msgTS).
+		Msg("posted permission prompt to slack, waiting for response (control)")
+}
+
 func (h *Handler) tryPostAskUserQuestionPrompt(
 	ctx context.Context,
 	req PermissionRequest,
