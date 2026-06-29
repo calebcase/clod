@@ -4109,6 +4109,19 @@ func (h *Handler) finalizeTask(
 	result *Result,
 	logger zerolog.Logger,
 ) {
+	// task.done is read in two places: RunningTask.Shutdown drains it
+	// during graceful shutdown, and runClod's select reads it on
+	// normal exit. The runner closes the channel on goroutine exit
+	// (defer close(task.done)). When Shutdown wins the race, the
+	// subsequent runClod read returns the zero value (nil) instead
+	// of the *Result. Dereferencing result.Error here used to SIGSEGV
+	// and crash the entire bot, taking every other session with it
+	// (eerie-eagle 2026-06-29). Treat the nil-result race as a clean
+	// shutdown — Shutdown already handled the real exit semantics.
+	if result == nil {
+		logger.Info().Msg("finalizeTask got nil result; treating as clean shutdown exit (Shutdown drained the done channel first)")
+		result = &Result{}
+	}
 	// Clear any work-in-progress reactions that didn't get popped
 	// by their result event — on normal completion this is a no-op
 	// (postStatsMessage already drained the queue per result), but
