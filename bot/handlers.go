@@ -3799,18 +3799,27 @@ func (h *Handler) runClod(
 	// ctrlPermRequests is never explicitly closed; ctx cancellation
 	// handles it.
 	go func() {
+		permLog := logger.With().Str("loop", "perm").Logger()
+		permLog.Info().Msg("perm-loop started")
+		defer permLog.Info().Msg("perm-loop exiting")
 		for {
 			select {
 			case req, ok := <-permRequests:
 				if !ok {
 					return
 				}
-				h.handlePermissionRequest(ctx, req, task, channelID, threadTS, threadKey, progressKey, logger)
+				start := time.Now()
+				permLog.Info().Str("tool_name", req.ToolName).Msg("perm-loop: handling MCP request")
+				h.handlePermissionRequest(ctx, req, task, channelID, threadTS, threadKey, progressKey, permLog)
+				permLog.Info().Str("tool_name", req.ToolName).Dur("elapsed", time.Since(start)).Msg("perm-loop: MCP request handled")
 			case req, ok := <-ctrlPermRequests:
 				if !ok {
 					return
 				}
-				h.handleControlPermissionRequest(ctx, req, task, channelID, threadTS, threadKey, progressKey, logger)
+				start := time.Now()
+				permLog.Info().Str("tool_name", req.ToolName).Msg("perm-loop: handling control request")
+				h.handleControlPermissionRequest(ctx, req, task, channelID, threadTS, threadKey, progressKey, permLog)
+				permLog.Info().Str("tool_name", req.ToolName).Dur("elapsed", time.Since(start)).Msg("perm-loop: control request handled")
 			case <-ctx.Done():
 				return
 			}
@@ -4497,19 +4506,23 @@ func (h *Handler) tryPostAskUserQuestionPrompt(
 
 	postCtx, cancel := context.WithTimeout(ctx, permissionPostTimeout)
 	defer cancel()
+	postStart := time.Now()
+	logger.Info().Int("num_blocks", len(blocks)).Msg("calling PostMessageBlocksContext for AskUserQuestion")
 	msgTS, err := h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
+	postElapsed := time.Since(postStart)
 	if err != nil {
 		// Distinguish deadline from other failures so the operator
 		// can tell "Slack was slow" from "Slack rejected the
 		// payload" — they call for different fixes.
 		if errors.Is(err, context.DeadlineExceeded) {
-			logger.Error().Dur("deadline", permissionPostTimeout).
+			logger.Error().Dur("deadline", permissionPostTimeout).Dur("elapsed", postElapsed).
 				Msg("AskUserQuestion post hit deadline; falling back to generic permission prompt")
 		} else {
-			logger.Error().Err(err).Msg("failed to post AskUserQuestion prompt; falling back to generic permission prompt")
+			logger.Error().Err(err).Dur("elapsed", postElapsed).Msg("failed to post AskUserQuestion prompt; falling back to generic permission prompt")
 		}
 		return ""
 	}
+	logger.Info().Dur("elapsed", postElapsed).Str("message_ts", msgTS).Msg("PostMessageBlocksContext returned for AskUserQuestion")
 
 	// Seed Selections with recommended defaults so a single Submit click
 	// submits the same answer the radio/checkbox initially shows.
