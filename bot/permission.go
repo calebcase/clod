@@ -273,11 +273,36 @@ func (p *PermissionFIFO) readRequests(ctx context.Context) {
 			p.logger.Info().
 				Str("tool_name", req.ToolName).
 				Str("tool_use_id", req.ToolUseID).
+				Int("buffered", len(p.requests)).
 				Msg("received permission request")
 
+			// Watchdog: if the channel send blocks (consumer wedged or
+			// missing) we want LOUD evidence rather than a silent stall.
+			// In normal operation send is instant; the watchdog only
+			// fires when the consumer side is misbehaving.
+			sendStart := time.Now()
+			watchdogDone := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-watchdogDone:
+						return
+					case <-ticker.C:
+						p.logger.Warn().
+							Str("tool_name", req.ToolName).
+							Dur("blocked_for", time.Since(sendStart)).
+							Int("buffered", len(p.requests)).
+							Msg("permission request send is still blocked (consumer not draining)")
+					}
+				}
+			}()
 			select {
 			case p.requests <- req:
+				close(watchdogDone)
 			case <-ctx.Done():
+				close(watchdogDone)
 				_ = file.Close()
 				return
 			}
