@@ -356,6 +356,17 @@ func (b *Bot) UpdateMessage(channelID, ts, text string) error {
 	return nil
 }
 
+// DeleteMessage deletes a message the bot posted. Used by the
+// output-file consolidator when swapping a prior fileshare bundle
+// for a fresh one containing more files.
+func (b *Bot) DeleteMessage(channelID, ts string) error {
+	_, _, err := b.client.DeleteMessage(channelID, ts)
+	if err != nil {
+		return oops.Trace(err)
+	}
+	return nil
+}
+
 // UpdateMessageBlocks updates an existing message with blocks.
 func (b *Bot) UpdateMessageBlocks(channelID, ts string, blocks []slack.Block) error {
 	_, _, _, err := b.client.UpdateMessage(
