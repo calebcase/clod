@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,16 +53,54 @@ type DownloadedFile struct {
 type uploadedFile struct {
 	modTime        time.Time // Last modification time when uploaded
 	lastUploadTime time.Time // When the file was last uploaded (for rate limiting)
-	// messageTS is the Slack ts of the most recent sync post for
-	// this file. Populated only for inline-text syncs (code-block
-	// chat.postMessage); empty for file-upload path since
-	// UploadFileV2 doesn't give us a usable message TS and
-	// chat.update can't replace file-attached content anyway.
+}
+
+// bundleMode distinguishes the two consolidation strategies. Consecutive
+// syncs stay in the same bundle only when their mode matches, so an
+// inline-text sync followed by a binary-image sync starts a new bundle.
+type bundleMode string
+
+const (
+	bundleModeInline    bundleMode = "inline"
+	bundleModeFileshare bundleMode = "fileshare"
+)
+
+// inlineEntry is one file's contribution to an inline-mode bundle.
+// content is post-trim (no trailing newlines) so the code fence stays
+// flush.
+type inlineEntry struct {
+	name    string
+	content []byte
+}
+
+// fileshareEntry is one file's contribution to a fileshare-mode bundle.
+// fileID is the Slack file ID returned by files.getUploadURLExternal;
+// title is what appears above the preview.
+type fileshareEntry struct {
+	name   string
+	fileID string
+	title  string
+}
+
+// outputBundle tracks a consolidated output message that groups
+// consecutive file syncs into a single Slack message. When the bot's
+// latest post is still this bundle's message (i.e. no other message
+// type interleaved) and the incoming sync's mode matches, the next
+// file extends the bundle:
+//
+//   - inline mode: edit the message in place, appending or
+//     replacing the file's code block.
+//   - fileshare mode: delete the prior message and re-post via
+//     files.completeUploadExternal with the accumulated file IDs so
+//     Slack creates one message showing every file at once.
+//
+// A mismatched mode, an interleaving message, or a size-overflow
+// starts a fresh bundle.
+type outputBundle struct {
 	messageTS string
-	// inlineText records whether the last sync for this file was
-	// posted inline (chat.postMessage + code block) so the next
-	// sync can decide whether an in-place edit is possible.
-	inlineText bool
+	mode      bundleMode
+	inline    []inlineEntry    // populated when mode == bundleModeInline
+	fileshare []fileshareEntry // populated when mode == bundleModeFileshare
 }
 
 // DownloadToMemory downloads a Slack file to memory using the slack-go client.
@@ -346,6 +385,10 @@ func (f *FileHandler) WatchOutputs(
 	// Track files we've already uploaded with their modification times.
 	uploaded := make(map[string]*uploadedFile)
 
+	// Consolidation state — grows across ticks. bundle == nil means
+	// "no current output message"; the next sync starts a fresh one.
+	var bundle *outputBundle
+
 	// Get initial file list to avoid uploading pre-existing files.
 	entries, _ := os.ReadDir(taskPath)
 	for _, e := range entries {
@@ -390,7 +433,7 @@ func (f *FileHandler) WatchOutputs(
 			}
 			return
 		}
-		f.uploadNewFiles(taskPath, channelID, threadTS, uploaded)
+		f.uploadNewFiles(taskPath, channelID, threadTS, uploaded, &bundle)
 	}
 
 	for {
@@ -434,6 +477,7 @@ func (f *FileHandler) uploadNewFiles(
 	channelID string,
 	threadTS string,
 	uploaded map[string]*uploadedFile,
+	bundle **outputBundle,
 ) {
 	entries, err := os.ReadDir(taskPath)
 	if err != nil {
@@ -503,27 +547,18 @@ func (f *FileHandler) uploadNewFiles(
 		inlineCandidate := len(content) <= inlineSyncMaxBytes && isPrintableUTF8(content)
 
 		if inlineCandidate {
-			messageTS, usedEdit := f.syncInline(channelID, threadTS, name, content, tracked)
-			if messageTS != "" {
+			if f.syncInlineBundle(channelID, threadTS, name, content, bundle) {
 				uploaded[name] = &uploadedFile{
 					modTime:        info2.ModTime(),
 					lastUploadTime: time.Now(),
-					messageTS:      messageTS,
-					inlineText:     true,
 				}
-				f.logger.Debug().
-					Str("file", name).
-					Bool("edited", usedEdit).
-					Str("message_ts", messageTS).
-					Msg("inline file sync posted")
 				continue
 			}
 			// Fall through to file-upload path on inline failure.
 		}
 
 		// Binary / large / inline-failed: use the file-upload path.
-		_, err = f.UploadFromTaskOutputs(localPath, channelID, threadTS, fmt.Sprintf(":outbox_tray: Output: `%s`", name))
-		if err != nil {
+		if err := f.syncFileshareBundle(localPath, name, channelID, threadTS, bundle); err != nil {
 			f.logger.Error().Err(err).Str("file", name).Msg("failed to upload output file")
 			continue
 		}
@@ -534,64 +569,326 @@ func (f *FileHandler) uploadNewFiles(
 	}
 }
 
-// syncInline posts (or edits) a code-block message carrying the file's
-// content. Edits only when the bot hasn't posted anything else on
-// this thread since the previous inline sync message for this file —
-// otherwise posts a new message so the update lands below the
-// interleaved activity. Returns the resolved Slack message TS and
-// whether an in-place edit was used.
-func (f *FileHandler) syncInline(
+// inlineBundleMaxBytes caps the total serialized body of a
+// consolidated inline bundle. Slack's chat.postMessage text limit is
+// 40,000 chars; ~35 KiB leaves headroom for code fences, headers, and
+// mrkdwn expansion across all entries in the bundle. When adding a
+// new entry would exceed this, the current bundle is retired and a
+// fresh one takes its place.
+const inlineBundleMaxBytes = 35 * 1024
+
+// syncInlineBundle posts or extends the consolidated inline output
+// message for this thread. Returns true if the sync succeeded (bundle
+// updated), false if it failed and the caller should fall back to the
+// file-share path.
+//
+// Rules:
+//   - If a bundle exists in the SAME mode, its message is still the
+//     latest bot post, AND adding the new file keeps the body within
+//     inlineBundleMaxBytes, extend it in place (chat.update).
+//   - Otherwise start a fresh bundle: post a new message and reset
+//     *bundlePtr.
+//
+// A re-sync of a file already in the bundle replaces its entry rather
+// than adding a duplicate, so iterative edits stay tidy.
+func (f *FileHandler) syncInlineBundle(
 	channelID, threadTS, name string,
 	content []byte,
-	tracked *uploadedFile,
-) (string, bool) {
-	body := formatInlineSyncMessage(name, content)
+	bundlePtr **outputBundle,
+) bool {
+	trimmed := trimTrailingNewlines(content)
+	bundle := *bundlePtr
 
-	// Edit path: previous inline sync message exists, and the thread's
-	// latest bot post is still that message.
-	if tracked != nil && tracked.inlineText && tracked.messageTS != "" && f.bot != nil {
-		if f.bot.LatestPostTS(channelID, threadTS) == tracked.messageTS {
-			if err := f.bot.UpdateMessage(channelID, tracked.messageTS, body); err == nil {
-				return tracked.messageTS, true
+	// Extend path.
+	if bundle != nil && bundle.mode == bundleModeInline && f.bot != nil &&
+		f.bot.LatestPostTS(channelID, threadTS) == bundle.messageTS {
+		nextEntries := replaceOrAppendInline(bundle.inline, name, trimmed)
+		body := formatInlineBundleMessage(nextEntries)
+		if len(body) <= inlineBundleMaxBytes {
+			if err := f.bot.UpdateMessage(channelID, bundle.messageTS, body); err == nil {
+				bundle.inline = nextEntries
+				f.logger.Debug().
+					Str("file", name).
+					Int("entries", len(nextEntries)).
+					Int("body_bytes", len(body)).
+					Str("message_ts", bundle.messageTS).
+					Msg("extended inline output bundle")
+				return true
 			} else {
-				f.logger.Warn().Err(err).Str("file", name).Msg("inline sync edit failed; falling back to post-new")
+				f.logger.Warn().Err(err).Str("file", name).Msg("inline bundle edit failed; falling back to post-new")
 			}
+		} else {
+			f.logger.Debug().
+				Str("file", name).
+				Int("body_bytes", len(body)).
+				Msg("inline bundle body would exceed cap; starting fresh bundle")
 		}
 	}
 
-	// Post-new path.
-	if f.bot == nil {
-		// AttachBot wasn't wired; posting falls back to direct client call.
-		opts := []slack.MsgOption{slack.MsgOptionText(body, false)}
-		if threadTS != "" {
-			opts = append(opts, slack.MsgOptionTS(threadTS))
-		}
-		_, ts, err := f.client.PostMessage(channelID, opts...)
-		if err != nil {
-			f.logger.Error().Err(err).Str("file", name).Msg("failed to post inline sync (no bot)")
-			return "", false
-		}
-		return ts, false
-	}
-	ts, err := f.bot.PostMessage(channelID, body, threadTS)
+	// Post-new path: fresh bundle with just this file.
+	entries := []inlineEntry{{name: name, content: trimmed}}
+	body := formatInlineBundleMessage(entries)
+	ts, err := f.postText(channelID, threadTS, body)
 	if err != nil {
 		f.logger.Error().Err(err).Str("file", name).Msg("failed to post inline sync")
-		return "", false
+		return false
 	}
-	return ts, false
+	*bundlePtr = &outputBundle{
+		messageTS: ts,
+		mode:      bundleModeInline,
+		inline:    entries,
+	}
+	return true
 }
 
-// formatInlineSyncMessage renders `name` + content as a mrkdwn
-// message with a code block. Tabs inside content are preserved;
-// trailing whitespace is trimmed so the closing fence stays flush.
-func formatInlineSyncMessage(name string, content []byte) string {
-	text := string(content)
-	// Trim only trailing newlines so the closing ``` sits on its
-	// own line without extra blank padding.
-	for len(text) > 0 && (text[len(text)-1] == '\n' || text[len(text)-1] == '\r') {
-		text = text[:len(text)-1]
+// syncFileshareBundle uploads a binary/large file via the staged
+// files.getUploadURLExternal → PUT → files.completeUploadExternal
+// path, consolidating with prior fileshare syncs when possible.
+//
+// Rules:
+//   - If a fileshare bundle exists and its message is still the
+//     latest bot post, delete that message and re-share all
+//     accumulated files (previous + new) via a single
+//     completeUploadExternal call, producing one fresh message.
+//   - Otherwise start a fresh bundle: share just this file.
+//
+// The delete + repost has visible flicker but produces one Slack
+// message containing every file in the bundle, matching the
+// inline-consolidation semantics.
+func (f *FileHandler) syncFileshareBundle(
+	localPath, name, channelID, threadTS string,
+	bundlePtr **outputBundle,
+) error {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return oops.Trace(err)
 	}
-	return fmt.Sprintf(":outbox_tray: Output: `%s`\n```\n%s\n```", name, text)
+	fileID, err := f.uploadAndGetFileID(localPath, name, int(info.Size()))
+	if err != nil {
+		return oops.Trace(err)
+	}
+	newEntry := fileshareEntry{
+		name:   name,
+		fileID: fileID,
+		title:  name,
+	}
+
+	bundle := *bundlePtr
+
+	// Extend path: consolidate into one refreshed message.
+	if bundle != nil && bundle.mode == bundleModeFileshare && f.bot != nil &&
+		f.bot.LatestPostTS(channelID, threadTS) == bundle.messageTS {
+		allEntries := append(append([]fileshareEntry{}, bundle.fileshare...), newEntry)
+		if err := f.bot.DeleteMessage(channelID, bundle.messageTS); err != nil {
+			f.logger.Warn().Err(err).Str("message_ts", bundle.messageTS).Msg("failed to delete prior fileshare bundle; posting fresh anyway")
+		}
+		ts, err := f.completeShareForBundle(channelID, threadTS, allEntries)
+		if err != nil {
+			return oops.Trace(err)
+		}
+		*bundlePtr = &outputBundle{
+			messageTS: ts,
+			mode:      bundleModeFileshare,
+			fileshare: allEntries,
+		}
+		f.logger.Debug().
+			Str("file", name).
+			Int("entries", len(allEntries)).
+			Str("message_ts", ts).
+			Msg("extended fileshare output bundle")
+		return nil
+	}
+
+	// Post-new path: fresh bundle with just this file.
+	ts, err := f.completeShareForBundle(channelID, threadTS, []fileshareEntry{newEntry})
+	if err != nil {
+		return oops.Trace(err)
+	}
+	*bundlePtr = &outputBundle{
+		messageTS: ts,
+		mode:      bundleModeFileshare,
+		fileshare: []fileshareEntry{newEntry},
+	}
+	return nil
+}
+
+// uploadAndGetFileID runs the two-step external upload (get URL, PUT
+// bytes) and returns the file ID without sharing to any channel. The
+// caller shares via completeUploadExternal when it's ready to compose
+// the final message.
+func (f *FileHandler) uploadAndGetFileID(localPath, name string, size int) (string, error) {
+	u, err := f.client.GetUploadURLExternalContext(context.Background(), slack.GetUploadURLExternalParameters{
+		FileName: name,
+		FileSize: size,
+	})
+	if err != nil {
+		return "", oops.Trace(err)
+	}
+	if err := f.client.UploadToURL(context.Background(), slack.UploadToURLParameters{
+		UploadURL: u.UploadURL,
+		File:      localPath,
+		Filename:  name,
+	}); err != nil {
+		return "", oops.Trace(err)
+	}
+	return u.FileID, nil
+}
+
+// completeShareForBundle calls files.completeUploadExternal with all
+// entries in the bundle, producing a single Slack message that shows
+// every file. Returns the new message's TS.
+func (f *FileHandler) completeShareForBundle(
+	channelID, threadTS string,
+	entries []fileshareEntry,
+) (string, error) {
+	files := make([]slack.FileSummary, 0, len(entries))
+	for _, e := range entries {
+		files = append(files, slack.FileSummary{ID: e.fileID, Title: e.title})
+	}
+	comment := formatFileshareComment(entries)
+	resp, err := f.client.CompleteUploadExternalContext(context.Background(), slack.CompleteUploadExternalParameters{
+		Files:           files,
+		Channel:         channelID,
+		ThreadTimestamp: threadTS,
+		InitialComment:  comment,
+	})
+	if err != nil {
+		return "", oops.Trace(err)
+	}
+	// Slack doesn't return the message TS from completeUploadExternal
+	// directly, so we look it up via LatestPostTS after a short delay
+	// to let Slack process. In practice the recordPost hook fires
+	// from PostMessage paths — file-share doesn't hit that. Instead,
+	// find the message via conversations.history.
+	ts := f.findLatestBotMessage(channelID, threadTS, len(files))
+	if ts != "" && f.bot != nil {
+		f.bot.recordPost(channelID, threadTS, ts)
+	}
+	_ = resp
+	return ts, nil
+}
+
+// findLatestBotMessage scans the recent thread history for the bot's
+// most recent post that has attached files matching numFiles. Used
+// to recover the message TS from completeUploadExternal (which
+// doesn't return it).
+func (f *FileHandler) findLatestBotMessage(channelID, threadTS string, numFiles int) string {
+	if f.bot == nil {
+		return ""
+	}
+	botUser, err := f.bot.UserID()
+	if err != nil || botUser == "" {
+		return ""
+	}
+	// Small delay so Slack has finished ingesting the share.
+	time.Sleep(300 * time.Millisecond)
+	params := &slack.GetConversationRepliesParameters{
+		ChannelID: channelID,
+		Timestamp: threadTS,
+		Limit:     20,
+	}
+	msgs, _, _, err := f.client.GetConversationReplies(params)
+	if err != nil {
+		f.logger.Debug().Err(err).Msg("failed to locate fileshare message TS after upload")
+		return ""
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if m.User != botUser && m.BotID == "" {
+			continue
+		}
+		if len(m.Files) >= numFiles {
+			return m.Timestamp
+		}
+	}
+	return ""
+}
+
+// postText sends a chat.postMessage with the given body, threading if
+// threadTS is set. Uses the Bot wrapper when available so LatestPostTS
+// tracking is maintained.
+func (f *FileHandler) postText(channelID, threadTS, body string) (string, error) {
+	if f.bot != nil {
+		return f.bot.PostMessage(channelID, body, threadTS)
+	}
+	opts := []slack.MsgOption{slack.MsgOptionText(body, false)}
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	_, ts, err := f.client.PostMessage(channelID, opts...)
+	if err != nil {
+		return "", oops.Trace(err)
+	}
+	return ts, nil
+}
+
+// replaceOrAppendInline returns a copy of entries with `name`'s entry
+// replaced by (name, content). When `name` isn't already in entries
+// the new record is appended.
+func replaceOrAppendInline(entries []inlineEntry, name string, content []byte) []inlineEntry {
+	out := make([]inlineEntry, 0, len(entries)+1)
+	found := false
+	for _, e := range entries {
+		if e.name == name {
+			out = append(out, inlineEntry{name: name, content: content})
+			found = true
+		} else {
+			out = append(out, e)
+		}
+	}
+	if !found {
+		out = append(out, inlineEntry{name: name, content: content})
+	}
+	return out
+}
+
+// trimTrailingNewlines strips \n and \r from the end of content so the
+// closing code fence sits flush.
+func trimTrailingNewlines(content []byte) []byte {
+	end := len(content)
+	for end > 0 && (content[end-1] == '\n' || content[end-1] == '\r') {
+		end--
+	}
+	return content[:end]
+}
+
+// formatInlineBundleMessage renders every entry as a
+// `Output: name\n```content```` block joined by blank lines, so
+// multiple files stay visually separated inside one mrkdwn message.
+func formatInlineBundleMessage(entries []inlineEntry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	var b bytes.Buffer
+	for i, e := range entries {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(":outbox_tray: Output: `")
+		b.WriteString(e.name)
+		b.WriteString("`\n```\n")
+		b.Write(e.content)
+		b.WriteString("\n```")
+	}
+	return b.String()
+}
+
+// formatFileshareComment renders the InitialComment shown above the
+// file previews in a fileshare bundle. Single-file bundles read like
+// the pre-consolidation post; multi-file bundles list every filename
+// so readers can tell what's attached without expanding each preview.
+func formatFileshareComment(entries []fileshareEntry) string {
+	if len(entries) == 1 {
+		return fmt.Sprintf(":outbox_tray: Output: `%s`", entries[0].name)
+	}
+	var b bytes.Buffer
+	fmt.Fprintf(&b, ":outbox_tray: Output (%d files):", len(entries))
+	for _, e := range entries {
+		b.WriteString("\n• `")
+		b.WriteString(e.name)
+		b.WriteString("`")
+	}
+	return b.String()
 }
 
 // isPrintableUTF8 reports whether b looks like printable text. We
