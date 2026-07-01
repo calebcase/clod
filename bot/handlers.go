@@ -3672,6 +3672,15 @@ func (h *Handler) runClod(
 	var incompleteSince time.Time
 	const maxIncompleteHold = 10 * time.Second
 
+	// Code-fence stitching state. When a flush leaves an unclosed
+	// fence (large code block streamed past maxIncompleteHold),
+	// codeFenceOpen carries over so the next flush can re-open the
+	// fence with the same language tag. Without this, splitting a
+	// long `cat pixlr_usage.csv`-style output would leave the tail
+	// message parsed as plain text.
+	var codeFenceOpen bool
+	var codeFenceLang string
+
 	// Function to flush the buffer with message consolidation.
 	// When force is false, the flush is deferred if the buffer
 	// looks like it's mid-stream of a markdown table or code
@@ -3705,7 +3714,15 @@ func (h *Handler) runClod(
 			// Slack posts.
 			newContent := strings.Trim(outputBuffer.String(), "\n\r\t")
 			if newContent != "" {
-				newContent = ConvertMarkdownToMrkdwn(newContent)
+				// Balance code fences across the flush boundary so a
+				// large fenced block that spilled past the maxIncompleteHold
+				// timeout doesn't leave its tail rendered as plain text.
+				// stitchCodeFence re-opens any fence that was carried
+				// forward from the previous flush and closes any fence
+				// still open at the tail, updating the carry-over state.
+				var stitched string
+				stitched, codeFenceOpen, codeFenceLang = stitchCodeFence(newContent, codeFenceOpen, codeFenceLang)
+				newContent = ConvertMarkdownToMrkdwn(stitched)
 
 				// Check if we can consolidate with the previous message.
 				var posted bool

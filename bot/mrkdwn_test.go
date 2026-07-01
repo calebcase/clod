@@ -236,3 +236,98 @@ func TestBufferLooksIncomplete(t *testing.T) {
 		})
 	}
 }
+
+func TestStitchCodeFence(t *testing.T) {
+	cases := []struct {
+		name        string
+		in          string
+		openAtStart bool
+		langAtStart string
+		wantOut     string
+		wantOpen    bool
+		wantLang    string
+	}{
+		{
+			name:    "empty content, no state",
+			in:      "",
+			wantOut: "",
+		},
+		{
+			name:    "balanced fence, no state",
+			in:      "```\nhello\n```",
+			wantOut: "```\nhello\n```",
+		},
+		{
+			name:     "unclosed fence, opens carryover",
+			in:       "```python\nprint(1)",
+			wantOut:  "```python\nprint(1)\n```",
+			wantOpen: true,
+			wantLang: "python",
+		},
+		{
+			name:        "re-open carried fence, closes cleanly",
+			in:          "more rows\n```",
+			openAtStart: true,
+			langAtStart: "csv",
+			wantOut:     "```csv\nmore rows\n```",
+		},
+		{
+			name:        "re-open carried fence, still unclosed",
+			in:          "row 42\nrow 43",
+			openAtStart: true,
+			langAtStart: "csv",
+			wantOut:     "```csv\nrow 42\nrow 43\n```",
+			wantOpen:    true,
+			wantLang:    "csv",
+		},
+		{
+			name:    "language survives round-trip",
+			in:      "```javascript\nfoo\n```\ntext\n```rust\nbar",
+			wantOut: "```javascript\nfoo\n```\ntext\n```rust\nbar\n```",
+			// starts closed, opens js, closes, opens rust, unclosed
+			wantOpen: true,
+			wantLang: "rust",
+		},
+		{
+			name:    "info string on same line as opener with trailing whitespace",
+			in:      "```csv   \nfoo",
+			wantOut: "```csv   \nfoo\n```",
+			// The trim inside stitchCodeFence normalizes info=csv.
+			wantOpen: true,
+			wantLang: "csv",
+		},
+		{
+			name:    "backticks not at line start are literal, not fences",
+			in:      "here is ``` inline, still text",
+			wantOut: "here is ``` inline, still text",
+		},
+		{
+			name:    "closing fence with no trailing newline still balanced",
+			in:      "```\nabc\n```",
+			wantOut: "```\nabc\n```",
+		},
+		{
+			name:     "carried fence: adds closer even if tail lacks trailing newline",
+			in:       "midblock content no newline",
+			wantOut:  "```\nmidblock content no newline\n```",
+			openAtStart: true,
+			wantOpen: true,
+			wantLang: "",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out, open, lang := stitchCodeFence(c.in, c.openAtStart, c.langAtStart)
+			if out != c.wantOut {
+				t.Errorf("stitchCodeFence out\n got:  %q\n want: %q", out, c.wantOut)
+			}
+			if open != c.wantOpen {
+				t.Errorf("stitchCodeFence open: got %v, want %v", open, c.wantOpen)
+			}
+			if lang != c.wantLang {
+				t.Errorf("stitchCodeFence lang: got %q, want %q", lang, c.wantLang)
+			}
+		})
+	}
+}
