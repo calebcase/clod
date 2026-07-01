@@ -489,6 +489,11 @@ func (b *Bot) handleInteractiveCallback(ctx context.Context, callback slack.Inte
 				Msg("processing block action")
 			b.handler.HandleBlockAction(ctx, &callback, action)
 		}
+	case slack.InteractionTypeViewSubmission:
+		b.logger.Info().
+			Str("view_callback_id", callback.View.CallbackID).
+			Msg("processing view submission")
+		b.handler.HandleViewSubmission(ctx, &callback)
 	default:
 		b.logger.Debug().
 			Str("type", string(callback.Type)).

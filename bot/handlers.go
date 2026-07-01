@@ -4711,8 +4711,8 @@ func (h *Handler) HandleBlockAction(
 	isAskQuestionSelect := action.ActionID == "askq_radio" ||
 		action.ActionID == "askq_checkbox"
 	isAskQuestionFinal := action.ActionID == "askq_submit" ||
-		action.ActionID == "askq_cancel" ||
-		action.ActionID == "askq_discuss"
+		action.ActionID == "askq_cancel"
+	isAskQuestionDiscuss := action.ActionID == "askq_discuss"
 	isInitSelect := action.ActionID == "init_image" ||
 		action.ActionID == "init_ssh" ||
 		action.ActionID == "init_model" ||
@@ -4734,7 +4734,7 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "upload_cancel"
 	isLargeUploadFinal := action.ActionID == "upload_large_proceed" ||
 		action.ActionID == "upload_large_cancel"
-	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal && !isHomeRefresh && !isUploadFinal && !isLargeUploadFinal {
+	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isAskQuestionDiscuss && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal && !isHomeRefresh && !isUploadFinal && !isLargeUploadFinal {
 		logger.Debug().Msg("ignoring non-permission action")
 		return
 	}
@@ -4778,6 +4778,11 @@ func (h *Handler) HandleBlockAction(
 
 	if isAskQuestionFinal {
 		h.handleAskQuestionFinal(callback, action, actionValue, logger)
+		return
+	}
+
+	if isAskQuestionDiscuss {
+		h.openAskQuestionDiscussModal(callback, actionValue, logger)
 		return
 	}
 
@@ -5663,7 +5668,6 @@ func (h *Handler) handleAskQuestionFinal(
 	}
 
 	isCancel := action.ActionID == "askq_cancel"
-	isDiscuss := action.ActionID == "askq_discuss"
 
 	// Build the permission response.
 	//
@@ -5688,14 +5692,10 @@ func (h *Handler) handleAskQuestionFinal(
 	// happens via the Slack message update below.
 	resp := PermissionResponse{}
 	var answerSummary string
-	switch {
-	case isCancel:
+	if isCancel {
 		resp.Behavior = "deny"
 		resp.Message = "User cancelled the question prompt."
-	case isDiscuss:
-		resp.Behavior = "deny"
-		resp.Message = "The user wants to discuss the question before answering. Don't re-invoke AskUserQuestion immediately — continue the conversation in the thread: share your reasoning behind each option, ask whatever follow-ups you need, and wait for their reply."
-	default:
+	} else {
 		resp.Behavior = "deny"
 		answerSummary = formatAskUserQuestionAnswer(state)
 		resp.Message = "AskUserQuestion is unavailable in this environment; the user answered directly:\n" + answerSummary
@@ -5729,17 +5729,206 @@ func (h *Handler) handleAskQuestionFinal(
 
 	// Update the prompt message with the outcome.
 	var updated string
-	switch {
-	case isCancel:
+	if isCancel {
 		updated = fmt.Sprintf(":x: *Question cancelled* by <@%s>", callback.User.ID)
-	case isDiscuss:
-		updated = fmt.Sprintf(":speech_balloon: *Discussion requested* by <@%s> — reply in this thread to continue.", callback.User.ID)
-	default:
+	} else {
 		updated = fmt.Sprintf(":white_check_mark: *Answer submitted* by <@%s>\n%s",
 			callback.User.ID, answerSummary)
 	}
 	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, updated); err != nil {
 		logger.Error().Err(err).Msg("failed to update askq prompt after final click")
+	}
+}
+
+// askqDiscussModalCallbackID identifies the modal view opened by the
+// Discuss button on an AskUserQuestion prompt. Used both when opening
+// the modal (view.CallbackID) and when routing the view_submission
+// event so we ignore unrelated modals.
+const askqDiscussModalCallbackID = "askq_discuss_modal"
+
+// askqDiscussModalPrivateMetadata is the JSON payload the modal
+// carries in ModalViewRequest.PrivateMetadata. Slack returns it
+// verbatim on view_submission, letting us recover the thread + the
+// original prompt message TS without a side-channel lookup.
+type askqDiscussModalPrivateMetadata struct {
+	ThreadKey        string `json:"tk"`
+	OrigChannelID    string `json:"c"`
+	OrigMessageTS    string `json:"m"`
+	OrigResponseType string `json:"r,omitempty"`
+}
+
+// openAskQuestionDiscussModal shows a text-input modal in response
+// to the Discuss button click. Instead of dispatching the deny
+// immediately (which was leaving claude to guess what the user
+// wanted to discuss), we collect the user's opening message,
+// dispatch on modal-submit, and pass their text through to claude
+// as the tool_result body so the agent responds to what was
+// actually asked instead of dumping context first.
+func (h *Handler) openAskQuestionDiscussModal(
+	callback *slack.InteractionCallback,
+	actionValue PermissionActionValue,
+	logger zerolog.Logger,
+) {
+	metaBytes, err := json.Marshal(askqDiscussModalPrivateMetadata{
+		ThreadKey:     actionValue.ThreadKey,
+		OrigChannelID: callback.Channel.ID,
+		OrigMessageTS: callback.Message.Timestamp,
+	})
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to marshal askq discuss modal metadata")
+		return
+	}
+
+	titleText := slack.NewTextBlockObject("plain_text", "Discuss the question", false, false)
+	submitText := slack.NewTextBlockObject("plain_text", "Send to Claude", false, false)
+	closeText := slack.NewTextBlockObject("plain_text", "Cancel", false, false)
+
+	promptHeader := slack.NewSectionBlock(
+		slack.NewTextBlockObject(
+			"mrkdwn",
+			"Type what you'd like to say before Claude proceeds. Your message becomes the tool result Claude reads next — so it responds directly instead of restating the options.",
+			false, false,
+		),
+		nil, nil,
+	)
+
+	input := slack.NewPlainTextInputBlockElement(
+		slack.NewTextBlockObject("plain_text", "e.g. Explain why option [1] is worse than [0] in this case, then ask me again.", false, false),
+		"askq_discuss_text",
+	)
+	input.Multiline = true
+
+	inputBlock := slack.NewInputBlock(
+		"askq_discuss_input",
+		slack.NewTextBlockObject("plain_text", "Your message", false, false),
+		nil,
+		input,
+	)
+
+	modal := slack.ModalViewRequest{
+		Type:            slack.VTModal,
+		Title:           titleText,
+		Submit:          submitText,
+		Close:           closeText,
+		Blocks:          slack.Blocks{BlockSet: []slack.Block{promptHeader, inputBlock}},
+		CallbackID:      askqDiscussModalCallbackID,
+		PrivateMetadata: string(metaBytes),
+	}
+
+	if _, err := h.bot.client.OpenView(callback.TriggerID, modal); err != nil {
+		logger.Error().Err(err).Msg("failed to open askq discuss modal")
+		return
+	}
+	logger.Info().Str("thread_key", actionValue.ThreadKey).Msg("opened askq discuss modal")
+}
+
+// HandleViewSubmission dispatches a modal-submit callback. Currently
+// only the askq_discuss_modal is wired; unknown callback_ids are
+// ignored (silently ack'd by the socketmode middleware).
+func (h *Handler) HandleViewSubmission(ctx context.Context, callback *slack.InteractionCallback) {
+	logger := h.logger.With().
+		Str("view_callback_id", callback.View.CallbackID).
+		Str("user", callback.User.ID).
+		Logger()
+	switch callback.View.CallbackID {
+	case askqDiscussModalCallbackID:
+		h.handleAskQuestionDiscussSubmit(callback, logger)
+	default:
+		logger.Debug().Msg("unhandled view submission callback_id")
+	}
+}
+
+// handleAskQuestionDiscussSubmit dispatches the discuss response
+// once the modal is submitted. Mirrors handleAskQuestionFinal's
+// dispatch semantics (deny + control-or-MCP based on the pending
+// entry / mirrored state fields), but with the user's typed message
+// baked into the tool_result body so claude has something concrete
+// to respond to.
+func (h *Handler) handleAskQuestionDiscussSubmit(
+	callback *slack.InteractionCallback,
+	logger zerolog.Logger,
+) {
+	var meta askqDiscussModalPrivateMetadata
+	if err := json.Unmarshal([]byte(callback.View.PrivateMetadata), &meta); err != nil {
+		logger.Error().Err(err).Msg("failed to parse askq discuss modal private_metadata")
+		return
+	}
+	logger = logger.With().Str("thread_key", meta.ThreadKey).Logger()
+
+	userText := ""
+	if inputVals, ok := callback.View.State.Values["askq_discuss_input"]; ok {
+		if action, ok := inputVals["askq_discuss_text"]; ok {
+			userText = strings.TrimSpace(action.Value)
+		}
+	}
+
+	stateVal, ok := h.askQuestionStates.LoadAndDelete(meta.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no AskUserQuestion state found for discuss submit; prompt is stale")
+		if err := h.bot.UpdateMessage(meta.OrigChannelID, meta.OrigMessageTS, ":warning: This question prompt is no longer active."); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale askq message after discuss submit")
+		}
+		return
+	}
+	state := stateVal.(*askUserQuestionState)
+
+	taskVal, ok := h.runningTasks.Load(meta.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no running task for askq discuss submit")
+		return
+	}
+	task := taskVal.(*RunningTask)
+
+	pendingVal, hasPending := h.pendingPermissions.LoadAndDelete(meta.ThreadKey)
+	var pending *PendingPermission
+	if hasPending {
+		pending = pendingVal.(*PendingPermission)
+	} else {
+		logger.Warn().Msg("pendingPermissions missing for askq discuss submit; dispatching from askQuestionStates")
+	}
+
+	// Build the deny message with the user's opening in-line so
+	// Claude has both the "discuss, don't re-prompt" nudge AND the
+	// user's specific opening in front of it as the tool result.
+	resp := PermissionResponse{Behavior: "deny"}
+	if userText != "" {
+		resp.Message = "The user wants to discuss the question before answering. They said:\n\n" + userText + "\n\nRespond to their message directly. Don't re-invoke AskUserQuestion immediately — continue the conversation in the thread and wait for their reply."
+	} else {
+		resp.Message = "The user wants to discuss the question before answering. Don't re-invoke AskUserQuestion immediately — continue the conversation in the thread: share your reasoning behind each option, ask whatever follow-ups you need, and wait for their reply."
+	}
+
+	isControl := state.IsControlPermission
+	ctrlReqID := state.ControlRequestID
+	if hasPending {
+		isControl = pending.IsControlPermission
+		ctrlReqID = pending.ControlRequestID
+	}
+	logger.Info().
+		Bool("is_control", isControl).
+		Str("ctrl_req_id", ctrlReqID).
+		Bool("has_pending", hasPending).
+		Int("user_text_bytes", len(userText)).
+		Int("message_bytes", len(resp.Message)).
+		Msg("dispatching askq discuss response")
+	if isControl && ctrlReqID != "" {
+		if err := task.SendControlResponse(ctrlReqID, resp.Behavior, resp.Message); err != nil {
+			logger.Error().Err(err).Msg("failed to send control response for askq discuss")
+		}
+	} else {
+		task.SendPermissionResponse(resp)
+	}
+
+	// Update the original prompt so the thread reflects who
+	// requested the discussion and what they said.
+	var updated string
+	if userText != "" {
+		updated = fmt.Sprintf(":speech_balloon: *Discussion requested* by <@%s>\n>%s",
+			callback.User.ID, strings.ReplaceAll(userText, "\n", "\n>"))
+	} else {
+		updated = fmt.Sprintf(":speech_balloon: *Discussion requested* by <@%s> — reply in this thread to continue.", callback.User.ID)
+	}
+	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, updated); err != nil {
+		logger.Error().Err(err).Msg("failed to update askq prompt after discuss submit")
 	}
 }
 
