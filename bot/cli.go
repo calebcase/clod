@@ -43,7 +43,7 @@ type Flags struct {
 
 	DefaultModel string `kong:"default='',env='CLOD_BOT_DEFAULT_MODEL',help='Default claude --model to use (e.g. opus, sonnet, claude-haiku-4-5). Empty defers to claude default.'"`
 
-	GracefulShutdownTTL time.Duration `kong:"default='30s',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
+	GracefulShutdownTTL time.Duration `kong:"default='2m',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
 
 	ResumeStaleAfter time.Duration `kong:"default='30m',env='CLOD_BOT_RESUME_STALE_AFTER',help='Active sessions older than this are treated as stale on startup (flag cleared, no auto-resume). Set to 0 to disable auto-resume entirely.'"`
 }
