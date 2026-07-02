@@ -757,14 +757,17 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 				h.afterPermissionResolved(ev.Channel, threadTS, perm.ToolName, resp.Behavior, logger)
 				return
 			}
-			// Not a clear yes/no. Instead of a plaintext reminder, post a
-			// permission-style block message that quotes the user's text and
-			// offers buttons to route the intent — approve the pending
-			// permission, deny it, or cancel it and redirect the agent with
-			// the typed text as new instructions. This matches the style of
-			// the original permission prompt and handles the common case
-			// (user wants to redirect mid-task, not respond yes/no).
-			h.postAmbiguousResponsePrompt(ev.Channel, threadTS, ev.User, ev.Text, progressKey, logger)
+			// Not a clear yes/no. Auto-Discuss: deny the pending
+			// permission with the user's text baked into the
+			// tool_result so claude reads it as the tool response
+			// and answers directly. Replaces the older 3-button
+			// ambiguous-response prompt (Allow / Deny / Cancel &
+			// redirect), which routinely stranded the user's
+			// message when they forgot to click — observed in
+			// eerie-eagle 2026-07-02: a user request to revive
+			// hyper.md sat unrouted for hours because it hit the
+			// ambiguous prompt.
+			h.autoDiscussPendingPermission(ev.Channel, threadTS, ev.User, ev.Text, progressKey, perm, task, logger)
 			return
 		}
 
@@ -4572,10 +4575,81 @@ func (h *Handler) tryPostAskUserQuestionPrompt(
 	return msgTS
 }
 
+// autoDiscussPendingPermission denies the pending permission and
+// forwards the user's typed text to claude in the deny message, so
+// claude reads their reply as the tool_result and responds directly.
+// This replaces the older ambiguous-response prompt for the "user
+// typed something instead of clicking allow/deny" case — that UI
+// routinely stranded messages when users forgot to click a button.
+//
+// The instruction to claude is deliberately blunt: read the user's
+// message and reply to it, don't dump reasoning or re-invoke the
+// tool. In practice claude interpreted the shorter Discuss deny as
+// "explain everything you were considering" and buried the user's
+// point; the new phrasing pushes it to respond directly.
+//
+// If the pending permission was an AskUserQuestion the associated
+// state entry is also cleared and the prompt message updated so
+// the thread reflects that the question was deferred into
+// discussion. For a generic permission we update its prompt
+// message the same way.
+func (h *Handler) autoDiscussPendingPermission(
+	channelID, threadTS, userID, userText, progressKey string,
+	perm *PendingPermission,
+	task *RunningTask,
+	logger zerolog.Logger,
+) {
+	discussMsg := "The user replied with a message instead of choosing an option or answering yes/no. Read their message and respond to it directly in the thread. Do not dump reasoning or a summary — answer the specific thing they said. Do not re-invoke the tool immediately; wait for their next reply.\n\nThey said:\n\n" + userText
+
+	resp := PermissionResponse{Behavior: "deny", Message: discussMsg}
+
+	logger.Info().
+		Bool("is_control", perm.IsControlPermission).
+		Str("tool_name", perm.ToolName).
+		Int("text_bytes", len(userText)).
+		Msg("auto-discuss: denying pending permission with user's message")
+
+	if perm.IsControlPermission && perm.ControlRequestID != "" {
+		if err := task.SendControlResponse(perm.ControlRequestID, resp.Behavior, resp.Message); err != nil {
+			logger.Error().Err(err).Msg("auto-discuss: failed to send control response")
+		}
+	} else {
+		task.SendPermissionResponse(resp)
+	}
+	h.pendingPermissions.Delete(progressKey)
+
+	// If the pending was an AskUserQuestion, clear its state and
+	// use its own prompt-message TS for the update (that's the
+	// message the user was staring at when they typed).
+	updateChannelID := perm.ChannelID
+	updateMessageTS := perm.MessageTS
+	if stateVal, ok := h.askQuestionStates.LoadAndDelete(progressKey); ok {
+		state := stateVal.(*askUserQuestionState)
+		if state.ChannelID != "" && state.MessageTS != "" {
+			updateChannelID = state.ChannelID
+			updateMessageTS = state.MessageTS
+		}
+	}
+
+	if updateChannelID != "" && updateMessageTS != "" {
+		updated := fmt.Sprintf(":speech_balloon: *Discussion requested* by <@%s>\n>%s",
+			userID, strings.ReplaceAll(userText, "\n", "\n>"))
+		if err := h.bot.UpdateMessage(updateChannelID, updateMessageTS, updated); err != nil {
+			logger.Debug().Err(err).Msg("auto-discuss: failed to update prompt message")
+		}
+	}
+
+	h.afterPermissionResolved(channelID, threadTS, perm.ToolName, "deny", logger)
+}
+
 // postAmbiguousResponsePrompt posts a permission-style block message when the
 // user types something during a pending permission that doesn't parse as
 // yes/no. Offers three buttons: treat as allow, treat as deny, or cancel the
 // pending permission and redirect the agent with the typed text as new input.
+//
+// Deprecated as of 2026-07-02: the primary path is now
+// autoDiscussPendingPermission. Retained for potential future
+// re-use / reference.
 func (h *Handler) postAmbiguousResponsePrompt(
 	channelID, threadTS, userID, userText, progressKey string,
 	logger zerolog.Logger,
