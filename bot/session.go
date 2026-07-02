@@ -24,8 +24,8 @@ type SessionMapping struct {
 	VerbosityLevel int       `json:"verbosity_level"` // Per-thread verbosity: -1 (silent), 0 (summary), 1 (full)
 	// Model is the Claude model to use for this thread. Empty means "bot
 	// default" (whatever the bot was configured with via the CLI flag).
-	// Valid values: "opus", "sonnet", "claude-haiku-4-5" (and any other
-	// string claude --model accepts).
+	// Valid values: "claude-fable-5", "opus", "sonnet", "claude-haiku-4-5"
+	// (and any other string claude --model accepts).
 	Model string `json:"model,omitempty"`
 	// ReactionAnchorTS is the Slack TS of the user's @-mention that kicked
 	// off this task. It's the anchor the bot uses for the model-indicator

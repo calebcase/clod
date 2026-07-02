@@ -14,7 +14,7 @@ import (
 )
 
 // Version is the bot version. Update this when releasing.
-const Version = "0.34.4"
+const Version = "0.35.0"
 
 type Flags struct {
 	Log struct {
@@ -43,7 +43,7 @@ type Flags struct {
 
 	VerbosityLevel int `kong:"default='0',env='CLOD_BOT_VERBOSITY_LEVEL',help='Default verbosity level: -1 (silent), 0 (summary), 1 (full)'"`
 
-	DefaultModel string `kong:"default='',env='CLOD_BOT_DEFAULT_MODEL',help='Default claude --model to use (e.g. opus, sonnet, claude-haiku-4-5). Empty defers to claude default.'"`
+	DefaultModel string `kong:"default='',env='CLOD_BOT_DEFAULT_MODEL',help='Default claude --model to use (e.g. fable, opus, sonnet, claude-fable-5, claude-opus-4-8, claude-haiku-4-5). Empty defers to claude default.'"`
 
 	GracefulShutdownTTL time.Duration `kong:"default='2m',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
 

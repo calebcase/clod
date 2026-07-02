@@ -404,13 +404,13 @@ func buildHomeHelpBlocks() []slack.Block {
 		"• `@bot :: <instructions>` — start a session in a fresh auto-named domain; pick a template or Custom setup in the two-step init dialog\n" +
 		"• `@bot *: <instructions>` — start a session in the workspace root itself (no per-domain subdirectory). Filesync and plan mode default off.\n" +
 		"• `@bot !: <instructions>` — start a host-direct session — runs claude directly on the host (no docker sandbox; confirmation required)\n" +
-		"• Any of the above can be prefixed with a model name to pick a specific model up front: `@bot opus services: …`, `@bot sonnet[1m] :: …`, `@bot claude-haiku-4-5 *: …` etc. Same models `@bot set model=` accepts (`opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`, `claude-(opus|sonnet|haiku)-X.Y…`, plus optional `[1m]` suffix for 1M-context variants)."
+		"• Any of the above can be prefixed with a model name to pick a specific model up front: `@bot opus services: …`, `@bot sonnet[1m] :: …`, `@bot claude-fable-5 *: …`, `@bot claude-opus-4-8 :: …`, `@bot claude-haiku-4-5 *: …` etc. Same models `@bot set model=` accepts (`fable`, `opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`, `claude-(fable|opus|sonnet|haiku)-X.Y…`, plus optional `[1m]` suffix for 1M-context variants on opus/sonnet)."
 
 	perThread := "*Per-session commands* (any active thread)\n" +
 		"• `@bot close` — stop the agent and close the session. Auto-resume on bot restart is disabled until you @-mention again.\n" +
 		"• `@bot upload <path>` — upload a host-filesystem file (or directory, with a recursive-vs-top-level prompt) into this thread. >5 files get zipped to /tmp first.\n" +
 		"• `@bot allow @user` / `@bot disallow @user` — manage who else can drive this session\n" +
-		"• `@bot set model=opus|sonnet|haiku|best|default|opusplan` — switch model family. `+` / `-` to cycle, or send 🎼 / 📜 / 🌸. Specific releases also work: `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, etc., plus 1M-context variants `opus[1m]` / `sonnet[1m]`. While the agent is running, the bot cancels and resumes with the new model.\n" +
+		"• `@bot set model=fable|opus|sonnet|haiku|best|default|opusplan` — switch model family. `+` / `-` to cycle (fable is excluded from the cycle — top-tier pricing; opt in explicitly). Or send 📖 / 🎼 / 📜 / 🌸. Specific releases also work: `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5`, etc., plus 1M-context variants `opus[1m]` / `sonnet[1m]`. While the agent is running, the bot cancels and resumes with the new model.\n" +
 		"• `@bot set effort=low|medium|high|xhigh|max` — set how long claude thinks per turn. `+` / `-` to step. `clear` removes the override (model default applies). While the agent is running, the bot cancels and resumes with the new effort.\n" +
 		"• `@bot set verbosity=0|1|-1` — silent / summary / full. Or 🙈 / 💬\n" +
 		"• `@bot set plan=on|off` — toggle plan mode. Or `+` / `-` / 💭\n" +
