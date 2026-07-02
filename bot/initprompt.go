@@ -52,7 +52,9 @@ type initModelOption struct {
 }
 
 var initModelOptions = []initModelOption{
-	{"opus", "🎼 Opus (most capable)", "Best for complex reasoning and hard problems. Slower and more expensive."},
+	{"claude-fable-5", "📖 Fable 5 (top tier)", "Anthropic's most capable model. Reserve for the hardest reasoning and long-horizon agent work; pricing exceeds Opus tier."},
+	{"claude-opus-4-8", "🎼 Opus 4.8 (latest Opus)", "Current top Opus. Highly autonomous; strong on long-horizon coding and agentic work."},
+	{"opus", "🎼 Opus (latest alias)", "Tracks whatever claude treats as 'opus' today. Use this to auto-upgrade as new Opus releases ship."},
 	{"sonnet", "📜 Sonnet (balanced, recommended)", "Good default for most tasks. Faster and cheaper than Opus."},
 	{"claude-haiku-4-5", "🌸 Haiku (fast and cheap)", "Best for quick, simple tasks. Fastest and cheapest."},
 }

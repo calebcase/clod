@@ -32,7 +32,7 @@ const startMsgTemplate = ":rocket: Starting work in the `%s` domain...\n\n" +
 	"field      | values                             | notes\n" +
 	"-----------+------------------------------------+--------------------------------\n" +
 	"verbosity  | +/- or 0/1/-1 (or 💬 / 🙈)         | 🙈 silent · summary · 💬 full\n" +
-	"model      | opus|sonnet|haiku (+/- cycles)     | 🎼 · 📜 · 🌸 · point releases ok\n" +
+	"model      | fable|opus|sonnet|haiku (+/- cycles)| 📖 · 🎼 · 📜 · 🌸 · point releases ok\n" +
 	"effort     | low|medium|high|xhigh|max (+/-)    | clear → model default\n" +
 	"plan       | on|off (or +/-)                    | 💭 on by default\n" +
 	"filesync   | on|off                             | sync project dir (non-recursive)\n" +
@@ -246,6 +246,7 @@ const (
 	// Model-indicator emojis. Bot adds its own reaction to the task's
 	// status message to show which model is active; a user reacting with a
 	// different model emoji switches the active model for the thread.
+	fableEmoji  = "book"           // 📖 Fable
 	opusEmoji   = "musical_score"  // 🎼 Opus
 	sonnetEmoji = "scroll"         // 📜 Sonnet
 	haikuEmoji  = "cherry_blossom" // 🌸 Haiku
@@ -270,13 +271,15 @@ const (
 // modelEmojis maps model strings (as accepted by `claude --model`) to the
 // Slack emoji used for their reaction indicator.
 var modelEmojis = map[string]string{
-	"opus":               opusEmoji,
-	"sonnet":             sonnetEmoji,
-	"claude-haiku-4-5":   haikuEmoji,
+	"claude-fable-5":   fableEmoji,
+	"opus":             opusEmoji,
+	"sonnet":           sonnetEmoji,
+	"claude-haiku-4-5": haikuEmoji,
 }
 
 // emojiToModel is the reverse mapping of modelEmojis for reaction handling.
 var emojiToModel = map[string]string{
+	fableEmoji:  "claude-fable-5",
 	opusEmoji:   "opus",
 	sonnetEmoji: "sonnet",
 	haikuEmoji:  "claude-haiku-4-5",
@@ -293,9 +296,12 @@ func emojiForModel(model string) string {
 	// claude-NAME-X-Y forms to their family. Covers what claude-
 	// code writes into `.clod/claude/settings.json` when you run
 	// `/model` in a session: `opus[1m]`, `sonnet[1m]`,
-	// `claude-opus-4-7`, `claude-haiku-4-5`, etc.
+	// `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`,
+	// `claude-haiku-4-5`, etc.
 	lower := strings.ToLower(model)
 	switch {
+	case strings.Contains(lower, "fable"):
+		return fableEmoji
 	case strings.Contains(lower, "opus"):
 		return opusEmoji
 	case strings.Contains(lower, "sonnet"):
@@ -1635,6 +1641,8 @@ func (h *Handler) applyModelSet(channelID, threadTS string, session *SessionMapp
 		newModel = cycleModel(cycle, current, 1)
 	case "-":
 		newModel = cycleModel(cycle, current, -1)
+	case "fable", "claude-fable-5", fableEmoji:
+		newModel = "claude-fable-5"
 	case "opus", opusEmoji:
 		newModel = "opus"
 	case "sonnet", sonnetEmoji:
@@ -1673,7 +1681,7 @@ func (h *Handler) applyModelSet(channelID, threadTS string, session *SessionMapp
 	// the new one. Idempotent RemoveReaction on emojis we didn't add.
 	newEmoji := emojiForModel(newModel)
 	if session.ReactionAnchorTS != "" {
-		for _, e := range []string{opusEmoji, sonnetEmoji, haikuEmoji} {
+		for _, e := range []string{fableEmoji, opusEmoji, sonnetEmoji, haikuEmoji} {
 			if e == newEmoji {
 				continue
 			}
@@ -2076,7 +2084,7 @@ func (h *Handler) handleModelReaction(ctx context.Context, ev *slackevents.React
 	// is harmless and it guarantees a stale indicator doesn't survive.
 	newEmoji := emojiForModel(newModel)
 	if session.ReactionAnchorTS != "" {
-		for _, e := range []string{opusEmoji, sonnetEmoji, haikuEmoji} {
+		for _, e := range []string{fableEmoji, opusEmoji, sonnetEmoji, haikuEmoji} {
 			if e == newEmoji {
 				continue
 			}

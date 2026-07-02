@@ -32,9 +32,9 @@ func ParseMention(text string) *ParsedMention {
 }
 
 // modelPrefixPattern matches `<@BOT> <model> <rest>` where `<model>` is
-// a recognised family name (`opus`, `sonnet`, `haiku`, plus the
-// `best`/`default`/`opusplan` aliases) or a specific point release
-// (`claude-(opus|sonnet|haiku)-X.Y...`), with an optional `[1m]`
+// a recognised family name (`fable`, `opus`, `sonnet`, `haiku`, plus
+// the `best`/`default`/`opusplan` aliases) or a specific point release
+// (`claude-(fable|opus|sonnet|haiku)-X.Y...`), with an optional `[1m]`
 // 1M-context suffix. The pattern is constrained on purpose: a free-
 // form first-word match would silently swallow ordinary user prose
 // that happened to start with a real word.
@@ -44,7 +44,7 @@ func ParseMention(text string) *ParsedMention {
 // Group 2: model token (with optional `[1m]`).
 // Group 3: rest of the message.
 var modelPrefixPattern = regexp.MustCompile(
-	`(?i)^(<@[A-Z0-9]+>)\s+((?:opus|sonnet|haiku|best|default|opusplan|claude-(?:opus|sonnet|haiku)-[\w.-]+)(?:\[1m\])?)\s+(.+)$`,
+	`(?i)^(<@[A-Z0-9]+>)\s+((?:fable|opus|sonnet|haiku|best|default|opusplan|claude-(?:fable|opus|sonnet|haiku)-[\w.-]+)(?:\[1m\])?)\s+(.+)$`,
 )
 
 // ParseModelPrefix peeks at the first whitespace-delimited word after

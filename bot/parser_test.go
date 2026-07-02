@@ -53,6 +53,24 @@ func TestParseModelPrefix(t *testing.T) {
 			"claude-opus-4-7",
 		},
 		{
+			"fable family name",
+			"<@U123> fable services: thing",
+			"<@U123> services: thing",
+			"fable",
+		},
+		{
+			"fable point release",
+			"<@U123> claude-fable-5 services: thing",
+			"<@U123> services: thing",
+			"claude-fable-5",
+		},
+		{
+			"opus 4.8 point release",
+			"<@U123> claude-opus-4-8 services: thing",
+			"<@U123> services: thing",
+			"claude-opus-4-8",
+		},
+		{
 			"1m suffix on family name",
 			"<@U123> opus[1m] services: thing",
 			"<@U123> services: thing",
