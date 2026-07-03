@@ -495,6 +495,25 @@ func (t *RunningTask) PermissionRequests() <-chan PermissionRequest {
 	return t.permissionFIFO.Requests()
 }
 
+// RuntimeDir returns the absolute path to this task's runtime dir
+// (where FIFOs, sockets, and embedded bridge binaries live). Used by
+// the handler to start / stop the scheduling MCP socket alongside
+// the task lifecycle.
+func (t *RunningTask) RuntimeDir() string {
+	if t.permissionFIFO == nil {
+		return ""
+	}
+	return t.permissionFIFO.RuntimeDir()
+}
+
+// TaskPath returns the domain dir the task is running inside. Same
+// value handlers.go passed to Runner.Start; re-exposed here so
+// scheduling.StartSocket doesn't have to be threaded a duplicate
+// parameter.
+func (t *RunningTask) TaskPath() string {
+	return t.taskPath
+}
+
 // SendPermissionResponse sends a response to a permission request.
 func (t *RunningTask) SendPermissionResponse(resp PermissionResponse) {
 	if t.permissionFIFO == nil {
