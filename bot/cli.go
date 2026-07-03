@@ -14,7 +14,7 @@ import (
 )
 
 // Version is the bot version. Update this when releasing.
-const Version = "0.35.0"
+const Version = "0.36.0"
 
 type Flags struct {
 	Log struct {
@@ -82,6 +82,20 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		Str("path", cli.SessionStorePath).
 		Msg("loaded sessions from storage")
 
+	// SchedulingRegistry backs the cron_* / bg_* MCP shim served by
+	// bot/schedbridge in each session container. Storage lives next to
+	// sessions.json under a `crons.json` sibling (see mcp-shim.md §4.3).
+	// Ticker starts inside NewSchedulingRegistry's Start so persisted
+	// crons resume at boot.
+	scheduling, err := NewSchedulingRegistry(deriveCronsPath(cli.SessionStorePath), logger)
+	if err != nil {
+		return err
+	}
+	scheduling.Start()
+	logger.Info().
+		Str("path", deriveCronsPath(cli.SessionStorePath)).
+		Msg("scheduling registry loaded")
+
 	// Resolve the workspace README path relative to the workspace
 	// dir when it isn't already absolute, so the default
 	// `README.md` lands at `<WorkspacePath>/README.md`.
@@ -98,6 +112,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		auth,
 		domains,
 		sessions,
+		scheduling,
 		runner,
 		cli.VerboseTools,
 		cli.VerbosityLevel,
@@ -200,9 +215,24 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		}
 	}
 
+	// Stop the scheduling engine so no more ticks fire mid-shutdown.
+	// Note: this does NOT cancel per-session sockets; those are
+	// tied to runClod lifecycle and torn down when the containers exit.
+	// It only stops the cron engine goroutine itself.
+	scheduling.Stop()
+
 	// Save sessions before exit
 	if saveErr := sessions.Save(); saveErr != nil {
 		logger.Error().Err(saveErr).Msg("failed to save sessions")
+		if err == nil {
+			err = saveErr
+		}
+	}
+	// Save scheduling registry too. UpdateFireResult saves per-tick
+	// already, so this is a belt-and-suspenders capture of any
+	// last-second Add/Delete that didn't survive to disk yet.
+	if saveErr := scheduling.Save(); saveErr != nil {
+		logger.Error().Err(saveErr).Msg("failed to save scheduling registry")
 		if err == nil {
 			err = saveErr
 		}

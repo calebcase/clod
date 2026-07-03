@@ -28,6 +28,16 @@ import (
 //go:embed permbridge/permbridge.linux-amd64
 var permBridgeBinary []byte
 
+// schedBridgeBinary is the scheduling MCP shim companion to permbridge.
+// It advertises cron_create / cron_list / cron_delete (and later bg_*
+// tools) and forwards each call over a Unix socket to the bot process.
+// Same static-linux/amd64 build as permbridge — no base image
+// dependencies. Rebuild via bot/schedbridge/build.sh. See mcp-shim.md
+// for the shim design; scheduling.go / schedsocket.go for the bot half.
+//
+//go:embed schedbridge/schedbridge.linux-amd64
+var schedBridgeBinary []byte
+
 const (
 	// FIFORequestName is the name of the FIFO for permission requests (hook writes, bot reads)
 	FIFORequestName = "permission_request.fifo"
@@ -37,6 +47,14 @@ const (
 	// inside the runtime directory. The container sees it at the same path
 	// (the runtime dir is bind-mounted in with its host path).
 	MCPBridgeName = "permbridge"
+	// SchedBridgeName is the filename for the scheduling-shim companion
+	// binary. Written next to permbridge in the runtime dir and pointed
+	// at from the same mcp_config.json.
+	SchedBridgeName = "schedbridge"
+	// SchedSocketName is the Unix socket the bot listens on and
+	// schedbridge dials into. Lives inside the runtime dir so both
+	// sides of the bind-mount see the same path.
+	SchedSocketName = "schedbridge.sock"
 	// MCPConfigName is the name of the MCP config file
 	MCPConfigName = "mcp_config.json"
 )
@@ -195,6 +213,19 @@ func NewPermissionFIFO(domainPath string, runtimeSuffix string, domainReadmePath
 		return nil, oops.New("embedded permbridge binary is empty; rebuild via bot/permbridge/build.sh")
 	}
 	if err := os.WriteFile(mcpPath, permBridgeBinary, 0o755); err != nil {
+		return nil, oops.Trace(err)
+	}
+
+	// Drop schedbridge next to permbridge. Same rationale: static
+	// binary + bind-mounted runtime dir means the container can exec
+	// it with no interpreter dependency. If we ever move to a
+	// multi-arch build (arm64 macs etc.) both binaries will need
+	// per-arch embeds picked at build time.
+	schedPath := filepath.Join(runtimeDir, SchedBridgeName)
+	if len(schedBridgeBinary) == 0 {
+		return nil, oops.New("embedded schedbridge binary is empty; rebuild via bot/schedbridge/build.sh")
+	}
+	if err := os.WriteFile(schedPath, schedBridgeBinary, 0o755); err != nil {
 		return nil, oops.Trace(err)
 	}
 
@@ -510,6 +541,26 @@ func (p *PermissionFIFO) ContextPath() string {
 	return p.contextPath
 }
 
+// RuntimeDir returns the absolute path to the per-task runtime dir
+// where all FIFOs, sockets, and embedded bridge binaries live.
+func (p *PermissionFIFO) RuntimeDir() string {
+	return filepath.Dir(p.requestPath)
+}
+
+// SchedBridgePath returns the path to the scheduling MCP shim binary
+// inside the runtime dir. Written to disk by NewPermissionFIFO;
+// referenced by CreateMCPConfig's mcpServers entry.
+func (p *PermissionFIFO) SchedBridgePath() string {
+	return filepath.Join(filepath.Dir(p.requestPath), SchedBridgeName)
+}
+
+// SchedSocketPath returns the path to the Unix socket that the bot
+// listens on for schedbridge connections. schedbridge dials this path
+// after reading CLOD_RUNTIME_DIR from its environment.
+func (p *PermissionFIFO) SchedSocketPath() string {
+	return filepath.Join(filepath.Dir(p.requestPath), SchedSocketName)
+}
+
 // MCPScriptPath returns the path to the in-container permission bridge
 // executable. (Name kept for historical reasons; the bridge is now a Go
 // binary written by NewPermissionFIFO.)
@@ -532,11 +583,27 @@ func (p *PermissionFIFO) CreateMCPConfig() (configPath string, toolName string, 
 	// Running the binary as `command` (no interpreter) is the whole
 	// point of replacing the Python version: no host/container package
 	// dependency, works on any linux base image that can exec an ELF.
+	// Two MCP servers registered:
+	//   "permission" — the existing FIFO-backed permission prompt shim
+	//   "scheduling" — the socket-backed cron/bg shim (see mcp-shim.md)
+	// Both exec their binaries directly; no interpreter needed in the base image.
 	config := map[string]interface{}{
 		"mcpServers": map[string]interface{}{
 			"permission": map[string]interface{}{
 				"command": mcpScript,
 				"args":    []string{},
+			},
+			"scheduling": map[string]interface{}{
+				"command": p.SchedBridgePath(),
+				"args":    []string{},
+				// schedbridge reads CLOD_RUNTIME_DIR to find the socket.
+				// Same env var permbridge uses for its FIFOs, set by
+				// runner.go on `claude` invocation, but we duplicate
+				// here so a stand-alone spawn (e.g. an out-of-band test)
+				// works without the runner wrapping it.
+				"env": map[string]string{
+					"CLOD_RUNTIME_DIR": filepath.Dir(p.requestPath),
+				},
 			},
 		},
 	}

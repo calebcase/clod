@@ -45,6 +45,7 @@ type Bot struct {
 	auth          *Authorizer
 	domains       *DomainRegistry
 	sessions      *SessionStore
+	scheduling    *SchedulingRegistry
 	runner        *Runner
 	files         *FileHandler
 	logger        zerolog.Logger
@@ -81,6 +82,7 @@ func NewBot(
 	auth *Authorizer,
 	domains *DomainRegistry,
 	sessions *SessionStore,
+	scheduling *SchedulingRegistry,
 	runner *Runner,
 	verboseTools []string,
 	verbosityLevel int,
@@ -109,6 +111,7 @@ func NewBot(
 		auth:                auth,
 		domains:             domains,
 		sessions:            sessions,
+		scheduling:          scheduling,
 		runner:              runner,
 		files:               NewFileHandler(client, logger),
 		logger:              logger.With().Str("component", "bot").Logger(),

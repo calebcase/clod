@@ -1453,6 +1453,19 @@ func (h *Handler) handleCloseCommand(
 		logger.Debug().Err(err).Msg("save after close-clear-active")
 	}
 
+	// Cancel all scheduled crons for this session. Per mcp-shim.md §4.8:
+	// closing a thread cancels its schedules. The runClod defer will
+	// stop the socket; DeleteSession removes the persisted state and
+	// stops the tickers, matching that lifecycle.
+	if h.bot.scheduling != nil {
+		if removed := h.bot.scheduling.DeleteSession(key(ev.Channel, threadTS)); len(removed) > 0 {
+			logger.Info().Strs("cron_ids", removed).Msg("cancelled crons on session close")
+			if err := h.bot.scheduling.Save(); err != nil {
+				logger.Warn().Err(err).Msg("failed to persist crons after session close")
+			}
+		}
+	}
+
 	progressKey := key(ev.Channel, threadTS)
 	var wasRunning bool
 	if taskVal, ok := h.runningTasks.Load(progressKey); ok {
@@ -3652,6 +3665,23 @@ func (h *Handler) runClod(
 	h.runningTasks.Store(progressKey, task)
 	defer h.runningTasks.Delete(progressKey)
 	defer h.pendingPermissions.Delete(progressKey) // Clean up any pending permission state
+
+	// Spin up the scheduling MCP socket alongside the task. The socket
+	// lives in the same runtime dir as the FIFOs/binaries; schedbridge
+	// inside the container dials it via CLOD_RUNTIME_DIR (set below in
+	// the docker invocation). Torn down after Stdout drains so any
+	// last-second cron_delete from the agent still lands.
+	var schedSocket *SchedSocket
+	if h.bot.scheduling != nil && task.RuntimeDir() != "" {
+		var socketErr error
+		schedSocket, socketErr = h.bot.scheduling.StartSocket(progressKey, task.RuntimeDir(), task.TaskPath())
+		if socketErr != nil {
+			logger.Warn().Err(socketErr).Msg("failed to start scheduling socket; cron_* tools will be unavailable this run")
+		} else {
+			defer schedSocket.Stop()
+		}
+	}
+	_ = schedSocket // referenced only for defer; suppress unused-write in future edits
 
 	// Start watching for output files to upload to Slack.
 	outputWatchDone := make(chan struct{})
