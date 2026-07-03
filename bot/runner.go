@@ -611,6 +611,13 @@ func (t *RunningTask) Shutdown(ctx context.Context, saveStateMsg string, gracePe
 	select {
 	case <-t.done:
 		log.Info().Msg("task exited gracefully within grace period")
+		// Belt-and-suspenders: `docker run --rm` should already have
+		// removed the container when its main process exited, but
+		// don't take that on faith. A redundant stop is cheap
+		// (no-op on an already-cleaned container) and closes the
+		// "session closed but container still running" hole for
+		// daemon-delay / --rm-failure edge cases. See stopContainer.
+		t.stopContainer("graceful path")
 		return true
 	case <-timer.C:
 		log.Warn().Msg("grace period expired; forcing")
@@ -664,27 +671,47 @@ func (t *RunningTask) forceKill() {
 		t.cancel()
 	}
 
-	// Stop the container directly. Tolerate every failure mode:
-	// claude-direct mode (no suffix), container already gone,
-	// docker daemon unreachable.
+	// Stop the container directly. Delegates to stopContainer so the
+	// graceful path can call the same logic — see stopContainer's doc
+	// for why we don't rely on `docker run --rm` autocleanup alone.
+	t.stopContainer("force path")
+}
+
+// stopContainer explicitly `docker stop`s the session's container by
+// runtime-suffix filter. Called from both Shutdown branches:
+//
+//   - Graceful path: `docker run --rm` should have already removed
+//     the container when its main process exited, but daemon delays,
+//     stuck processes, or `--rm` failures leave orphans; a redundant
+//     `docker stop` here is cheap (no-op when the container is
+//     already gone) and closes the "session closed but container
+//     still up" hole.
+//   - Force path: after SIGKILL'ing the process group the docker
+//     client may have died before it could tell the daemon anything,
+//     so the daemon still owns the container. Explicit stop by name
+//     brings it down.
+//
+// Tolerates every failure mode: claude-direct mode (no suffix),
+// container already gone, docker daemon unreachable. `pathLabel`
+// tags log entries so it's clear which branch triggered the call.
+func (t *RunningTask) stopContainer(pathLabel string) {
 	if t.runtimeSuffix == "" {
 		return
 	}
-	// Filter by container name suffix. The bash wrapper builds
-	// names as `clod-<task>-<id>-<suffix>`, so `name=<suffix>$`
-	// (an exact-tail match via regex anchor) hits exactly our
-	// container. Use a short timeout on docker ps so a hung
+	// Filter by container name suffix. The bash wrapper builds names
+	// as `clod-<task>-<id>-<suffix>`, so `name=<suffix>$` (regex tail
+	// anchor) hits exactly our container. Short timeout so a hung
 	// daemon doesn't stall shutdown.
 	psCtx, psCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer psCancel()
 	psOut, err := exec.CommandContext(psCtx, "docker", "ps", "-q", "--filter", "name="+t.runtimeSuffix+"$").Output()
 	if err != nil {
-		t.logger.Debug().Err(err).Str("suffix", t.runtimeSuffix).Msg("docker ps lookup failed; skipping explicit container stop")
+		t.logger.Debug().Err(err).Str("suffix", t.runtimeSuffix).Str("path", pathLabel).Msg("docker ps lookup failed; skipping explicit container stop")
 		return
 	}
 	cids := strings.Fields(string(psOut))
 	if len(cids) == 0 {
-		t.logger.Debug().Str("suffix", t.runtimeSuffix).Msg("no running container matched runtime suffix")
+		t.logger.Debug().Str("suffix", t.runtimeSuffix).Str("path", pathLabel).Msg("no running container matched runtime suffix")
 		return
 	}
 	for _, cid := range cids {
@@ -692,9 +719,9 @@ func (t *RunningTask) forceKill() {
 		err := exec.CommandContext(stopCtx, "docker", "stop", "-t", "5", cid).Run()
 		stopCancel()
 		if err != nil {
-			t.logger.Warn().Err(err).Str("cid", cid).Msg("docker stop failed (force path)")
+			t.logger.Warn().Err(err).Str("cid", cid).Str("path", pathLabel).Msg("docker stop failed")
 		} else {
-			t.logger.Info().Str("cid", cid).Msg("docker stop ok (force path)")
+			t.logger.Info().Str("cid", cid).Str("path", pathLabel).Msg("docker stop ok")
 		}
 	}
 }
