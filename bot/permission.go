@@ -305,7 +305,7 @@ func (p *PermissionFIFO) readRequests(ctx context.Context) {
 				Str("tool_name", req.ToolName).
 				Str("tool_use_id", req.ToolUseID).
 				Int("buffered", len(p.requests)).
-				Msg("received permission request")
+				Msg("permission request read from FIFO; handing to consumer")
 
 			// Watchdog: if the channel send blocks (consumer wedged or
 			// missing) we want LOUD evidence rather than a silent stall.
@@ -332,6 +332,17 @@ func (p *PermissionFIFO) readRequests(ctx context.Context) {
 			select {
 			case p.requests <- req:
 				close(watchdogDone)
+				// Post-send log so we can distinguish "reader saw it"
+				// from "consumer received it" during wedge debugging.
+				// Without this, eagle-style wedges show only the
+				// pre-send "received" line and the missing next-step
+				// log has to be reverse-engineered from goroutine
+				// dumps. See the 07-05 wedge analysis for why.
+				p.logger.Info().
+					Str("tool_name", req.ToolName).
+					Str("tool_use_id", req.ToolUseID).
+					Dur("send_wait", time.Since(sendStart)).
+					Msg("permission request delivered to consumer")
 			case <-ctx.Done():
 				close(watchdogDone)
 				_ = file.Close()
@@ -503,9 +514,32 @@ func (p *PermissionFIFO) SendResponse(resp PermissionResponse) {
 }
 
 // Close cleans up the FIFO.
+//
+// Unblocking the reader: readRequests spends most of its time blocked
+// in `os.OpenFile(requestPath, O_RDONLY, 0)` — an OS-level open that
+// hangs until a writer connects. Context cancellation cannot interrupt
+// that syscall, so p.cancel() alone is not enough to make the reader
+// exit. To force it out we briefly open the same FIFO for write
+// ourselves; the kernel completes the pending open on both sides, the
+// reader loop's next iteration observes ctx.Done and returns. Without
+// this, each closed PermissionFIFO leaks its reader goroutine — the
+// eagle 07-05 wedge dump showed a reader parked in openat for 20+
+// hours, precisely this leak pattern.
+//
+// O_NONBLOCK|O_WRONLY has an important subtlety on FIFOs: it succeeds
+// only if a reader is already blocked in openat. If no reader is
+// waiting (already unblocked, or never started), open returns ENXIO
+// which we swallow — nothing to unblock. Either outcome is fine.
 func (p *PermissionFIFO) Close() {
 	if p.cancel != nil {
 		p.cancel()
+	}
+
+	// Poke the request-FIFO reader out of any pending openat.
+	if p.requestPath != "" {
+		if fd, err := syscall.Open(p.requestPath, syscall.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			_ = syscall.Close(fd)
+		}
 	}
 
 	// Remove the FIFOs
