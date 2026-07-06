@@ -32,6 +32,16 @@ type SessionMapping struct {
 	// reaction so the indicator sits on the message that started the thread
 	// (not on the bot's own "Starting..." status post).
 	ReactionAnchorTS string `json:"reaction_anchor_ts,omitempty"`
+	// LatestPostTS mirrors the in-memory sync.Map that Bot.recordPost
+	// maintains so the Home tab's `[latest →]` link survives a bot
+	// restart. The in-memory map is empty on startup; without this
+	// persisted copy, every idle/closed session loses its jump link
+	// permanently because it will never post again to repopulate the
+	// map. Written on every bot-originated post but not Save()d on
+	// each — Save happens on the next natural cadence (turn, heartbeat,
+	// state change), which is fine since the map is authoritative for
+	// hot reads and this field is only consulted as a warm cache.
+	LatestPostTS string `json:"latest_post_ts,omitempty"`
 	// Active is true whenever runClod is executing against this session.
 	// Cleared only on *clean* completion; an unclean exit (shutdown, crash,
 	// timeout) leaves it set so the bot can resume on next startup. The
@@ -452,6 +462,43 @@ func (s *SessionStore) Touch(channelID, threadTS string) {
 	if session := s.sessions[k]; session != nil {
 		session.UpdatedAt = time.Now()
 	}
+}
+
+// SetLatestPostTS mirrors Bot.recordPost onto the persisted session so
+// the Home tab's `[latest →]` link survives a bot restart. Silently
+// no-ops when no session exists for (channelID, threadTS) — recordPost
+// fires for messages the bot posts in channels/threads that aren't
+// tracked sessions (init dialogs, DMs to non-session users), and we
+// don't want to fabricate empty session rows for those. Does NOT
+// bump UpdatedAt — recordPost fires on high-frequency posts (streaming
+// stats messages, etc.) and heartbeat-bumping here would defeat the
+// stale-detection logic. Caller is not required to Save(); the next
+// natural persistence pass carries the value.
+func (s *SessionStore) SetLatestPostTS(channelID, threadTS, ts string) {
+	if ts == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if session := s.sessions[key(channelID, threadTS)]; session != nil {
+		session.LatestPostTS = ts
+	}
+}
+
+// LatestPostTS returns the persisted latest post TS for (channelID,
+// threadTS), or "" if no session exists or the field is unset. Used
+// as a fallback by Bot.LatestPostTS when the in-memory map is cold
+// (e.g. immediately after a bot restart) so idle/closed sessions
+// don't lose their Home-tab jump link.
+func (s *SessionStore) LatestPostTS(channelID, threadTS string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if session := s.sessions[key(channelID, threadTS)]; session != nil {
+		return session.LatestPostTS
+	}
+	return ""
 }
 
 // ActiveSessions returns all sessions currently flagged Active whose

@@ -284,24 +284,44 @@ func (b *Bot) PostMessage(channelID, text string, threadTS string) (string, erro
 // thread (edit-eligible) or was superseded (post-new-required). A
 // zero thread argument is normalized to the root-post ts so top-
 // level posts and their thread replies share the same bucket.
+//
+// Also mirrored onto the persisted SessionMapping so the Home tab's
+// `[latest →]` link survives a bot restart. Without persistence,
+// idle/closed sessions (which never post again to repopulate the
+// in-memory map) lose their jump link forever after a restart.
 func (b *Bot) recordPost(channelID, threadTS, messageTS string) {
 	if messageTS == "" {
 		return
 	}
 	k := channelID + ":" + threadTS
+	normalizedThreadTS := threadTS
 	if threadTS == "" {
 		k = channelID + ":" + messageTS
+		normalizedThreadTS = messageTS
 	}
 	b.latestPostTS.Store(k, messageTS)
+	if b.sessions != nil {
+		b.sessions.SetLatestPostTS(channelID, normalizedThreadTS, messageTS)
+	}
 }
 
 // LatestPostTS returns the TS of the most-recent post tracked for
-// (channel, thread). Empty string if the bot has posted nothing in
-// this bucket yet.
+// (channel, thread). Prefers the in-memory sync.Map (hot path used
+// by the file sync watcher on every message) and falls back to the
+// persisted SessionMapping.LatestPostTS when the map is cold — the
+// map empties on every bot restart, so without the fallback every
+// idle/closed session's `[latest →]` link would vanish on the next
+// bounce. Empty string if the bot has posted nothing in this bucket
+// and no persisted value exists either.
 func (b *Bot) LatestPostTS(channelID, threadTS string) string {
 	v, _ := b.latestPostTS.Load(channelID + ":" + threadTS)
-	s, _ := v.(string)
-	return s
+	if s, _ := v.(string); s != "" {
+		return s
+	}
+	if b.sessions != nil {
+		return b.sessions.LatestPostTS(channelID, threadTS)
+	}
+	return ""
 }
 
 // LatestPermalinkFor returns a clickable Slack permalink to the
