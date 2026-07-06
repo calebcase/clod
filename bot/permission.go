@@ -86,6 +86,13 @@ type PermissionFIFO struct {
 	responses     chan PermissionResponse
 	logger        zerolog.Logger
 	cancel        context.CancelFunc
+	// writerDone is closed when writeResponses returns. SendResponse
+	// consults it (non-blocking) so a queue-into-dead-writer is loud
+	// instead of silent. Before this channel existed, a writer that
+	// exited via ctx.Done() would silently absorb responses into the
+	// buffered channel and callers would spin waiting for permbridge
+	// forever — that was the eagle wedge on 2026-07-06.
+	writerDone chan struct{}
 }
 
 // ContextFileName is the filename of the combined onboarding context written
@@ -247,6 +254,7 @@ func NewPermissionFIFO(domainPath string, runtimeSuffix string, domainReadmePath
 		contextPath:   contextPath,
 		requests:      make(chan PermissionRequest, 10),
 		responses:     make(chan PermissionResponse, 10),
+		writerDone:    make(chan struct{}),
 		logger:        logger.With().Str("component", "permission_fifo").Logger(),
 	}, nil
 }
@@ -381,6 +389,18 @@ func (p *PermissionFIFO) readRequests(ctx context.Context) {
 //     blocked on open" every 30s so a hung send is loud in the
 //     log instead of silent.
 func (p *PermissionFIFO) writeResponses(ctx context.Context) {
+	// Signal exit so SendResponse can detect a dead writer instead of
+	// silently absorbing responses into the buffered channel. Ordering
+	// matters: close writerDone AFTER logging so a caller racing on
+	// SendResponse sees the log before observing the closed channel.
+	defer func() {
+		p.logger.Info().
+			Int("undrained_responses", len(p.responses)).
+			Err(ctx.Err()).
+			Msg("writeResponses goroutine exiting")
+		close(p.writerDone)
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -501,7 +521,23 @@ func (p *PermissionFIFO) Requests() <-chan PermissionRequest {
 // goroutine, whether the queue happened at all. Without this trail
 // a silently-stalled writer is indistinguishable from a never-queued
 // response (2026-06-25 eerie-eagle incident).
+//
+// Also checks writerDone: if the writer goroutine has exited the
+// buffered channel will still accept the send, but nothing will ever
+// drain it. Logs a Warn in that case so the 2026-07-06 eagle wedge
+// (response queued at buffered:1, writer already dead, zero further
+// log evidence) is diagnosable immediately from the log instead of
+// requiring goroutine forensics on the running bot.
 func (p *PermissionFIFO) SendResponse(resp PermissionResponse) {
+	select {
+	case <-p.writerDone:
+		p.logger.Warn().
+			Str("behavior", resp.Behavior).
+			Int("buffered", len(p.responses)).
+			Msg("SendResponse called but writer goroutine has exited; response will not be delivered")
+		return
+	default:
+	}
 	select {
 	case p.responses <- resp:
 		p.logger.Info().
