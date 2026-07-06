@@ -910,8 +910,14 @@ func (r *Runner) Start(
 	taskPath, prompt, sessionID, model, permissionMode string,
 	useClaudeDirect bool,
 ) (*RunningTask, error) {
-	// Create command with timeout context.
+	// Create command with timeout context. runStart is captured so the
+	// error-return path below can report actual runtime, not just the
+	// nominal deadline — a container that outlives its ctx deadline
+	// (e.g. `docker run` orphaned from bash on ctx cancel) can push
+	// cmd.Wait() to return hours past the deadline, and reporting
+	// only "timed out after 24h" hides that gap.
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	runStart := time.Now()
 
 	// Create permission FIFO for MCP communication (must be done before building args).
 	// Pass empty string to generate a unique runtime suffix for concurrent instances.
@@ -1674,19 +1680,39 @@ func (r *Runner) Start(
 		}
 
 		if err != nil {
-			// Check if it was a timeout
-			if runCtx.Err() == context.DeadlineExceeded {
-				result.Error = oops.New("clod execution timed out after %v", r.timeout)
-			} else if runCtx.Err() == context.Canceled {
-				result.Error = oops.New("clod execution was cancelled")
-			} else {
-				// Include the recent stderr tail so the caller can surface
-				// the actual reason to the user (SSH agent missing, auth
-				// required, etc.) instead of "exit status 1".
-				if tail := snapshotStderrTail(); tail != "" {
-					result.Error = oops.New("%s\n```\n%s\n```", err.Error(), tail)
+			// Report the actual runtime, not just the nominal deadline.
+			// A container that outlives ctx cancellation (docker isn't
+			// killed by Go's SIGKILL of the bash intermediate) can push
+			// cmd.Wait to return hours past the deadline; "timed out
+			// after 24h" hides that. See 2026-07-06 eagle post-mortem:
+			// deadline fired at Jul 6 09:44:27, cmd.Wait didn't return
+			// until docker stop at Jul 6 22:46:59, but the error text
+			// still just read "timed out after 24h0m0s".
+			runtimeElapsed := time.Since(runStart)
+			switch runCtx.Err() {
+			case context.DeadlineExceeded:
+				if runtimeElapsed > r.timeout+time.Minute {
+					result.Error = oops.New(
+						"clod execution timed out (deadline %v elapsed %v ago; process kept running until now, total runtime %v)",
+						r.timeout, runtimeElapsed-r.timeout, runtimeElapsed,
+					)
 				} else {
-					result.Error = oops.Trace(err)
+					result.Error = oops.New("clod execution timed out after %v", r.timeout)
+				}
+			case context.Canceled:
+				result.Error = oops.New("clod execution was cancelled after %v", runtimeElapsed)
+			default:
+				// Neither we-timed-it-out nor we-cancelled-it. The
+				// child died on its own — could be `docker stop` from
+				// outside, OOM, a permbridge crash, an image issue,
+				// etc. Include the stderr tail so the caller can
+				// surface the actual reason to the user (SSH agent
+				// missing, auth required, etc.) instead of "exit
+				// status 1".
+				if tail := snapshotStderrTail(); tail != "" {
+					result.Error = oops.New("clod exited unexpectedly after %v: %s\n```\n%s\n```", runtimeElapsed, err.Error(), tail)
+				} else {
+					result.Error = oops.New("clod exited unexpectedly after %v: %w", runtimeElapsed, err)
 				}
 			}
 		}
