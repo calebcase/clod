@@ -1689,6 +1689,22 @@ func (r *Runner) Start(
 			// until docker stop at Jul 6 22:46:59, but the error text
 			// still just read "timed out after 24h0m0s".
 			runtimeElapsed := time.Since(runStart)
+			// When our own ctx killed the run (deadline OR explicit
+			// cancel), the bash intermediate got SIGKILLed by
+			// exec.CommandContext but its docker-run child got
+			// orphaned to init and the container kept running. The
+			// permission-FIFO writer goroutine also exits on ctx.Done
+			// while permbridge inside the container is still trying
+			// to serve MCP requests — that's the 2026-07-07 eagle
+			// wedge (writer dead, permbridge blocked in
+			// wait_for_partner, agent making requests nobody
+			// answers). Explicitly stop the container so the whole
+			// process tree tears down instead of relying on a
+			// SIGKILL-of-bash cascade that docker's process tree
+			// doesn't participate in.
+			if runCtx.Err() != nil {
+				task.stopContainer("runctx path")
+			}
 			switch runCtx.Err() {
 			case context.DeadlineExceeded:
 				if runtimeElapsed > r.timeout+time.Minute {
