@@ -280,17 +280,29 @@ type RunningTask struct {
 	// a bot restart mid-task doesn't orphan the thread.
 	sessionIDCaptured chan string
 	sessionIDOnce     sync.Once
-	// lastPingAt is the timestamp of the most-recent SSE `ping` event
-	// forwarded from claude's stream. Used by the liveness ticker to
-	// distinguish "long tool wait" (pings still arriving) from "SSE
-	// connection wedged" (pings stopped) — deltas alone can't
-	// distinguish these: eagle-style research sessions regularly go
-	// 2–3 hours between content_block_delta events during healthy
-	// operation, but pings from Anthropic arrive every ~15–20s
-	// regardless. sync/atomic holder because the writer is the stream
-	// parser goroutine and the reader is the liveness ticker
-	// goroutine — no mutex, no allocation on read.
-	lastPingAt atomic.Value // time.Time
+	// lastStreamAt is the timestamp of the most-recent parsed line
+	// from claude's stream-json stdout. Used by the liveness ticker
+	// as a proxy for "the model is actively producing output".
+	//
+	// A v0.36.6 attempt used SSE `ping` events as the heartbeat, on
+	// the theory that Anthropic sends them every ~15s. That was
+	// wrong for this transport: claude's `--output-format
+	// stream-json` does NOT forward SSE pings to stdout — zero
+	// `"type":"ping"` events appear across the entire log corpus.
+	// Fallback: any parsed stream line counts (content_block_delta,
+	// system.*, message_*, assistant, user, result). During active
+	// model generation these fire multiple times per second, so a
+	// short freshness window reliably captures "actively
+	// producing". Absence of stream events does NOT prove wedged
+	// though — legitimate long tool waits (a background bash job
+	// running python for hours) produce zero events. Absence is a
+	// hint, not a verdict; the Home tab and reaction let the user
+	// interpret it with context they have and the bot doesn't
+	// (what the model was asked to do, how long the tool takes).
+	//
+	// sync/atomic holder because the writer is the stream parser
+	// goroutine and the reader is the liveness ticker.
+	lastStreamAt atomic.Value // time.Time
 	// compactPending is set when the stream emits a
 	// `system.subtype:"compact_boundary"` marker, and cleared on the
 	// next content_block_start. The handler surfaces the paired
@@ -510,6 +522,17 @@ func (t *RunningTask) SendInputWithImages(text string, images []ImageData) error
 // Output returns the channel for receiving output chunks.
 func (t *RunningTask) Output() <-chan string {
 	return t.output
+}
+
+// LastStreamAt returns the timestamp of the most recently parsed
+// line from claude's stream-json output, or zero if nothing has been
+// seen yet. Read by the Home-tab renderer to display a per-session
+// freshness indicator without needing to reach into runner internals.
+func (t *RunningTask) LastStreamAt() time.Time {
+	if v := t.lastStreamAt.Load(); v != nil {
+		return v.(time.Time)
+	}
+	return time.Time{}
 }
 
 // PermissionRequests returns the channel for receiving permission requests from the FIFO.
@@ -1357,15 +1380,15 @@ func (r *Runner) Start(
 				return
 			case <-ticker.C:
 				var lastAt time.Time
-				if v := task.lastPingAt.Load(); v != nil {
+				if v := task.lastStreamAt.Load(); v != nil {
 					lastAt = v.(time.Time)
 				}
-				// Undefined lastAt means no ping observed yet;
+				// Undefined lastAt means no line observed yet;
 				// treat as not-fresh so we don't add the liveness
 				// reaction before we've seen anything.
 				since := time.Since(lastAt)
-				fresh := !lastAt.IsZero() && since < 90*time.Second
-				stale := lastAt.IsZero() || since > 120*time.Second
+				fresh := !lastAt.IsZero() && since < 60*time.Second
+				stale := lastAt.IsZero() || since > 90*time.Second
 				if fresh && !alive {
 					alive = true
 					send("__ALIVE__")
@@ -1481,6 +1504,14 @@ func (r *Runner) Start(
 				continue
 			}
 			handshaken = true
+
+			// Liveness signal: every parsed line proves the model
+			// (or claude itself) is currently producing output.
+			// The ticker uses this to toggle the __ALIVE__/__STALE__
+			// reaction. See RunningTask.lastStreamAt for why this
+			// is bumped on every line rather than a periodic
+			// keep-alive (there isn't one in stream-json).
+			task.lastStreamAt.Store(time.Now())
 
 			// Extract session ID if present
 			if msg.SessionID != "" && task.sessionID == "" {
@@ -1816,19 +1847,6 @@ func (r *Runner) Start(
 						Str("subtype", ctrlReq.Subtype).
 						Msg("unhandled control_request subtype")
 				}
-			case "ping":
-				// SSE keep-alive from Anthropic — the ONLY reliable
-				// signal that "claude is alive and the API connection
-				// is up" during long tool waits. content_block_delta
-				// events can go silent for hours during healthy work
-				// (e.g. eagle sessions running long training jobs
-				// see 2–3h gaps between deltas). Pings arrive
-				// every ~15–20s regardless of what the model is
-				// doing, so the liveness ticker uses this timestamp
-				// to distinguish "long tool wait" from "SSE
-				// connection stalled".
-				task.lastPingAt.Store(time.Now())
-				r.logger.Debug().Msg("received ping")
 			case "content_block_stop", "message_start", "message_delta", "message_stop":
 				// These are part of the streaming protocol but we don't need to act on them.
 				// content_block_stop: marks end of a content block
