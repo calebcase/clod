@@ -4006,11 +4006,32 @@ func (h *Handler) runClod(
 			// runClod starts (thread-reply resume path).
 			if content == "__ALIVE__" || content == "__STALE__" {
 				sess := h.bot.sessions.Get(channelID, threadTS)
+				anchor := ""
+				if sess != nil {
+					anchor = sess.ReactionAnchorTS
+				}
+				// Log receipt + outcome at Info. Two per session
+				// transition (one ALIVE, one STALE per cycle) — low
+				// volume, high forensic value when a wedge is
+				// investigated later ("did the bot even see this?").
+				logger.Info().
+					Str("sentinel", content).
+					Bool("has_session", sess != nil).
+					Str("anchor", anchor).
+					Msg("liveness sentinel received")
 				if sess != nil && sess.ReactionAnchorTS != "" {
 					if content == "__ALIVE__" {
-						_ = h.bot.AddReaction(channelID, sess.ReactionAnchorTS, livenessEmoji)
+						if err := h.bot.AddReaction(channelID, sess.ReactionAnchorTS, livenessEmoji); err != nil {
+							logger.Warn().Err(err).Msg("AddReaction(satellite) failed")
+						} else {
+							logger.Debug().Msg("AddReaction(satellite) ok")
+						}
 					} else {
-						_ = h.bot.RemoveReaction(channelID, sess.ReactionAnchorTS, livenessEmoji)
+						if err := h.bot.RemoveReaction(channelID, sess.ReactionAnchorTS, livenessEmoji); err != nil {
+							logger.Warn().Err(err).Msg("RemoveReaction(satellite) failed")
+						} else {
+							logger.Debug().Msg("RemoveReaction(satellite) ok")
+						}
 					}
 				}
 				continue
