@@ -1389,11 +1389,24 @@ func (r *Runner) Start(
 				since := time.Since(lastAt)
 				fresh := !lastAt.IsZero() && since < 60*time.Second
 				stale := lastAt.IsZero() || since > 90*time.Second
+				// Per-tick state at Debug (fires every 15s per
+				// session, would flood the log at Info). Transitions
+				// stay at Info because they are rare and useful for
+				// forensics of any wedge investigation.
+				r.logger.Debug().
+					Time("last_stream_at", lastAt).
+					Dur("since", since).
+					Bool("fresh", fresh).
+					Bool("stale", stale).
+					Bool("alive_prev", alive).
+					Msg("liveness tick")
 				if fresh && !alive {
 					alive = true
+					r.logger.Info().Dur("since_last_stream", since).Msg("liveness transition -> ALIVE")
 					send("__ALIVE__")
 				} else if stale && alive {
 					alive = false
+					r.logger.Info().Dur("since_last_stream", since).Msg("liveness transition -> STALE")
 					send("__STALE__")
 				}
 			}
