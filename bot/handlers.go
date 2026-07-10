@@ -949,7 +949,21 @@ func (h *Handler) publishHomeView(userID string, knownHash string, logger zerolo
 	if includeWorkspace {
 		rollup = h.bot.sessions.UsageRollup(usageRollupWindows)
 	}
-	view := buildHomeTabView(sessions, rollup, h.bot.PermalinkFor, h.bot.LatestPermalinkFor, userID, includeWorkspace, Version)
+	// livenessFor resolves (channel, thread) to the last-parsed
+	// stream line's timestamp — populated only for sessions with an
+	// in-memory RunningTask (i.e. currently running, this bot
+	// instance). Idle sessions and sessions from other bot instances
+	// yield zero time.Time; the formatter renders no indicator in
+	// those cases.
+	livenessFor := func(channelID, threadTS string) time.Time {
+		if v, ok := h.runningTasks.Load(key(channelID, threadTS)); ok {
+			if t, ok := v.(*RunningTask); ok && t != nil {
+				return t.LastStreamAt()
+			}
+		}
+		return time.Time{}
+	}
+	view := buildHomeTabView(sessions, rollup, h.bot.PermalinkFor, h.bot.LatestPermalinkFor, livenessFor, userID, includeWorkspace, Version)
 
 	req := slack.PublishViewContextRequest{
 		UserID: userID,
