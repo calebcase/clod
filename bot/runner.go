@@ -1257,6 +1257,35 @@ func (r *Runner) Start(
 		task.notifySessionID(sessionID)
 	}
 
+	// Watch runCtx.Done and stop the container as soon as our ctx
+	// says "stop", NOT after cmd.Wait returns. The v0.36.4 attempt
+	// placed the stopContainer call after cmd.Wait, which turned out
+	// to be a no-op: exec.CommandContext SIGKILLs bash on ctx.Done,
+	// but its docker-run child gets orphaned to init and keeps the
+	// stdout/stderr pipes open. cmd.Wait blocks on those pipes
+	// closing, which happens only when docker run exits, which
+	// happens only when the container exits, which we're supposed to
+	// be causing here — chicken and egg. See 2026-07-09 eagle
+	// post-mortem: deadline fired at 01:15:39Z, "docker stop
+	// (runctx path)" didn't log until 21:35:17Z — a 20h gap where
+	// cmd.Wait was blocked on pipes held open by an orphaned docker
+	// run.
+	//
+	// Watcher exits when runCtx.Done fires (either via WithTimeout
+	// deadline, Shutdown's forceKill -> cancel, or parent-ctx
+	// propagation). No task-done path — stopContainer is a no-op on
+	// an already-gone container, so if the run completed cleanly
+	// and the watcher fires later during bot shutdown it just
+	// silently confirms the container is gone.
+	go func() {
+		<-runCtx.Done()
+		task.logger.Info().
+			Err(runCtx.Err()).
+			Str("suffix", task.runtimeSuffix).
+			Msg("runCtx.Done fired — stopping container without waiting for cmd.Wait")
+		task.stopContainer("runctx-watcher")
+	}()
+
 	// Start permission FIFO listener
 	permFIFO.Start(runCtx)
 
@@ -1689,22 +1718,16 @@ func (r *Runner) Start(
 			// until docker stop at Jul 6 22:46:59, but the error text
 			// still just read "timed out after 24h0m0s".
 			runtimeElapsed := time.Since(runStart)
-			// When our own ctx killed the run (deadline OR explicit
-			// cancel), the bash intermediate got SIGKILLed by
-			// exec.CommandContext but its docker-run child got
-			// orphaned to init and the container kept running. The
-			// permission-FIFO writer goroutine also exits on ctx.Done
-			// while permbridge inside the container is still trying
-			// to serve MCP requests — that's the 2026-07-07 eagle
-			// wedge (writer dead, permbridge blocked in
-			// wait_for_partner, agent making requests nobody
-			// answers). Explicitly stop the container so the whole
-			// process tree tears down instead of relying on a
-			// SIGKILL-of-bash cascade that docker's process tree
-			// doesn't participate in.
-			if runCtx.Err() != nil {
-				task.stopContainer("runctx path")
-			}
+			// Container teardown on ctx cancel/timeout is handled by
+			// the runCtx.Done watcher goroutine spawned at task
+			// start — it fires stopContainer immediately when the
+			// ctx signals, not after cmd.Wait unblocks. v0.36.4
+			// tried calling stopContainer here and hit a chicken-
+			// and-egg deadlock: cmd.Wait was blocked on the
+			// stdout/stderr pipes held open by orphaned docker run,
+			// so this branch didn't execute until the container was
+			// stopped some other way. See the watcher's block
+			// comment for details.
 			switch runCtx.Err() {
 			case context.DeadlineExceeded:
 				if runtimeElapsed > r.timeout+time.Minute {
