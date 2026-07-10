@@ -259,6 +259,18 @@ const (
 	// mode.
 	planModeEmoji = "thought_balloon" // 💭 plan mode
 
+	// livenessEmoji marks "SSE stream is alive" on the anchor
+	// message. Added when the runner's liveness ticker observes
+	// pings arriving within the freshness window (~90s), removed
+	// when they stop (>120s). Presence = "claude is alive, waiting
+	// on a tool or the model"; absence during an active session =
+	// "SSE stalled, likely wedged". Distinguishes long tool waits
+	// (deltas silent, pings flowing) from the CLOSE_WAIT wedge class
+	// (both silent). Chosen because :satellite_antenna: visually
+	// reads as "receiving signal" and doesn't overlap with
+	// model/verbosity/plan-mode indicators already on the anchor.
+	livenessEmoji = "satellite_antenna" // 📡 SSE alive
+
 	// Default model string when no thread preference exists and no bot
 	// default is set. Matches a common --model alias.
 	fallbackModel = "sonnet"
@@ -3972,6 +3984,40 @@ func (h *Handler) runClod(
 				continue
 			}
 
+			// Liveness reaction — add/remove :satellite_antenna: on
+			// the anchor based on SSE ping freshness. The runner
+			// side is a state machine that only emits transitions,
+			// so we don't burn Slack API on repeated adds. Look up
+			// the session lazily since sessions can appear after
+			// runClod starts (thread-reply resume path).
+			if content == "__ALIVE__" || content == "__STALE__" {
+				sess := h.bot.sessions.Get(channelID, threadTS)
+				if sess != nil && sess.ReactionAnchorTS != "" {
+					if content == "__ALIVE__" {
+						_ = h.bot.AddReaction(channelID, sess.ReactionAnchorTS, livenessEmoji)
+					} else {
+						_ = h.bot.RemoveReaction(channelID, sess.ReactionAnchorTS, livenessEmoji)
+					}
+				}
+				continue
+			}
+
+			// Compaction status banner — post a rolling
+			// "compacting session…" while claude summarizes context,
+			// finalized when the next real content block starts.
+			// Without this, the compaction pause looks identical to
+			// a wedge from Slack (nothing streams during compaction).
+			if content == "__COMPACT_START__" {
+				h.updateNamedProgressMessage(channelID, threadTS, "compact",
+					":broom: *Compacting session…* (claude is summarizing context to reduce tokens)", "", logger)
+				continue
+			}
+			if content == "__COMPACT_END__" {
+				h.finalizeNamedProgressMessage(channelID, threadTS, "compact",
+					":white_check_mark: *Compaction complete*", logger)
+				continue
+			}
+
 			// Check for special stats message.
 			if strings.HasPrefix(content, "__STATS__") {
 				h.clearProgressMessage(channelID, threadTS, logger)
@@ -4102,6 +4148,20 @@ func (h *Handler) finalizeTask(
 	// entries and we don't want hourglasses stranded on user
 	// messages.
 	h.clearAllWorkInProgress(channelID, threadTS)
+	// Clear the liveness reaction — the session just ended, so
+	// the "SSE alive" indicator would be stale until manually
+	// removed. RemoveReaction is idempotent, so this is a safe
+	// no-op when the reaction wasn't added (session ended before
+	// the freshness threshold ever tripped alive).
+	if sess := h.bot.sessions.Get(channelID, threadTS); sess != nil && sess.ReactionAnchorTS != "" {
+		if err := h.bot.RemoveReaction(channelID, sess.ReactionAnchorTS, livenessEmoji); err != nil {
+			logger.Debug().Err(err).Msg("failed to clear liveness reaction on task end")
+		}
+	}
+	// Also clean up a lingering compact banner if the session
+	// ended mid-compaction (rare but possible on shutdown/timeout).
+	h.finalizeNamedProgressMessage(channelID, threadTS, "compact",
+		":white_check_mark: *Compaction complete*", logger)
 	var finalMsg string
 	cleanExit := result.Error == nil
 	progressKey := key(channelID, threadTS)

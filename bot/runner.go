@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -279,6 +280,30 @@ type RunningTask struct {
 	// a bot restart mid-task doesn't orphan the thread.
 	sessionIDCaptured chan string
 	sessionIDOnce     sync.Once
+	// lastPingAt is the timestamp of the most-recent SSE `ping` event
+	// forwarded from claude's stream. Used by the liveness ticker to
+	// distinguish "long tool wait" (pings still arriving) from "SSE
+	// connection wedged" (pings stopped) — deltas alone can't
+	// distinguish these: eagle-style research sessions regularly go
+	// 2–3 hours between content_block_delta events during healthy
+	// operation, but pings from Anthropic arrive every ~15–20s
+	// regardless. sync/atomic holder because the writer is the stream
+	// parser goroutine and the reader is the liveness ticker
+	// goroutine — no mutex, no allocation on read.
+	lastPingAt atomic.Value // time.Time
+	// compactPending is set when the stream emits a
+	// `system.subtype:"compact_boundary"` marker, and cleared on the
+	// next content_block_start. The handler surfaces the paired
+	// __COMPACT_START__/__COMPACT_END__ sentinels as a rolling
+	// "compacting session…" status message so the user can
+	// distinguish a legitimate compaction pause from a wedge.
+	compactPending atomic.Bool
+	// livenessDone is closed by the liveness ticker goroutine when
+	// it returns (via runCtx.Done). The outer stream-parsing
+	// goroutine waits on it before running close(task.output) so
+	// the ticker's __ALIVE__/__STALE__ sends can never race the
+	// close. See runCtx cancel defer chain in the outer goroutine.
+	livenessDone chan struct{}
 }
 
 // closeStdin closes the bot's end of the child's stdin pipe. It's safe to
@@ -1286,6 +1311,72 @@ func (r *Runner) Start(
 		task.stopContainer("runctx-watcher")
 	}()
 
+	// Liveness ticker: watches lastPingAt (updated by the SSE `ping`
+	// case) and toggles __ALIVE__ / __STALE__ sentinels on the output
+	// channel when the freshness state flips. The handler translates
+	// those into an add/remove of a liveness reaction on the anchor
+	// message. Design rationale:
+	//
+	//   - content_block_delta events can go 2–3 hours silent in
+	//     healthy long-running sessions (eagle model-training work),
+	//     so a heartbeat driven by deltas false-positives constantly.
+	//   - Anthropic sends pings every ~15–20s to keep the SSE alive
+	//     regardless of what the model is doing, so ping freshness
+	//     is a stable signal.
+	//   - Fresh threshold (90s) gives headroom over the ~20s ping
+	//     interval so a single dropped ping doesn't flip the state;
+	//     stale threshold (120s) adds hysteresis so we don't churn
+	//     add/remove on a marginal connection.
+	//   - Runner owns the state machine so the handler only sees
+	//     transitions (one __ALIVE__ per becoming-fresh, one
+	//     __STALE__ per becoming-stale) — no repeated reaction API
+	//     hits.
+	livenessDone := make(chan struct{})
+	task.livenessDone = livenessDone
+	go func() {
+		defer close(livenessDone)
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		var alive bool
+		// Sends are gated on runCtx to avoid racing the outer
+		// goroutine's `close(task.output)`. The outer goroutine's
+		// defer chain cancels runCtx first, then waits on
+		// livenessDone before allowing close(task.output) to run —
+		// so once we return via <-runCtx.Done() here, the outer
+		// goroutine unblocks and closes task.output. Never send
+		// after ctx cancels.
+		send := func(msg string) {
+			select {
+			case task.output <- msg:
+			case <-runCtx.Done():
+			}
+		}
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				var lastAt time.Time
+				if v := task.lastPingAt.Load(); v != nil {
+					lastAt = v.(time.Time)
+				}
+				// Undefined lastAt means no ping observed yet;
+				// treat as not-fresh so we don't add the liveness
+				// reaction before we've seen anything.
+				since := time.Since(lastAt)
+				fresh := !lastAt.IsZero() && since < 90*time.Second
+				stale := lastAt.IsZero() || since > 120*time.Second
+				if fresh && !alive {
+					alive = true
+					send("__ALIVE__")
+				} else if stale && alive {
+					alive = false
+					send("__STALE__")
+				}
+			}
+		}
+	}()
+
 	// Start permission FIFO listener
 	permFIFO.Start(runCtx)
 
@@ -1310,11 +1401,32 @@ func (r *Runner) Start(
 	// Read from PTY and parse stream-json in background
 	go func() {
 		defer close(task.output)
+		// Wait for the liveness ticker to fully exit before letting
+		// the close(task.output) defer above run. The ticker sends
+		// __ALIVE__/__STALE__ into task.output; without this
+		// barrier a slow ticker could still be in-flight when the
+		// close fires and panic. Registered after close(task.output)
+		// so it runs FIRST (LIFO). livenessDone is closed by the
+		// ticker on exit; nil check tolerates test paths that skip
+		// the ticker setup.
+		defer func() {
+			if task.livenessDone != nil {
+				<-task.livenessDone
+			}
+		}()
 		defer close(task.done)
 		defer func() { _ = ptmx.Close() }()
 		defer task.closeStdin()
 		defer task.cancelWakeupTimer()
 		defer permFIFO.Close()
+		// Cancel runCtx on ANY exit path so goroutines observing
+		// ctx.Done (liveness ticker, stopContainer watcher) shut
+		// down promptly. Registered LAST here so it runs FIRST in
+		// the defer chain (LIFO) — before the livenessDone wait
+		// above. Also fixes a pre-existing minor leak where
+		// clean-exit runs left runCtx uncancelled until parent-ctx
+		// propagation.
+		defer cancel()
 
 		var outputBuilder strings.Builder
 		// Track tool_use IDs to their names and inputs so we can show context in results.
@@ -1394,6 +1506,24 @@ func (r *Runner) Start(
 						Str("session_id", task.sessionID).
 						Msg("captured session ID from system init")
 					task.notifySessionID(msg.SessionID)
+				}
+				// Compaction boundary: claude signals that it's
+				// summarizing history to reduce context. Nothing
+				// visible flows during compaction, so from Slack the
+				// gap looks identical to a wedge. Surface a
+				// __COMPACT_START__ sentinel and let the handler
+				// post a rolling "compacting session…" banner. The
+				// paired __COMPACT_END__ fires on the next
+				// content_block_start (real work resuming).
+				if msg.Subtype == "compact_boundary" {
+					if task.compactPending.CompareAndSwap(false, true) {
+						r.logger.Info().Msg("compact_boundary observed — surfacing status")
+						select {
+						case task.output <- "__COMPACT_START__":
+						default:
+							r.logger.Warn().Msg("output channel full, dropping __COMPACT_START__")
+						}
+					}
 				}
 			case "assistant":
 				// Assistant messages contain text output and tool_use requests.
@@ -1509,6 +1639,17 @@ func (r *Runner) Start(
 				r.logger.Info().
 					Bool("has_content_block", msg.ContentBlock != nil).
 					Msg("received content_block_start")
+				// If a compact_boundary was surfaced earlier in this
+				// run, the next content_block_start is the model
+				// producing real output again — pair the sentinel so
+				// the handler can finalize its "compacting…" banner.
+				if task.compactPending.CompareAndSwap(true, false) {
+					select {
+					case task.output <- "__COMPACT_END__":
+					default:
+						r.logger.Warn().Msg("output channel full, dropping __COMPACT_END__")
+					}
+				}
 				if msg.ContentBlock != nil {
 					r.logger.Info().
 						Str("block_type", msg.ContentBlock.Type).
@@ -1675,13 +1816,25 @@ func (r *Runner) Start(
 						Str("subtype", ctrlReq.Subtype).
 						Msg("unhandled control_request subtype")
 				}
-			case "content_block_stop", "message_start", "message_delta", "message_stop", "ping":
+			case "ping":
+				// SSE keep-alive from Anthropic — the ONLY reliable
+				// signal that "claude is alive and the API connection
+				// is up" during long tool waits. content_block_delta
+				// events can go silent for hours during healthy work
+				// (e.g. eagle sessions running long training jobs
+				// see 2–3h gaps between deltas). Pings arrive
+				// every ~15–20s regardless of what the model is
+				// doing, so the liveness ticker uses this timestamp
+				// to distinguish "long tool wait" from "SSE
+				// connection stalled".
+				task.lastPingAt.Store(time.Now())
+				r.logger.Debug().Msg("received ping")
+			case "content_block_stop", "message_start", "message_delta", "message_stop":
 				// These are part of the streaming protocol but we don't need to act on them.
 				// content_block_stop: marks end of a content block
 				// message_start: marks beginning of assistant message
 				// message_delta: contains stop_reason and usage (we get this from result)
 				// message_stop: marks end of assistant message
-				// ping: keep-alive signal
 				r.logger.Debug().Str("type", msg.Type).Msg("received streaming marker")
 			case "error":
 				// Error event from Claude API
