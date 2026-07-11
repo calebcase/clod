@@ -1231,16 +1231,25 @@ func (r *Runner) Start(
 			}
 			stderrTail = append(stderrTail, line)
 			stderrMu.Unlock()
-			// permbridge-emitted diagnostic lines need to land in
-			// the default info-level logs — they're the
-			// in-container half of the FIFO handshake and the
-			// only way to debug a deadlock after the fact.
+			// Bridge-emitted diagnostic lines land at Info —
+			// they're the in-container half of the FIFO handshake
+			// (permbridge) and the socket handshake (schedbridge),
+			// and the only way to debug a deadlock or a flapping
+			// MCP subprocess after the fact. Symmetric treatment
+			// for both bridges; prior to 0.36.9 only permbridge
+			// was promoted and schedbridge stderr was invisible
+			// in default logs, which made the 2026-07-10 flapping
+			// investigation harder than it needed to be.
 			// Everything else (docker build chatter, SSH agent
 			// banners) stays at debug to keep the log readable.
 			if strings.HasPrefix(line, "[permbridge]") {
 				r.logger.Info().
 					Str("stderr", line).
 					Msg("permbridge stderr")
+			} else if strings.HasPrefix(line, "[schedbridge]") {
+				r.logger.Info().
+					Str("stderr", line).
+					Msg("schedbridge stderr")
 			} else {
 				r.logger.Debug().
 					Str("stderr", line).
