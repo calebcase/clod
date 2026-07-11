@@ -38,6 +38,17 @@ var permBridgeBinary []byte
 //go:embed schedbridge/schedbridge.linux-amd64
 var schedBridgeBinary []byte
 
+// clodProxyBinary is the in-container HTTP → HTTPS reverse proxy that
+// stands between claude and api.anthropic.com. Its job is to force
+// turnover of the outbound keep-alive pool so claude doesn't wedge
+// on a silently half-closed socket (upstream claude-code #54434
+// class). The wrapper starts it before claude and sets
+// ANTHROPIC_BASE_URL to point at its loopback listen address.
+// Rebuild via bot/clodproxy/build.sh.
+//
+//go:embed clodproxy/clodproxy.linux-amd64
+var clodProxyBinary []byte
+
 const (
 	// FIFORequestName is the name of the FIFO for permission requests (hook writes, bot reads)
 	FIFORequestName = "permission_request.fifo"
@@ -51,6 +62,13 @@ const (
 	// binary. Written next to permbridge in the runtime dir and pointed
 	// at from the same mcp_config.json.
 	SchedBridgeName = "schedbridge"
+	// ClodProxyName is the filename for the in-container HTTP → HTTPS
+	// reverse proxy binary. Written next to the other bridges in the
+	// runtime dir; the wrapper spawns it before claude and sets
+	// ANTHROPIC_BASE_URL=http://127.0.0.1:8788/ so claude routes
+	// through it. See clodproxy/main.go for the wedge-mitigation
+	// rationale.
+	ClodProxyName = "clodproxy"
 	// SchedSocketName is the Unix socket the bot listens on and
 	// schedbridge dials into. Lives inside the runtime dir so both
 	// sides of the bind-mount see the same path.
@@ -233,6 +251,19 @@ func NewPermissionFIFO(domainPath string, runtimeSuffix string, domainReadmePath
 		return nil, oops.New("embedded schedbridge binary is empty; rebuild via bot/schedbridge/build.sh")
 	}
 	if err := os.WriteFile(schedPath, schedBridgeBinary, 0o755); err != nil {
+		return nil, oops.Trace(err)
+	}
+
+	// Drop clodproxy next to the bridges. The wrapper (Dockerfile_wrapper
+	// in bin/clod) spawns it before claude and sets ANTHROPIC_BASE_URL
+	// so claude routes API calls through it. See clodproxy/main.go for
+	// why the workaround exists (upstream claude-code #54434
+	// between-turn CLOSE_WAIT pool wedges).
+	proxyPath := filepath.Join(runtimeDir, ClodProxyName)
+	if len(clodProxyBinary) == 0 {
+		return nil, oops.New("embedded clodproxy binary is empty; rebuild via bot/clodproxy/build.sh")
+	}
+	if err := os.WriteFile(proxyPath, clodProxyBinary, 0o755); err != nil {
 		return nil, oops.Trace(err)
 	}
 

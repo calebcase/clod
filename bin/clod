@@ -1,7 +1,7 @@
 #!/bin/env bash
 set -euo pipefail
 
-CLOD_VERSION="0.36.9"
+CLOD_VERSION="0.37.0"
 
 reinit=${CLOD_REINIT:-false}
 noninteractive=${CLOD_NONINTERACTIVE:-false}
@@ -139,6 +139,34 @@ fi
 # Note: We intentionally do NOT copy ~/.claude.json back on exit.
 # The bot saves permissions directly to ~/.claude/claude.json (via volume mount),
 # and copying back would overwrite those saves with the stale copy made at startup.
+
+# Start clodproxy if the bot dropped it in the runtime dir. It's a
+# tiny reverse-proxy that terminates idle keep-alive connections to
+# api.anthropic.com aggressively — workaround for upstream claude-
+# code #54434 (Node undici pool holds silently half-closed sockets
+# between turns and wedges on next request). If the binary isn't
+# present we just skip it and go direct; nothing else about the
+# session should change.
+if [[ -n "\${CLOD_RUNTIME_DIR:-}" && -x "\${CLOD_RUNTIME_DIR}/clodproxy" && -z "\${CLOD_DISABLE_PROXY:-}" ]]; then
+  "\${CLOD_RUNTIME_DIR}/clodproxy" >&2 &
+  # Wait up to 3s for the proxy to bind. Uses bash's /dev/tcp
+  # builtin so we don't require curl/nc in the base image.
+  proxy_up=0
+  for i in \$(seq 1 30); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8788) 2>/dev/null; then
+      exec 3>&-; exec 3<&-
+      proxy_up=1
+      break
+    fi
+    sleep 0.1
+  done
+  if (( proxy_up )); then
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:8788/"
+    echo "[wrapper] clodproxy healthy — ANTHROPIC_BASE_URL=\${ANTHROPIC_BASE_URL}" >&2
+  else
+    echo "[wrapper] clodproxy failed to come up; falling back to direct Anthropic" >&2
+  fi
+fi
 
 # Read default flags from .clod/claude-default-flags if it exists.
 if [[ -f .clod/claude-default-flags ]]; then
