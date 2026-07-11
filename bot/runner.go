@@ -1250,6 +1250,10 @@ func (r *Runner) Start(
 				r.logger.Info().
 					Str("stderr", line).
 					Msg("schedbridge stderr")
+			} else if strings.HasPrefix(line, "[clodproxy]") || strings.HasPrefix(line, "[wrapper]") {
+				r.logger.Info().
+					Str("stderr", line).
+					Msg("container helper stderr")
 			} else {
 				r.logger.Debug().
 					Str("stderr", line).
