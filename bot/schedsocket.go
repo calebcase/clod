@@ -108,8 +108,13 @@ func (s *SchedSocket) Stop() {
 // acceptLoop pulls new connections off the listener until it's
 // closed. Each connection gets its own goroutine so multiple
 // concurrent tool calls from the shim don't head-of-line block.
+// Every accepted connection logs at Info; the counter tags per-
+// connection log lines so a flapping schedbridge (repeatedly
+// dialing + hanging up) is obvious in the log without goroutine
+// forensics.
 func (s *SchedSocket) acceptLoop() {
 	defer s.wg.Done()
+	var connSeq uint64
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -120,19 +125,33 @@ func (s *SchedSocket) acceptLoop() {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
+		connSeq++
+		id := connSeq
+		s.logger.Info().Uint64("conn_id", id).Msg("schedbridge connected")
 		s.wg.Add(1)
-		go func(c net.Conn) {
+		go func(c net.Conn, cid uint64) {
 			defer s.wg.Done()
-			s.handleConn(c)
-		}(conn)
+			s.handleConn(c, cid)
+		}(conn, id)
 	}
 }
 
 // handleConn reads JSON-lines JSON-RPC 2.0 requests from conn,
 // dispatches each to the tool router, and writes responses back
 // on the same connection. One request per line; \n-delimited.
-func (s *SchedSocket) handleConn(conn net.Conn) {
+// Logs each dispatched method at Info so a flapping or
+// misbehaving MCP client is diagnosable from the log alone.
+func (s *SchedSocket) handleConn(conn net.Conn, connID uint64) {
 	defer conn.Close()
+	connLog := s.logger.With().Uint64("conn_id", connID).Logger()
+	start := time.Now()
+	var msgs uint64
+	defer func() {
+		connLog.Info().
+			Uint64("messages", msgs).
+			Dur("lifetime", time.Since(start)).
+			Msg("schedbridge disconnected")
+	}()
 
 	// bufio.Reader with a generous buffer for very long tool_call
 	// input schemas (e.g. long shell commands in cron_create).
@@ -142,17 +161,27 @@ func (s *SchedSocket) handleConn(conn net.Conn) {
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			msgs++
+			// Peek method for the log — dispatch parses again;
+			// cheap because lines are small JSON-RPC docs.
+			var peek jsonrpcReq
+			_ = json.Unmarshal(line, &peek)
+			method := peek.Method
+			if method == "" {
+				method = "<parse-error>"
+			}
+			connLog.Info().Str("method", method).Msg("schedbridge dispatch")
 			resp := s.dispatch(line)
 			if resp != nil {
 				if err := encoder.Encode(resp); err != nil {
-					s.logger.Debug().Err(err).Msg("write response failed; closing")
+					connLog.Warn().Err(err).Msg("schedbridge write response failed; closing")
 					return
 				}
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
-				s.logger.Debug().Err(err).Msg("read error on schedbridge conn")
+				connLog.Info().Err(err).Msg("schedbridge read error; closing")
 			}
 			return
 		}
