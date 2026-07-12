@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/calebcase/oops"
@@ -66,6 +67,17 @@ type Bot struct {
 	// place (still the latest) or post a new one (something else
 	// was posted after).
 	latestPostTS sync.Map // key "channel:thread" -> string messageTS
+
+	// lastEventAt is the unix-nano timestamp of the most-recent
+	// Slack event routed through the socketmode middleware
+	// (excluding pings, which flow through slack-go internally and
+	// don't reach our handlers). Used by the event-starvation
+	// watchdog to detect the failure mode from 2026-07-12 morning:
+	// WebSocket pings still arrived but the event delivery pipe
+	// silently starved for 11+ minutes. Watchdog logs a Warn if the
+	// gap grows past starvationThreshold so the log itself tells us
+	// something's wrong without needing a goroutine dump.
+	lastEventAt atomic.Int64
 
 	// permalinkCache memoizes chat.getPermalink lookups so the
 	// Home-tab renderer doesn't re-hit the API on every publish.
@@ -138,8 +150,58 @@ func (b *Bot) ResumeActiveSessions(ctx context.Context, maxAge time.Duration) {
 	b.handler.ResumeActiveSessions(ctx, maxAge)
 }
 
+// slackEventStarvationThreshold is how long we allow the event
+// pipe to be silent (no non-ping events) before logging a warn.
+// 2026-07-12 morning saw an 11-minute silent starvation while
+// pings still flowed — 5 minutes is well past any normal quiet
+// period and short enough to catch the pattern before the user
+// notices.
+const slackEventStarvationThreshold = 5 * time.Minute
+
+// runEventStarvationWatchdog logs a warn once per minute while
+// the socketmode event pipe has been silent longer than
+// slackEventStarvationThreshold. Bumps stop firing as soon as any
+// event arrives (lastEventAt is set by the middleware). Bounded
+// by ctx so it cleanly exits on Shutdown.
+//
+// Kept as a periodic warn (not a force-reconnect) because slack-go
+// v0.27.0+ is expected to handle the starvation on its own; this
+// watchdog is here to prove that when the next wedge happens.
+func (b *Bot) runEventStarvationWatchdog(ctx context.Context) {
+	// Prime lastEventAt so a startup silence isn't reported.
+	b.lastEventAt.Store(time.Now().UnixNano())
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	var lastWarnAt time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			last := time.Unix(0, b.lastEventAt.Load())
+			since := now.Sub(last)
+			if since < slackEventStarvationThreshold {
+				continue
+			}
+			// Warn at most once per minute so a long outage
+			// doesn't spam. Log includes the exact silence
+			// duration so operators know how bad it is.
+			if now.Sub(lastWarnAt) >= 1*time.Minute {
+				b.logger.Warn().
+					Dur("silence", since).
+					Time("last_event_at", last).
+					Msg("Slack event pipe starved: no non-ping events received")
+				lastWarnAt = now
+			}
+		}
+	}
+}
+
 func (b *Bot) Run(ctx context.Context) error {
 	b.logger.Info().Msg("starting socket mode connection")
+
+	// Event-starvation watchdog. Exits when ctx cancels.
+	go b.runEventStarvationWatchdog(ctx)
 
 	// Use the socketmode handler instead of manually reading from Events channel
 	err := b.socketHandler.RunEventLoopContext(ctx)
@@ -193,6 +255,7 @@ func (b *Bot) registerEventHandlers() {
 
 // handleEventsAPIMiddleware is the socketmode handler for Events API events.
 func (b *Bot) handleEventsAPIMiddleware(evt *socketmode.Event, client *socketmode.Client) {
+	b.lastEventAt.Store(time.Now().UnixNano())
 	fmt.Printf(">>> EVENTS API: %+v\n", evt.Type)
 
 	eventsAPIEvent, ok := evt.Data.(slackevents.EventsAPIEvent)
@@ -209,6 +272,7 @@ func (b *Bot) handleEventsAPIMiddleware(evt *socketmode.Event, client *socketmod
 
 // handleInteractiveMiddleware is the socketmode handler for interactive events.
 func (b *Bot) handleInteractiveMiddleware(evt *socketmode.Event, client *socketmode.Client) {
+	b.lastEventAt.Store(time.Now().UnixNano())
 	fmt.Printf(">>> INTERACTIVE EVENT: %+v\n", evt.Type)
 	b.logger.Info().Msg("received interactive event via socketmode handler")
 

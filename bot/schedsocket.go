@@ -170,11 +170,25 @@ func (s *SchedSocket) handleConn(conn net.Conn, connID uint64) {
 			if method == "" {
 				method = "<parse-error>"
 			}
-			connLog.Info().Str("method", method).Msg("schedbridge dispatch")
+			dispatchStart := time.Now()
 			resp := s.dispatch(line)
+			// Log AFTER dispatch so we get elapsed_ms. If dispatch
+			// itself ever wedges, the connection-close log line
+			// (deferred) will still show `messages` count and
+			// lifetime — enough to spot which method never
+			// returned.
+			connLog.Info().
+				Str("method", method).
+				Dur("elapsed", time.Since(dispatchStart)).
+				Bool("has_response", resp != nil).
+				Msg("schedbridge dispatch")
 			if resp != nil {
+				writeStart := time.Now()
 				if err := encoder.Encode(resp); err != nil {
-					connLog.Warn().Err(err).Msg("schedbridge write response failed; closing")
+					connLog.Warn().
+						Err(err).
+						Dur("write_elapsed", time.Since(writeStart)).
+						Msg("schedbridge write response failed; closing")
 					return
 				}
 			}
