@@ -1,7 +1,7 @@
 #!/bin/env bash
 set -euo pipefail
 
-CLOD_VERSION="0.37.2"
+CLOD_VERSION="0.37.3"
 
 reinit=${CLOD_REINIT:-false}
 noninteractive=${CLOD_NONINTERACTIVE:-false}
@@ -161,8 +161,26 @@ if [[ -n "\${CLOD_RUNTIME_DIR:-}" && -x "\${CLOD_RUNTIME_DIR}/clodproxy" && -z "
     sleep 0.1
   done
   if (( proxy_up )); then
+    # Two-pronged routing:
+    #  - ANTHROPIC_BASE_URL: the SDK sends plain HTTP to loopback,
+    #    hitting our reverse-proxy path — gives us per-request
+    #    tracing for the main /v1/messages calls.
+    #  - HTTPS_PROXY: every OTHER outbound HTTPS (statsig, sentry,
+    #    docs.anthropic.com, etc.) is intercepted by claude-code
+    #    per its documented corporate-proxy support and CONNECT-
+    #    tunneled through us — gives us idle-timeout enforcement
+    #    so the between-turn CLOSE_WAIT class of wedges can't
+    #    accumulate on any endpoint. Discovered from eagle
+    #    2026-07-12 13:19Z wedge on a Datadog / Statsig-adjacent IP
+    #    that was NOT api.anthropic.com and thus bypassed the
+    #    reverse-proxy path.
+    #  - NO_PROXY: don't proxy loopback (matters for permbridge /
+    #    schedbridge / in-container health checks).
     export ANTHROPIC_BASE_URL="http://127.0.0.1:8788/"
-    echo "[wrapper] clodproxy healthy — ANTHROPIC_BASE_URL=\${ANTHROPIC_BASE_URL}" >&2
+    export HTTPS_PROXY="http://127.0.0.1:8788/"
+    export HTTP_PROXY="http://127.0.0.1:8788/"
+    export NO_PROXY="localhost,127.0.0.1,::1"
+    echo "[wrapper] clodproxy healthy — routing api.anthropic.com direct + all other HTTPS via CONNECT tunnel" >&2
   else
     echo "[wrapper] clodproxy failed to come up; falling back to direct Anthropic" >&2
   fi
