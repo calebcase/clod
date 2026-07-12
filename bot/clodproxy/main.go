@@ -242,24 +242,183 @@ func main() {
 		_, _ = io.WriteString(w, "clodproxy upstream error: "+err.Error()+"\n")
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok\n")
+	tunnelIdleTimeout := *bodyIdleTimeout // reuse the same knob for CONNECT tunnels
+	var tunnelSeq atomic.Uint64
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// HTTPS_PROXY intercepts every outbound HTTPS from claude
+		// and issues CONNECT to us before doing the TLS handshake.
+		// We can't inspect the tunneled bytes (they're TLS), but
+		// we CAN detect "no bytes flowing in either direction for
+		// N seconds" at the TCP splice level and close the tunnel.
+		// That is enough to break the between-turn CLOSE_WAIT pool
+		// wedge for endpoints outside api.anthropic.com (statsig,
+		// sentry, etc.) — same failure mode we observed on eagle
+		// at 13:19Z with a wedged direct connection to a Datadog
+		// / Statsig-adjacent IP.
+		if r.Method == http.MethodConnect {
+			handleConnect(w, r, tunnelIdleTimeout, tunnelSeq.Add(1))
+			return
+		}
+		if r.URL.Path == "/healthz" {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok\n")
+			return
+		}
+		proxy.ServeHTTP(w, r)
 	})
-	mux.Handle("/", proxy)
 
 	srv := &http.Server{
 		Addr:              *listenAddr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
-	logf("listening on %s → %s (conn_idle=%v body_idle=%v)",
-		*listenAddr, u.String(), *idleConnTimeout, *bodyIdleTimeout)
+	logf("listening on %s → %s (conn_idle=%v body_idle=%v tunnel_idle=%v)",
+		*listenAddr, u.String(), *idleConnTimeout, *bodyIdleTimeout, tunnelIdleTimeout)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logf("serve: %v", err)
 		os.Exit(1)
 	}
+}
+
+// handleConnect implements HTTP CONNECT tunnel mode. Claude sends
+// `CONNECT api.anthropic.com:443 HTTP/1.1` when HTTPS_PROXY points
+// at us; we dial the upstream, hijack the client conn, splice bytes
+// bidirectionally, and enforce an idle-timeout at the TCP level.
+// Body-level tracing isn't possible (TLS-encrypted) — we only see
+// byte counts and idle time.
+//
+// The idle-timeout closure is what makes this useful. Between
+// turns the tunnel sits idle; if the upstream (or a middlebox)
+// silently half-closes, claude's undici agent won't notice until
+// it tries to write on the tunnel again — that's the eagle wedge
+// class. Our timeout closes both ends so claude sees EOF and
+// drops the pool entry.
+func handleConnect(w http.ResponseWriter, r *http.Request, idleTimeout time.Duration, id uint64) {
+	target := r.Host // for CONNECT, r.Host holds "host:port"
+	started := time.Now()
+	logf("connect#%d TARGET %s ua=%q", id, target, r.Header.Get("User-Agent"))
+
+	upstream, err := net.DialTimeout("tcp", target, 30*time.Second)
+	if err != nil {
+		logf("connect#%d DIAL_FAIL dur=%s err=%v", id, time.Since(started).Round(time.Millisecond), err)
+		http.Error(w, "clodproxy CONNECT dial failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer upstream.Close()
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		upstream.Close()
+		logf("connect#%d HIJACK_UNSUPPORTED", id)
+		http.Error(w, "clodproxy CONNECT: hijack unsupported", http.StatusInternalServerError)
+		return
+	}
+	client, buf, err := hijacker.Hijack()
+	if err != nil {
+		upstream.Close()
+		logf("connect#%d HIJACK_ERR: %v", id, err)
+		return
+	}
+	defer client.Close()
+
+	// Ack the CONNECT. The write must happen BEFORE any tunneled
+	// bytes flow — claude waits for this line before starting its
+	// TLS handshake over the tunnel.
+	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		logf("connect#%d ACK_WRITE_ERR: %v", id, err)
+		return
+	}
+
+	// If the hijacked reader has any bytes already buffered from the
+	// CONNECT request line (unusual but possible), forward them to
+	// upstream so the TLS handshake sees a clean stream.
+	if buf != nil && buf.Reader != nil {
+		if n := buf.Reader.Buffered(); n > 0 {
+			pre := make([]byte, n)
+			if _, err := io.ReadFull(buf.Reader, pre); err == nil {
+				_, _ = upstream.Write(pre)
+			}
+		}
+	}
+
+	logf("connect#%d ESTABLISHED dur=%s", id, time.Since(started).Round(time.Millisecond))
+	tunnelBytes(client, upstream, idleTimeout, id, target, started)
+}
+
+// tunnelBytes runs two goroutines splicing bytes between the client
+// and upstream, plus an idle watchdog that closes both sides when
+// no data has moved in either direction for `idleTimeout`. Returns
+// when both directions have terminated. Total byte counts and
+// close reason logged on exit.
+func tunnelBytes(client, upstream net.Conn, idleTimeout time.Duration, id uint64, target string, started time.Time) {
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	var toUpstream, toClient atomic.Int64
+	var idleAborted atomic.Bool
+
+	stopWatchdog := make(chan struct{})
+	go func() {
+		tick := idleTimeout / 4
+		if tick < 5*time.Second {
+			tick = 5 * time.Second
+		}
+		ticker := time.NewTicker(tick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWatchdog:
+				return
+			case now := <-ticker.C:
+				last := time.Unix(0, lastActivity.Load())
+				since := now.Sub(last)
+				if since > idleTimeout {
+					idleAborted.Store(true)
+					logf("connect#%d IDLE_ABORT target=%s idle=%s to_upstream=%d to_client=%d",
+						id, target, since.Round(time.Millisecond),
+						toUpstream.Load(), toClient.Load())
+					_ = client.Close()
+					_ = upstream.Close()
+					return
+				}
+			}
+		}
+	}()
+
+	done := make(chan struct{}, 2)
+	copyOne := func(dst, src net.Conn, counter *atomic.Int64) {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				lastActivity.Store(time.Now().UnixNano())
+				counter.Add(int64(n))
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	go copyOne(upstream, client, &toUpstream)
+	go copyOne(client, upstream, &toClient)
+
+	// Wait for one direction to end; force the other side to unblock.
+	<-done
+	close(stopWatchdog)
+	_ = client.Close()
+	_ = upstream.Close()
+	<-done
+
+	reason := "peer_close"
+	if idleAborted.Load() {
+		reason = "idle_abort"
+	}
+	logf("connect#%d END target=%s reason=%s dur=%s to_upstream=%d to_client=%d",
+		id, target, reason, time.Since(started).Round(time.Millisecond),
+		toUpstream.Load(), toClient.Load())
 }
