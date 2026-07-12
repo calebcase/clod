@@ -443,7 +443,7 @@ func (h *Handler) handleLargeZipConfirm(
 	}
 }
 
-// uploadZipWithProgress wraps UploadFileV2 with a counting reader
+// uploadZipWithProgress wraps UploadFile with a counting reader
 // so the user sees byte-level progress while the staging zip is
 // streamed to Slack. Used for both the small-zip and large-zip
 // (post-confirmation) paths since either can take a noticeable
@@ -470,7 +470,7 @@ func (h *Handler) uploadZipWithProgress(channelID, threadTS, zipPath, comment st
 		},
 	}
 
-	params := slack.UploadFileV2Parameters{
+	params := slack.UploadFileParameters{
 		Reader:          pr,
 		FileSize:        int(totalBytes),
 		Filename:        filepath.Base(zipPath),
@@ -479,7 +479,7 @@ func (h *Handler) uploadZipWithProgress(channelID, threadTS, zipPath, comment st
 		ThreadTimestamp: threadTS,
 		InitialComment:  comment,
 	}
-	_, err = h.bot.client.UploadFileV2(params)
+	_, err = h.bot.client.UploadFile(params)
 	if err != nil {
 		h.finalizeNamedProgressMessage(channelID, threadTS, "upload",
 			fmt.Sprintf(":x: *Upload failed* `%s`: %v", filepath.Base(zipPath), err), logger)

@@ -192,8 +192,8 @@ func (f *FileHandler) UploadFromTaskOutputs(
 		return nil, oops.Trace(err)
 	}
 
-	// Use UploadFileV2 (the new API).
-	params := slack.UploadFileV2Parameters{
+	// Use UploadFile (v2 API is now default in slack-go 0.27).
+	params := slack.UploadFileParameters{
 		File:            localPath,
 		FileSize:        int(info.Size()),
 		Filename:        filepath.Base(localPath),
@@ -203,7 +203,7 @@ func (f *FileHandler) UploadFromTaskOutputs(
 		InitialComment:  comment,
 	}
 
-	summary, err := f.client.UploadFileV2(params)
+	summary, err := f.client.UploadFile(params)
 	if err != nil {
 		return nil, oops.Trace(err)
 	}
@@ -232,7 +232,7 @@ func (f *FileHandler) UploadSnippet(
 		Str("channel", channelID).
 		Msg("uploading snippet to Slack")
 
-	params := slack.UploadFileV2Parameters{
+	params := slack.UploadFileParameters{
 		Content:         content,
 		FileSize:        len(content),
 		Filename:        title + ".txt",
@@ -242,7 +242,7 @@ func (f *FileHandler) UploadSnippet(
 		ThreadTimestamp: threadTS,
 	}
 
-	summary, err := f.client.UploadFileV2(params)
+	summary, err := f.client.UploadFile(params)
 	if err != nil {
 		return nil, oops.Trace(err)
 	}
