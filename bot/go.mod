@@ -1,13 +1,15 @@
 module github.com/calebcase/clod/bot
 
-go 1.23.2
+go 1.25
+
+toolchain go1.25.12
 
 require (
 	github.com/alecthomas/kong v1.13.0
 	github.com/calebcase/oops v0.0.12
 	github.com/mattn/go-isatty v0.0.20
 	github.com/rs/zerolog v1.34.0
-	github.com/slack-go/slack v0.17.3
+	github.com/slack-go/slack v0.27.0
 )
 
 require (
