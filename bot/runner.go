@@ -280,6 +280,23 @@ type RunningTask struct {
 	// a bot restart mid-task doesn't orphan the thread.
 	sessionIDCaptured chan string
 	sessionIDOnce     sync.Once
+	// inputWaitingSince is the unix-nano timestamp of the most-
+	// recent SendInput call for which no downstream stream event
+	// has yet arrived. Set by SendInput; cleared by the stream
+	// parser on the next parsed line. Used by the liveness ticker
+	// to detect the specific wedge class where claude receives
+	// stdin bytes but its Node event loop never gets around to
+	// composing a new HTTP request — same fingerprint as upstream
+	// #54434 observed on eagle 2026-07-13 11:50Z where the user's
+	// question sat un-processed for 30+ minutes despite all our
+	// proxy / connection layer being healthy.
+	//
+	// Threshold picked at 60s: a normal turn from stdin input to
+	// first stream event runs 1–5s (claude spawns request +
+	// upstream latency); 60s is well past any legitimate cold-
+	// start jitter and shorter than we'd want to sit unnoticed.
+	inputWaitingSince atomic.Int64
+
 	// lastStreamAt is the timestamp of the most-recent parsed line
 	// from claude's stream-json stdout. Used by the liveness ticker
 	// as a proxy for "the model is actively producing output".
@@ -516,6 +533,13 @@ func (t *RunningTask) SendInputWithImages(text string, images []ImageData) error
 	if _, err := t.stdin.Write(append(data, '\n')); err != nil {
 		return oops.Trace(err)
 	}
+	// Arm the input-response watchdog. The liveness ticker will
+	// warn if no stream event arrives within its threshold. Only
+	// arm if not already armed — repeated SendInput without an
+	// intervening response (rare but possible for control
+	// messages during a running turn) shouldn't reset the clock
+	// and hide a wedge.
+	t.inputWaitingSince.CompareAndSwap(0, time.Now().UnixNano())
 	return nil
 }
 
@@ -1374,6 +1398,12 @@ func (r *Runner) Start(
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		var alive bool
+		// inputWedgeWarnedAt tracks the input-arming timestamp we
+		// most recently warned about, so we don't spam the same
+		// wedge every tick. A fresh SendInput resets
+		// inputWaitingSince to a new nanosecond value, which
+		// distinguishes it from the one we already warned about.
+		var inputWedgeWarnedFor int64
 		// Sends are gated on runCtx to avoid racing the outer
 		// goroutine's `close(task.output)`. The outer goroutine's
 		// defer chain cancels runCtx first, then waits on
@@ -1421,6 +1451,24 @@ func (r *Runner) Start(
 					alive = false
 					r.logger.Info().Dur("since_last_stream", since).Msg("liveness transition -> STALE")
 					send("__STALE__")
+				}
+				// Input-response watchdog: SendInput → stream event
+				// should be near-instant (1–5s typical). If it's
+				// been >60s and we haven't warned for THIS input
+				// event yet, warn. This catches the 2026-07-13
+				// wedge class where claude receives stdin but its
+				// Node event loop never composes a new HTTP
+				// request — invisible to the HTTP-layer probes,
+				// visible here.
+				armed := task.inputWaitingSince.Load()
+				if armed != 0 && armed != inputWedgeWarnedFor {
+					waited := time.Since(time.Unix(0, armed))
+					if waited > 60*time.Second {
+						r.logger.Warn().
+							Dur("waited", waited).
+							Msg("claude did not respond to input within 60s — likely internal event-loop wedge (upstream claude-code #54434 class)")
+						inputWedgeWarnedFor = armed
+					}
 				}
 			}
 		}
@@ -1538,6 +1586,20 @@ func (r *Runner) Start(
 			// is bumped on every line rather than a periodic
 			// keep-alive (there isn't one in stream-json).
 			task.lastStreamAt.Store(time.Now())
+
+			// Clear the input-response watchdog. A stream event
+			// arriving from claude means it processed some stdin
+			// input; we're no longer waiting on a first-response
+			// to a specific SendInput call. If a follow-up
+			// SendInput happens without an intervening response
+			// it will re-arm.
+			if prev := task.inputWaitingSince.Swap(0); prev != 0 {
+				elapsed := time.Since(time.Unix(0, prev))
+				r.logger.Info().
+					Dur("since_input", elapsed).
+					Str("type", msg.Type).
+					Msg("input-response watchdog disarmed by stream event")
+			}
 
 			// Extract session ID if present
 			if msg.SessionID != "" && task.sessionID == "" {
