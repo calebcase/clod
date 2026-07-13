@@ -488,7 +488,28 @@ func slackTSGreater(a, b string) bool {
 	return a > b
 }
 
-// PostMessage sends a message to a channel.
+// slackPostRetryBackoffs is the retry schedule for transient Slack
+// API failures on PostMessage / UpdateMessage. Total wall clock
+// ~3.5s across 3 retries. Slack's server side handles rate limits
+// with 429 + Retry-After; slack-go's client honors that
+// transparently, so this outer retry is for network blips and 5xx
+// only. Kept small enough that a real outage doesn't stall the
+// output loop for long. The 2026-07-13 "response got lost after
+// restart" bug traced to handlers.go swallowing PostMessage errors
+// at Debug — with retries here the transient failures self-heal
+// before the caller sees an error at all.
+var slackPostRetryBackoffs = []time.Duration{
+	500 * time.Millisecond,
+	1500 * time.Millisecond,
+	3000 * time.Millisecond,
+}
+
+// PostMessage sends a message to a channel with retry-on-transient
+// -failure. Bot.PostMessage is the single fan-in for claude → Slack
+// traffic; every call is logged (Info on success, Warn on retry,
+// Error on final failure) so a "response got lost" investigation
+// can grep one file. Preview capped at 80 chars keeps the log
+// readable without dumping full model output.
 func (b *Bot) PostMessage(channelID, text string, threadTS string) (string, error) {
 	opts := []slack.MsgOption{
 		slack.MsgOptionText(text, false),
@@ -496,11 +517,52 @@ func (b *Bot) PostMessage(channelID, text string, threadTS string) (string, erro
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
-
-	_, ts, err := b.client.PostMessage(channelID, opts...)
+	preview := text
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+	start := time.Now()
+	var ts string
+	var err error
+	for attempt := 0; attempt <= len(slackPostRetryBackoffs); attempt++ {
+		if attempt > 0 {
+			time.Sleep(slackPostRetryBackoffs[attempt-1])
+		}
+		_, ts, err = b.client.PostMessage(channelID, opts...)
+		if err == nil {
+			break
+		}
+		if attempt < len(slackPostRetryBackoffs) {
+			b.logger.Warn().
+				Err(err).
+				Int("attempt", attempt+1).
+				Str("channel", channelID).
+				Str("thread", threadTS).
+				Int("bytes", len(text)).
+				Str("preview", preview).
+				Msg("PostMessage failed, retrying")
+		}
+	}
+	elapsed := time.Since(start)
 	if err != nil {
+		b.logger.Error().
+			Err(err).
+			Str("channel", channelID).
+			Str("thread", threadTS).
+			Int("bytes", len(text)).
+			Str("preview", preview).
+			Dur("elapsed", elapsed).
+			Msg("PostMessage failed after all retries; message lost")
 		return "", oops.Trace(err)
 	}
+	b.logger.Info().
+		Str("channel", channelID).
+		Str("thread", threadTS).
+		Str("ts", ts).
+		Int("bytes", len(text)).
+		Str("preview", preview).
+		Dur("elapsed", elapsed).
+		Msg("PostMessage ok")
 	b.recordPost(channelID, threadTS, ts)
 	return ts, nil
 }
@@ -593,16 +655,53 @@ func (b *Bot) PermalinkFor(channelID, messageTS string) string {
 	return url
 }
 
-// UpdateMessage updates an existing message.
+// UpdateMessage updates an existing message with the same retry
+// policy as PostMessage.
 func (b *Bot) UpdateMessage(channelID, ts, text string) error {
-	_, _, _, err := b.client.UpdateMessage(
-		channelID,
-		ts,
-		slack.MsgOptionText(text, false),
-	)
+	preview := text
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+	start := time.Now()
+	var err error
+	for attempt := 0; attempt <= len(slackPostRetryBackoffs); attempt++ {
+		if attempt > 0 {
+			time.Sleep(slackPostRetryBackoffs[attempt-1])
+		}
+		_, _, _, err = b.client.UpdateMessage(channelID, ts, slack.MsgOptionText(text, false))
+		if err == nil {
+			break
+		}
+		if attempt < len(slackPostRetryBackoffs) {
+			b.logger.Warn().
+				Err(err).
+				Int("attempt", attempt+1).
+				Str("channel", channelID).
+				Str("ts", ts).
+				Int("bytes", len(text)).
+				Str("preview", preview).
+				Msg("UpdateMessage failed, retrying")
+		}
+	}
+	elapsed := time.Since(start)
 	if err != nil {
+		b.logger.Error().
+			Err(err).
+			Str("channel", channelID).
+			Str("ts", ts).
+			Int("bytes", len(text)).
+			Str("preview", preview).
+			Dur("elapsed", elapsed).
+			Msg("UpdateMessage failed after all retries; edit lost")
 		return oops.Trace(err)
 	}
+	b.logger.Info().
+		Str("channel", channelID).
+		Str("ts", ts).
+		Int("bytes", len(text)).
+		Str("preview", preview).
+		Dur("elapsed", elapsed).
+		Msg("UpdateMessage ok")
 	return nil
 }
 
