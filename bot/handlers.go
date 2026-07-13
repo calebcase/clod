@@ -3829,6 +3829,12 @@ func (h *Handler) runClod(
 					if age < maxConsolidationAge && combinedLen <= maxMessageLen {
 						combined := last.Content + separator + newContent
 						if err := h.bot.UpdateMessage(channelID, last.MessageTS, combined); err != nil {
+							// Bot.UpdateMessage already retries + logs
+							// Warn/Error internally. Falling through to
+							// PostMessage below is fine — it recovers by
+							// posting a fresh message. Debug is enough
+							// here because the loud logging already
+							// happened one layer down.
 							logger.Debug().Err(err).Msg("failed to update consolidated message, posting new")
 						} else {
 							// Update tracking with new content and time.
@@ -3846,7 +3852,23 @@ func (h *Handler) runClod(
 				// Post new message if consolidation didn't happen.
 				if !posted {
 					if msgTS, err := h.bot.PostMessage(channelID, newContent, threadTS); err != nil {
-						logger.Debug().Err(err).Msg("failed to post output message")
+						// After Bot.PostMessage's internal retries have
+						// all failed the content is truly lost — no
+						// downstream fallback. Warn with a preview so
+						// operators can grep the log and see exactly
+						// what didn't reach Slack. This was the source
+						// of the "response got lost after restart"
+						// pattern observed on 2026-07-13 — the swallow
+						// used to be at Debug (invisible by default).
+						preview := newContent
+						if len(preview) > 120 {
+							preview = preview[:117] + "..."
+						}
+						logger.Warn().
+							Err(err).
+							Int("bytes_lost", len(newContent)).
+							Str("preview", preview).
+							Msg("failed to post output message; content dropped")
 					} else {
 						// Track this as the new last message.
 						h.lastOutputMsg.Store(threadKey, &LastOutputMsg{
