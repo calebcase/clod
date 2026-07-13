@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -72,12 +73,20 @@ type Bot struct {
 	// Slack event routed through the socketmode middleware
 	// (excluding pings, which flow through slack-go internally and
 	// don't reach our handlers). Used by the event-starvation
-	// watchdog to detect the failure mode from 2026-07-12 morning:
-	// WebSocket pings still arrived but the event delivery pipe
-	// silently starved for 11+ minutes. Watchdog logs a Warn if the
-	// gap grows past starvationThreshold so the log itself tells us
-	// something's wrong without needing a goroutine dump.
+	// watchdog as a cheap first-pass indicator that something MIGHT
+	// be wrong — a real starvation is then confirmed by polling
+	// Slack directly (see runEventStarvationWatchdog) so a quiet
+	// Sunday afternoon doesn't fire the warn every minute.
 	lastEventAt atomic.Int64
+
+	// lastMessageTSByThread tracks the highest inbound Slack
+	// message TS we've observed on each session thread, keyed by
+	// "channelID:threadTS". Updated when handleCallbackEvent
+	// dispatches a MessageEvent or AppMentionEvent. Used by the
+	// starvation watchdog to poll conversations.replies with
+	// oldest=<this> and detect messages Slack has that we
+	// haven't received via Socket Mode.
+	lastMessageTSByThread sync.Map // key "channel:thread" -> string TS
 
 	// permalinkCache memoizes chat.getPermalink lookups so the
 	// Home-tab renderer doesn't re-hit the API on every publish.
@@ -151,28 +160,43 @@ func (b *Bot) ResumeActiveSessions(ctx context.Context, maxAge time.Duration) {
 }
 
 // slackEventStarvationThreshold is how long we allow the event
-// pipe to be silent (no non-ping events) before logging a warn.
-// 2026-07-12 morning saw an 11-minute silent starvation while
-// pings still flowed — 5 minutes is well past any normal quiet
-// period and short enough to catch the pattern before the user
-// notices.
+// pipe to be silent (no non-ping events) before we start actively
+// probing Slack for missed messages. 5 min is well past any
+// normal quiet period.
 const slackEventStarvationThreshold = 5 * time.Minute
 
-// runEventStarvationWatchdog logs a warn once per minute while
-// the socketmode event pipe has been silent longer than
-// slackEventStarvationThreshold. Bumps stop firing as soon as any
-// event arrives (lastEventAt is set by the middleware). Bounded
-// by ctx so it cleanly exits on Shutdown.
+// runEventStarvationWatchdog probes Slack directly to confirm real
+// starvation rather than relying on a naked timeout. Every minute,
+// if the local event pipe has been silent longer than
+// slackEventStarvationThreshold, iterate the currently-running
+// tasks and call conversations.replies on each session's thread
+// with oldest = the last message TS we processed via Socket Mode.
+// Any returned messages are ones Slack has but we don't — the
+// smoking gun for socket-mode starvation.
 //
-// Kept as a periodic warn (not a force-reconnect) because slack-go
-// v0.27.0+ is expected to handle the starvation on its own; this
-// watchdog is here to prove that when the next wedge happens.
+// Design choices to keep noise low:
+//  - Only probes while at least one task is actively running.
+//    A truly idle bot has no expected events, so silence is
+//    normal and shouldn't fire.
+//  - Only warns when Slack itself confirms missed messages. Time
+//    alone is not enough to justify a warn.
+//  - Each thread warns at most once per starvation episode; the
+//    warn is repeated only after a fresh event arrives (which
+//    clears the lastWarnedTS memory).
+//
+// Runs bounded by ctx so it exits cleanly on Shutdown.
 func (b *Bot) runEventStarvationWatchdog(ctx context.Context) {
 	// Prime lastEventAt so a startup silence isn't reported.
 	b.lastEventAt.Store(time.Now().UnixNano())
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	var lastWarnAt time.Time
+
+	// lastWarnedForTS tracks the last TS we already warned about
+	// per thread so we don't repeat the same warn every minute for
+	// the same stuck message. Cleared implicitly when a newer
+	// message arrives and updates lastMessageTSByThread.
+	var lastWarnedForTS sync.Map // key "channel:thread" -> string TS
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -183,18 +207,119 @@ func (b *Bot) runEventStarvationWatchdog(ctx context.Context) {
 			if since < slackEventStarvationThreshold {
 				continue
 			}
-			// Warn at most once per minute so a long outage
-			// doesn't spam. Log includes the exact silence
-			// duration so operators know how bad it is.
-			if now.Sub(lastWarnAt) >= 1*time.Minute {
-				b.logger.Warn().
-					Dur("silence", since).
-					Time("last_event_at", last).
-					Msg("Slack event pipe starved: no non-ping events received")
-				lastWarnAt = now
+			// Only probe if the bot has any running task.
+			// Idle bot → silence is expected → don't waste
+			// Slack API calls confirming the obvious.
+			if b.handler == nil {
+				continue
 			}
+			activeCount := 0
+			b.handler.runningTasks.Range(func(k, v any) bool {
+				activeCount++
+				return true
+			})
+			if activeCount == 0 {
+				continue
+			}
+			b.probeMissedMessages(ctx, since, &lastWarnedForTS)
 		}
 	}
+}
+
+// probeMissedMessages walks the currently-running tasks and asks
+// Slack directly via conversations.replies whether it has messages
+// beyond the last TS we've processed. Any returned messages are
+// proof of a socket-mode starvation and get logged at Warn.
+//
+// Errors from the Slack API are logged at Debug — the probe is
+// diagnostic, so a transient failure isn't itself an alarm.
+func (b *Bot) probeMissedMessages(ctx context.Context, silence time.Duration, lastWarnedForTS *sync.Map) {
+	if b.client == nil {
+		return
+	}
+	b.handler.runningTasks.Range(func(k, v any) bool {
+		key, _ := k.(string)
+		// key format is "channelID:threadTS"; split on the first
+		// colon. threadTS itself doesn't contain a colon.
+		colon := strings.Index(key, ":")
+		if colon < 0 {
+			return true
+		}
+		channelID := key[:colon]
+		threadTS := key[colon+1:]
+
+		lastTSAny, _ := b.lastMessageTSByThread.Load(key)
+		lastTS, _ := lastTSAny.(string)
+		if lastTS == "" {
+			// No baseline to compare against — we haven't
+			// observed any message on this thread yet.
+			// Fall back to the thread's own TS so we can at
+			// least see if there's ANY message we've missed.
+			lastTS = threadTS
+		}
+
+		params := &slack.GetConversationRepliesParameters{
+			ChannelID: channelID,
+			Timestamp: threadTS,
+			Oldest:    lastTS,
+			Limit:     20,
+		}
+		msgs, _, _, err := b.client.GetConversationRepliesContext(ctx, params)
+		if err != nil {
+			b.logger.Debug().
+				Err(err).
+				Str("channel", channelID).
+				Str("thread", threadTS).
+				Msg("starvation probe: conversations.replies failed")
+			return true
+		}
+		// Slack returns messages >= oldest inclusive. Drop the
+		// pivot itself so we're only reporting truly-newer ones.
+		var missed []slack.Message
+		for i := range msgs {
+			if msgs[i].Timestamp != lastTS {
+				missed = append(missed, msgs[i])
+			}
+		}
+		if len(missed) == 0 {
+			return true
+		}
+		// Highest TS in the missed set — used as the "already
+		// warned for this" cursor so we don't repeat every
+		// minute for a persistent starvation.
+		highestMissed := missed[0].Timestamp
+		for i := 1; i < len(missed); i++ {
+			if missed[i].Timestamp > highestMissed {
+				highestMissed = missed[i].Timestamp
+			}
+		}
+		if prevAny, ok := lastWarnedForTS.Load(key); ok {
+			if prev, _ := prevAny.(string); prev == highestMissed {
+				return true
+			}
+		}
+		lastWarnedForTS.Store(key, highestMissed)
+
+		// Summarize the missed messages for the log — user_id
+		// + text head so the operator can see what got stranded.
+		summaries := make([]string, 0, len(missed))
+		for _, m := range missed {
+			text := m.Text
+			if len(text) > 80 {
+				text = text[:77] + "..."
+			}
+			summaries = append(summaries, fmt.Sprintf("ts=%s user=%s text=%q", m.Timestamp, m.User, text))
+		}
+		b.logger.Warn().
+			Str("channel", channelID).
+			Str("thread", threadTS).
+			Dur("silence", silence).
+			Str("last_seen_ts", lastTS).
+			Int("missed_count", len(missed)).
+			Strs("missed", summaries).
+			Msg("Slack event pipe starvation CONFIRMED: Slack has messages we did not receive")
+		return true
+	})
 }
 
 func (b *Bot) Run(ctx context.Context) error {
@@ -309,8 +434,10 @@ func (b *Bot) handleEventsAPIEvent(ctx context.Context, evt slackevents.EventsAP
 func (b *Bot) handleCallbackEvent(ctx context.Context, innerEvent slackevents.EventsAPIInnerEvent) {
 	switch ev := innerEvent.Data.(type) {
 	case *slackevents.AppMentionEvent:
+		b.bumpLastMessageTS(ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp)
 		b.handler.HandleAppMention(ctx, ev)
 	case *slackevents.MessageEvent:
+		b.bumpLastMessageTS(ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp)
 		b.handler.HandleMessage(ctx, ev)
 	case *slackevents.ReactionAddedEvent:
 		b.handler.HandleReactionAdded(ctx, ev)
@@ -323,6 +450,38 @@ func (b *Bot) handleCallbackEvent(ctx context.Context, innerEvent slackevents.Ev
 			Str("type", innerEvent.Type).
 			Msg("unhandled callback event type")
 	}
+}
+
+// bumpLastMessageTS records the TS of a Slack message the bot
+// received via Socket Mode, keyed by the thread it belongs to. The
+// starvation watchdog polls conversations.replies with
+// oldest=<this> to confirm Slack has no additional messages we
+// haven't seen. threadTS falls back to messageTS for top-level
+// messages (Slack's convention for treating a lone message as its
+// own thread parent).
+func (b *Bot) bumpLastMessageTS(channelID, threadTS, messageTS string) {
+	if channelID == "" || messageTS == "" {
+		return
+	}
+	if threadTS == "" {
+		threadTS = messageTS
+	}
+	k := channelID + ":" + threadTS
+	// Store the max — Slack event delivery is generally ordered
+	// but a defensive max avoids regressing on out-of-order events.
+	if prev, ok := b.lastMessageTSByThread.Load(k); ok {
+		if s, _ := prev.(string); slackTSGreater(s, messageTS) {
+			return
+		}
+	}
+	b.lastMessageTSByThread.Store(k, messageTS)
+}
+
+// slackTSGreater returns true if a > b as Slack timestamps.
+// Slack TS is "seconds.microseconds" as a string; string
+// comparison works because both halves are fixed-width.
+func slackTSGreater(a, b string) bool {
+	return a > b
 }
 
 // PostMessage sends a message to a channel.
