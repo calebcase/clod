@@ -273,11 +273,15 @@ func (b *Bot) probeMissedMessages(ctx context.Context, silence time.Duration, la
 				Msg("starvation probe: conversations.replies failed")
 			return true
 		}
-		// Slack returns messages >= oldest inclusive. Drop the
-		// pivot itself so we're only reporting truly-newer ones.
+		// Slack returns messages >= oldest inclusive AND
+		// conversations.replies ALWAYS includes the thread parent
+		// as the first item regardless of oldest. Filter to
+		// strictly-newer TS so we don't false-positive on either.
+		// Slack TS is "seconds.microseconds" as a fixed-width
+		// string, so plain string > compares correctly.
 		var missed []slack.Message
 		for i := range msgs {
-			if msgs[i].Timestamp != lastTS {
+			if msgs[i].Timestamp > lastTS {
 				missed = append(missed, msgs[i])
 			}
 		}
