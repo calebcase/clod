@@ -158,6 +158,15 @@ type Handler struct {
 	// Consecutive outputs are edited into the same message to reduce notification noise.
 	lastOutputMsg sync.Map // key -> *LastOutputMsg
 
+	// lastWedgeRestartAt tracks the wall-clock time of the most-
+	// recent wedge auto-restart per progressKey. Used as a per-
+	// session cooldown: if a session wedges again within
+	// wedgeRestartCooldown of its last auto-restart, we log and
+	// give up rather than looping. Prevents the pathological case
+	// of a permanently-broken session eating restart cycles
+	// forever.
+	lastWedgeRestartAt sync.Map // key -> time.Time
+
 	defaultVerbosityLevel int
 
 	// defaultModel is the fallback model passed to `claude --model` when a
@@ -1819,6 +1828,86 @@ func (h *Handler) restartRunningTaskForSettingChange(channelID, threadTS, reason
 		// upstream Slack event ctx, which is short-lived.
 		h.runClod(context.Background(), channelID, session.UserID, session.TaskPath, session.TaskName, nudge, session.SessionID, threadTS, logger)
 	}()
+}
+
+// wedgeRestartCooldown bounds how often a single session can be
+// auto-restarted for input-response wedge (upstream #54434).
+// Chosen at 10 min: enough to notice a persistent-broken session
+// and back off, short enough that a real transient wedge that
+// re-occurs on the fresh container gets a second attempt within
+// one working session. On cooldown expiration, the next wedge
+// triggers a fresh restart.
+const wedgeRestartCooldown = 10 * time.Minute
+
+// autoRestartWedgedTask is the input-response watchdog's recovery
+// path. Same primitives as restartRunningTaskForSettingChange, but
+// gated by a per-session cooldown so a permanently-broken session
+// can't restart-loop. Called from the output-loop's
+// __WEDGE_AUTO_RESTART__ sentinel handler; runs in its own
+// goroutine because Shutdown+resume takes several seconds and we
+// mustn't block the output loop.
+func (h *Handler) autoRestartWedgedTask(channelID, threadTS string, logger zerolog.Logger) {
+	progressKey := key(channelID, threadTS)
+	// Cooldown check: skip if we auto-restarted this session very
+	// recently. Log at Warn so operators still see the wedge
+	// happened even though we're not restarting — otherwise the
+	// signal is silent whenever the cooldown is active.
+	if prev, ok := h.lastWedgeRestartAt.Load(progressKey); ok {
+		if last, _ := prev.(time.Time); time.Since(last) < wedgeRestartCooldown {
+			logger.Warn().
+				Dur("since_last_restart", time.Since(last)).
+				Dur("cooldown", wedgeRestartCooldown).
+				Msg("wedge auto-restart skipped: cooldown active (session likely persistently broken)")
+			return
+		}
+	}
+	val, ok := h.runningTasks.Load(progressKey)
+	if !ok {
+		return
+	}
+	runningTask := val.(*RunningTask)
+	session := h.bot.sessions.Get(channelID, threadTS)
+	if session == nil || session.SessionID == "" {
+		logger.Warn().Msg("can't auto-restart wedged task: no captured session id")
+		return
+	}
+	h.lastWedgeRestartAt.Store(progressKey, time.Now())
+	h.expectedTaskCancels.Store(progressKey, true)
+
+	// Post the "detected wedge" notice BEFORE Shutdown so the user
+	// sees the recovery start immediately, not only after the
+	// (potentially slow) graceful shutdown grace period.
+	if _, err := h.bot.PostMessage(channelID,
+		":arrows_counterclockwise: Detected internal claude wedge (no response to your input in 60s); auto-restarting session…",
+		threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post wedge-detected notice")
+	}
+
+	logger.Warn().Msg("auto-restarting session due to input-response wedge")
+
+	// Graceful shutdown with save-state prompt. Claude in a wedged
+	// event loop is unlikely to respond, so the grace period will
+	// probably expire and Shutdown will force-kill the container.
+	// Either path unblocks runningTask.Done() below.
+	runningTask.Shutdown(context.Background(),
+		"Auto-restarting session after detecting internal wedge (upstream claude-code #54434). "+DefaultSaveStateMessage,
+		h.bot.gracefulShutdownTTL)
+	select {
+	case <-runningTask.Done():
+	case <-time.After(60 * time.Second):
+		logger.Warn().Msg("timeout waiting for wedged task to exit; abandoning auto-restart")
+		h.expectedTaskCancels.Delete(progressKey)
+		return
+	}
+	time.Sleep(250 * time.Millisecond)
+
+	if _, err := h.bot.PostMessage(channelID,
+		":arrows_counterclockwise: Session restarted. Continuing from your last message…",
+		threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post wedge-resume notice")
+	}
+	nudge := "The session was auto-restarted after detecting an internal claude event-loop wedge (upstream #54434). The user's most recent message may need to be re-answered — check the thread and respond to whatever they last asked. Do not redo work already completed and reported."
+	h.runClod(context.Background(), channelID, session.UserID, session.TaskPath, session.TaskName, nudge, session.SessionID, threadTS, logger)
 }
 
 // effortLevels are the values claude-code's `/effort` command
@@ -4017,6 +4106,17 @@ func (h *Handler) runClod(
 			if strings.HasPrefix(content, "__PROGRESS__") {
 				line := strings.TrimPrefix(content, "__PROGRESS__")
 				h.updateProgressMessage(channelID, threadTS, line, logger)
+				continue
+			}
+
+			// Runner's input-response watchdog signaled a wedge —
+			// auto-restart the session. Spawned as a goroutine so
+			// this output loop doesn't block waiting for shutdown
+			// (which needs task.done, which is drained by this same
+			// output loop). Handler applies a cooldown so a
+			// permanently-broken session can't restart-loop.
+			if content == "__WEDGE_AUTO_RESTART__" {
+				go h.autoRestartWedgedTask(channelID, threadTS, logger)
 				continue
 			}
 
