@@ -1468,6 +1468,13 @@ func (r *Runner) Start(
 							Dur("waited", waited).
 							Msg("claude did not respond to input within 60s — likely internal event-loop wedge (upstream claude-code #54434 class)")
 						inputWedgeWarnedFor = armed
+						// Signal the handler to auto-restart this
+						// session. Handler applies a per-session
+						// cooldown so a tight restart loop can't
+						// happen. Send is bounded by runCtx via
+						// the same `send` helper that gates the
+						// ALIVE/STALE sentinels.
+						send("__WEDGE_AUTO_RESTART__")
 					}
 				}
 			}
