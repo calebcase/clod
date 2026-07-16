@@ -1460,8 +1460,18 @@ func (r *Runner) Start(
 				// Node event loop never composes a new HTTP
 				// request — invisible to the HTTP-layer probes,
 				// visible here.
+				//
+				// Gate on "we've seen a stream event before" via
+				// lastAt.IsZero(). Cold-start (docker build + image
+				// pull + claude boot) can take multiple minutes for
+				// a brand-new session directory. Firing the watchdog
+				// during that window is always a false positive —
+				// claude hasn't started reading stdin yet, so of
+				// course there's no response. Once claude has ever
+				// spoken, the container is warm and any subsequent
+				// input-without-response IS a real wedge.
 				armed := task.inputWaitingSince.Load()
-				if armed != 0 && armed != inputWedgeWarnedFor {
+				if armed != 0 && armed != inputWedgeWarnedFor && !lastAt.IsZero() {
 					waited := time.Since(time.Unix(0, armed))
 					if waited > 60*time.Second {
 						r.logger.Warn().

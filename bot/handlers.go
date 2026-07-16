@@ -1871,6 +1871,16 @@ func (h *Handler) autoRestartWedgedTask(channelID, threadTS string, logger zerol
 		logger.Warn().Msg("can't auto-restart wedged task: no captured session id")
 		return
 	}
+	// User-initiated close wins over the watchdog. If the session has
+	// been explicitly closed (Active=false), do NOT auto-restart —
+	// spinning a fresh container back up would revive a session the
+	// user has deliberately shut down. Close paths set Active=false
+	// BEFORE cancelling the running task, so by the time this
+	// sentinel is processed the flag reflects the user's intent.
+	if !session.Active {
+		logger.Info().Msg("wedge auto-restart skipped: session was closed by user")
+		return
+	}
 	h.lastWedgeRestartAt.Store(progressKey, time.Now())
 	h.expectedTaskCancels.Store(progressKey, true)
 
