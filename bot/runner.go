@@ -798,6 +798,70 @@ func (t *RunningTask) stopContainer(pathLabel string) {
 	}
 }
 
+// stopOrphanContainersForTaskPath finds every running container whose
+// name matches this task's `clod-<name>-<id>-*` prefix and issues a
+// `docker stop` on it. Called from Runner.Start immediately before
+// spawning the new container so that a leftover container from a
+// prior invocation cannot coexist with the fresh one for the same
+// session.
+//
+// This is a belt-and-suspenders defense against the class of bug
+// where a runClod goroutine's exit path completed (map entry
+// Delete-d, next runClod started) but the underlying container did
+// not tear down — observed on eerie-eagle 2026-07-17 where two
+// containers ran `claude --resume 4ba521cf...` in parallel for 15h.
+// Root cause of the goroutine-vs-container divergence is unclear,
+// but a defensive sweep here makes the "two containers per session"
+// state impossible regardless of upstream cause.
+//
+// name/id come from <taskPath>/.clod/name and .clod/id, the same
+// files bin/clod reads to construct the container name (see line
+// ~524 of bin/clod). Every failure mode is tolerated (missing files,
+// docker daemon unreachable, stop timeout): we don't want the
+// orphan-check to block a legitimate task start.
+func stopOrphanContainersForTaskPath(taskPath string, logger zerolog.Logger) {
+	nameBytes, err := os.ReadFile(filepath.Join(taskPath, ".clod", "name"))
+	if err != nil {
+		logger.Debug().Err(err).Msg("orphan-check: no .clod/name; skipping")
+		return
+	}
+	idBytes, err := os.ReadFile(filepath.Join(taskPath, ".clod", "id"))
+	if err != nil {
+		logger.Debug().Err(err).Msg("orphan-check: no .clod/id; skipping")
+		return
+	}
+	name := strings.ToLower(strings.TrimSpace(string(nameBytes)))
+	id := strings.TrimSpace(string(idBytes))
+	if name == "" || id == "" {
+		return
+	}
+	prefix := fmt.Sprintf("^clod-%s-%s-", name, id)
+	psCtx, psCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer psCancel()
+	out, err := exec.CommandContext(psCtx, "docker", "ps", "-q", "--filter", "name="+prefix).Output()
+	if err != nil {
+		logger.Debug().Err(err).Str("prefix", prefix).Msg("orphan-check: docker ps failed; skipping")
+		return
+	}
+	cids := strings.Fields(string(out))
+	if len(cids) == 0 {
+		return
+	}
+	logger.Warn().
+		Strs("cids", cids).
+		Str("prefix", prefix).
+		Msg("orphan containers found for this task; stopping before new spawn")
+	for _, cid := range cids {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := exec.CommandContext(stopCtx, "docker", "stop", "-t", "5", cid).Run(); err != nil {
+			logger.Warn().Err(err).Str("cid", cid).Msg("orphan-check: docker stop failed")
+		} else {
+			logger.Info().Str("cid", cid).Msg("orphan-check: docker stop ok")
+		}
+		stopCancel()
+	}
+}
+
 // SessionID returns the session ID once captured.
 func (t *RunningTask) GetSessionID() string {
 	return t.sessionID
@@ -990,6 +1054,14 @@ func (r *Runner) Start(
 	// only "timed out after 24h" hides that gap.
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	runStart := time.Now()
+
+	// Belt-and-suspenders: kill any orphan container whose name
+	// matches this task's prefix before we spawn a new one. Prevents
+	// the "two containers per session" state observed 2026-07-17.
+	// Safe to call unconditionally: a normally-completed task leaves
+	// no matching container behind, so this is a no-op in the
+	// common case.
+	stopOrphanContainersForTaskPath(taskPath, r.logger)
 
 	// Create permission FIFO for MCP communication (must be done before building args).
 	// Pass empty string to generate a unique runtime suffix for concurrent instances.
