@@ -595,6 +595,16 @@ func (t *RunningTask) SendPermissionResponse(resp PermissionResponse) {
 		return
 	}
 	t.permissionFIFO.SendResponse(resp)
+	// Arm the input-response watchdog. A permission response is
+	// input to claude just like a text message: claude should
+	// process it and emit stream events. Without arming here,
+	// post-askq wedges (claude receives the response, then its
+	// event loop stalls before producing any output) are invisible
+	// to the watchdog — the earlier SendInput arm was disarmed by
+	// the askq tool_use stream event, so nothing is left to time
+	// out on. See 2026-07-18 eagle silence between 09:28 askq
+	// answer and no further output.
+	t.inputWaitingSince.CompareAndSwap(0, time.Now().UnixNano())
 }
 
 // ControlPermissionRequests returns the channel for receiving permission requests
@@ -626,8 +636,15 @@ func (t *RunningTask) SendControlResponse(requestID, behavior, message string) e
 		Str("behavior", behavior).
 		Msg("sending control_response")
 
-	_, err = t.stdin.Write(append(data, '\n'))
-	return oops.Trace(err)
+	if _, err := t.stdin.Write(append(data, '\n')); err != nil {
+		return oops.Trace(err)
+	}
+	// Arm the input-response watchdog. Same reasoning as
+	// SendPermissionResponse — the control_response IS the input
+	// claude is blocked on, and a wedge processing it would
+	// otherwise be undetectable.
+	t.inputWaitingSince.CompareAndSwap(0, time.Now().UnixNano())
+	return nil
 }
 
 // Done returns the channel that receives the final result.
