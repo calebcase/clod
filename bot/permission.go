@@ -609,6 +609,22 @@ func (p *PermissionFIFO) Close() {
 		}
 	}
 
+	// Symmetric poke for the response-FIFO writer: writeResponses
+	// can be stuck inside a blocking os.OpenFile(O_WRONLY) if the
+	// container's permbridge died before opening the reader — see
+	// 2026-07-19 eerie-eagle 00:21 where the orphan-check killed a
+	// container mid-askq and the user's answer arrived after, so
+	// the writer's target FIFO had no reader and never would. A
+	// brief O_RDONLY|O_NONBLOCK open unblocks the writer's open()
+	// syscall; ctx cancellation (already fired above) then routes
+	// it through the ctx.Err() check inside writeResponses so it
+	// exits cleanly instead of looping to write a dead response.
+	if p.responsePath != "" {
+		if fd, err := syscall.Open(p.responsePath, syscall.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
+			_ = syscall.Close(fd)
+		}
+	}
+
 	// Remove the FIFOs
 	_ = os.Remove(p.requestPath)  // Ignore error if already removed
 	_ = os.Remove(p.responsePath) // Ignore error if already removed
