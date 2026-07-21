@@ -777,6 +777,7 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 					task.SendPermissionResponse(*resp)
 				}
 				h.pendingPermissions.Delete(progressKey)
+				task.SetAwaitingUserResponse(false)
 
 				// Update the permission message to show it was handled
 				h.updatePermissionMessage(perm, resp.Behavior, ev.User, "")
@@ -4682,6 +4683,13 @@ func (h *Handler) handlePermissionRequest(
 		ToolName:  req.ToolName,
 		ToolInput: req.ToolInput,
 	})
+	// Gate the input-response watchdog: claude is now blocked in a
+	// permission-FIFO read; text SendInputs made while we wait will
+	// queue in claude's stdin buffer and are processed only after
+	// the user's answer resolves the block. Cleared in the answer
+	// path (parsePermissionResponse in HandleMessage, the button
+	// callback, the askq submit callback).
+	task.SetAwaitingUserResponse(true)
 
 	// Clear consolidation since permission prompt breaks the chain.
 	h.lastOutputMsg.Delete(threadKey)
@@ -4748,6 +4756,8 @@ func (h *Handler) handleControlPermissionRequest(
 		ControlRequestID:    task.pendingControlRequestID,
 		IsControlPermission: true,
 	})
+	// See handlePermissionRequest above for rationale.
+	task.SetAwaitingUserResponse(true)
 
 	h.lastOutputMsg.Delete(threadKey)
 
@@ -4882,6 +4892,7 @@ func (h *Handler) autoDiscussPendingPermission(
 		task.SendPermissionResponse(resp)
 	}
 	h.pendingPermissions.Delete(progressKey)
+	task.SetAwaitingUserResponse(false)
 
 	// If the pending was an AskUserQuestion, clear its state and
 	// use its own prompt-message TS for the update (that's the
@@ -5229,6 +5240,7 @@ func (h *Handler) HandleBlockAction(
 
 	// Clear pending state
 	h.pendingPermissions.Delete(actionValue.ThreadKey)
+	task.SetAwaitingUserResponse(false)
 
 	// Update the permission message to show it was handled
 	h.updatePermissionMessage(pending, actionValue.Behavior, callback.User.ID, actionValue.Remember)
@@ -6349,6 +6361,7 @@ func (h *Handler) handleAmbiguousAction(
 			task.SendPermissionResponse(resp)
 		}
 		h.pendingPermissions.Delete(actionValue.ThreadKey)
+		task.SetAwaitingUserResponse(false)
 		// Rewrite the ORIGINAL permission prompt to show the outcome — same
 		// visual treatment as a direct button click on the prompt.
 		h.updatePermissionMessage(pending, actionValue.Behavior, callback.User.ID, "")
