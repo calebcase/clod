@@ -6094,6 +6094,13 @@ func (h *Handler) handleAskQuestionFinal(
 	} else {
 		task.SendPermissionResponse(resp)
 	}
+	// Clear the input-response watchdog's "claude is blocked on a
+	// user answer" gate — otherwise the watchdog can never fire
+	// again for this task, and post-answer wedges become invisible
+	// (2026-07-22 eerie-eagle: askq answered at 03:06:49, gate
+	// stayed true, user sent text at 09:47:55 that produced no
+	// response but the watchdog didn't fire).
+	task.SetAwaitingUserResponse(false)
 
 	// Update the prompt message with the outcome.
 	var updated string
@@ -6285,6 +6292,11 @@ func (h *Handler) handleAskQuestionDiscussSubmit(
 	} else {
 		task.SendPermissionResponse(resp)
 	}
+	// Same fix as handleAskQuestionFinal: this is a permission-
+	// answering path so the "claude is blocked on user" gate must
+	// clear here, or the input-response watchdog stays permanently
+	// suppressed for the task.
+	task.SetAwaitingUserResponse(false)
 
 	// Update the original prompt so the thread reflects who
 	// requested the discussion and what they said.
