@@ -301,22 +301,6 @@ type RunningTask struct {
 	// false-positive fires where user was mid-typing a response.
 	inputWaitingSince atomic.Int64
 
-	// awaitingUserResponse is true when the bot has posted a
-	// permission prompt (AskUserQuestion or an MCP/control permission
-	// request) to Slack and is waiting for the user to answer. While
-	// this is true the input-response watchdog MUST NOT fire, because
-	// claude is legitimately blocked reading the permission FIFO or
-	// awaiting a control_response — any text SendInput calls made in
-	// this window will queue in claude's stdin buffer and be processed
-	// only after the permission resolves. Set by the handler when it
-	// routes a permission to Slack; cleared when the user's answer is
-	// sent back to claude (dispatchAskq, permission button, etc.).
-	// See eerie-eagle 2026-07-20 post-mortem: user sent text right as
-	// claude posted an askq, watchdog fired at 60s because claude
-	// couldn't process the text — it was blocked on the askq the user
-	// hadn't yet answered.
-	awaitingUserResponse atomic.Bool
-
 	// lastStreamAt is the timestamp of the most-recent parsed line
 	// from claude's stream-json stdout. Used by the liveness ticker
 	// as a proxy for "the model is actively producing output".
@@ -624,13 +608,7 @@ func (t *RunningTask) SendPermissionResponse(resp PermissionResponse) {
 	// the askq tool_use stream event, so nothing is left to time
 	// out on. See 2026-07-18 eagle silence between 09:28 askq
 	// answer and no further output.
-	//
-	// Store (not CAS): unconditionally reset the clock to now. If a
-	// SendInput happened while claude was blocked on the permission,
-	// its arm timestamp is stale (the whole "wait" was the user
-	// thinking, not claude wedging). Resetting means the 60s budget
-	// starts from when claude actually could have begun processing.
-	t.inputWaitingSince.Store(time.Now().UnixNano())
+	t.inputWaitingSince.CompareAndSwap(0, time.Now().UnixNano())
 }
 
 // ControlPermissionRequests returns the channel for receiving permission requests
@@ -668,26 +646,14 @@ func (t *RunningTask) SendControlResponse(requestID, behavior, message string) e
 	// Arm the input-response watchdog. Same reasoning as
 	// SendPermissionResponse — the control_response IS the input
 	// claude is blocked on, and a wedge processing it would
-	// otherwise be undetectable. Store (not CAS) so a stale arm
-	// from a SendInput made during the block is reset to now.
-	t.inputWaitingSince.Store(time.Now().UnixNano())
+	// otherwise be undetectable.
+	t.inputWaitingSince.CompareAndSwap(0, time.Now().UnixNano())
 	return nil
 }
 
 // Done returns the channel that receives the final result.
 func (t *RunningTask) Done() <-chan *Result {
 	return t.done
-}
-
-// SetAwaitingUserResponse toggles the flag the input-response
-// watchdog reads to know whether claude is legitimately blocked on a
-// human answer to a permission prompt (in which case any queued
-// SendInput cannot possibly wedge claude — it will process the input
-// after the permission resolves). Handler flips this true right after
-// posting a permission prompt to Slack, false right after the user's
-// answer is dispatched back to claude.
-func (t *RunningTask) SetAwaitingUserResponse(waiting bool) {
-	t.awaitingUserResponse.Store(waiting)
 }
 
 // Cancel cancels the running task without giving the agent a chance
@@ -1598,16 +1564,19 @@ func (r *Runner) Start(
 				// spoken, the container is warm and any subsequent
 				// input-without-response IS a real wedge.
 				//
-				// Also gate on awaitingUserResponse: while claude is
-				// blocked on a permission prompt (askq / MCP perm),
-				// any text SendInput queues but can't be processed
-				// until the user's answer resolves the block. That's
-				// not a wedge — it's the user thinking about the
-				// question. See eerie-eagle 2026-07-20 wedges class
-				// where user typed a text message right as claude
-				// posted an askq and the watchdog fired at 60s.
+				// No awaitingUserResponse gate — 2026-07-22 revert.
+				// Previously we suppressed the watchdog while claude
+				// was blocked on an askq to avoid firing during user
+				// think-time, but the state was hard to keep in sync
+				// with every permission-answer code path (missing a
+				// clear point left the watchdog permanently disabled
+				// on the task, wedging eagle 2026-07-22 for hours).
+				// Simpler and more robust: if the user types during
+				// an askq and the answer takes >2m, accept the
+				// occasional false-positive container restart. Full
+				// container shutdown is idempotent.
 				armed := task.inputWaitingSince.Load()
-				if armed != 0 && armed != inputWedgeWarnedFor && !lastAt.IsZero() && !task.awaitingUserResponse.Load() {
+				if armed != 0 && armed != inputWedgeWarnedFor && !lastAt.IsZero() {
 					waited := time.Since(time.Unix(0, armed))
 					if waited > 2*time.Minute {
 						r.logger.Warn().

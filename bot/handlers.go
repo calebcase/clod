@@ -777,7 +777,6 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 					task.SendPermissionResponse(*resp)
 				}
 				h.pendingPermissions.Delete(progressKey)
-				task.SetAwaitingUserResponse(false)
 
 				// Update the permission message to show it was handled
 				h.updatePermissionMessage(perm, resp.Behavior, ev.User, "")
@@ -4683,13 +4682,6 @@ func (h *Handler) handlePermissionRequest(
 		ToolName:  req.ToolName,
 		ToolInput: req.ToolInput,
 	})
-	// Gate the input-response watchdog: claude is now blocked in a
-	// permission-FIFO read; text SendInputs made while we wait will
-	// queue in claude's stdin buffer and are processed only after
-	// the user's answer resolves the block. Cleared in the answer
-	// path (parsePermissionResponse in HandleMessage, the button
-	// callback, the askq submit callback).
-	task.SetAwaitingUserResponse(true)
 
 	// Clear consolidation since permission prompt breaks the chain.
 	h.lastOutputMsg.Delete(threadKey)
@@ -4756,8 +4748,6 @@ func (h *Handler) handleControlPermissionRequest(
 		ControlRequestID:    task.pendingControlRequestID,
 		IsControlPermission: true,
 	})
-	// See handlePermissionRequest above for rationale.
-	task.SetAwaitingUserResponse(true)
 
 	h.lastOutputMsg.Delete(threadKey)
 
@@ -4892,7 +4882,6 @@ func (h *Handler) autoDiscussPendingPermission(
 		task.SendPermissionResponse(resp)
 	}
 	h.pendingPermissions.Delete(progressKey)
-	task.SetAwaitingUserResponse(false)
 
 	// If the pending was an AskUserQuestion, clear its state and
 	// use its own prompt-message TS for the update (that's the
@@ -5240,7 +5229,6 @@ func (h *Handler) HandleBlockAction(
 
 	// Clear pending state
 	h.pendingPermissions.Delete(actionValue.ThreadKey)
-	task.SetAwaitingUserResponse(false)
 
 	// Update the permission message to show it was handled
 	h.updatePermissionMessage(pending, actionValue.Behavior, callback.User.ID, actionValue.Remember)
@@ -6094,13 +6082,6 @@ func (h *Handler) handleAskQuestionFinal(
 	} else {
 		task.SendPermissionResponse(resp)
 	}
-	// Clear the input-response watchdog's "claude is blocked on a
-	// user answer" gate — otherwise the watchdog can never fire
-	// again for this task, and post-answer wedges become invisible
-	// (2026-07-22 eerie-eagle: askq answered at 03:06:49, gate
-	// stayed true, user sent text at 09:47:55 that produced no
-	// response but the watchdog didn't fire).
-	task.SetAwaitingUserResponse(false)
 
 	// Update the prompt message with the outcome.
 	var updated string
@@ -6292,11 +6273,6 @@ func (h *Handler) handleAskQuestionDiscussSubmit(
 	} else {
 		task.SendPermissionResponse(resp)
 	}
-	// Same fix as handleAskQuestionFinal: this is a permission-
-	// answering path so the "claude is blocked on user" gate must
-	// clear here, or the input-response watchdog stays permanently
-	// suppressed for the task.
-	task.SetAwaitingUserResponse(false)
 
 	// Update the original prompt so the thread reflects who
 	// requested the discussion and what they said.
@@ -6373,7 +6349,6 @@ func (h *Handler) handleAmbiguousAction(
 			task.SendPermissionResponse(resp)
 		}
 		h.pendingPermissions.Delete(actionValue.ThreadKey)
-		task.SetAwaitingUserResponse(false)
 		// Rewrite the ORIGINAL permission prompt to show the outcome — same
 		// visual treatment as a direct button click on the prompt.
 		h.updatePermissionMessage(pending, actionValue.Behavior, callback.User.ID, "")
