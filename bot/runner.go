@@ -1581,15 +1581,19 @@ func (r *Runner) Start(
 					if waited > 2*time.Minute {
 						r.logger.Warn().
 							Dur("waited", waited).
-							Msg("claude did not respond to input within 2m — likely internal event-loop wedge (upstream claude-code #54434 class)")
+							Msg("claude did not respond to input within 2m — likely internal event-loop wedge (upstream claude-code #54434 class); auto-restart DISABLED per user directive 2026-07-22")
 						inputWedgeWarnedFor = armed
-						// Signal the handler to auto-restart this
-						// session. Handler applies a per-session
-						// cooldown so a tight restart loop can't
-						// happen. Send is bounded by runCtx via
-						// the same `send` helper that gates the
-						// ALIVE/STALE sentinels.
-						send("__WEDGE_AUTO_RESTART__")
+						// Auto-restart disabled 2026-07-22 — the
+						// watchdog was firing false positives that
+						// killed containers mid-response. Detection
+						// stays on (Warn above) as forensic signal,
+						// but no __WEDGE_AUTO_RESTART__ sentinel is
+						// sent, so the handler never restarts. Real
+						// wedges will now require manual bot/session
+						// restart. To re-enable: uncomment the send
+						// below.
+						//
+						// send("__WEDGE_AUTO_RESTART__")
 					}
 				}
 			}
