@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"net/http"
+	_ "net/http/pprof" // side-effect: register /debug/pprof/* on DefaultServeMux
 	"os"
+	"strings"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -328,6 +329,19 @@ func (b *Bot) probeMissedMessages(ctx context.Context, silence time.Duration, la
 
 func (b *Bot) Run(ctx context.Context) error {
 	b.logger.Info().Msg("starting socket mode connection")
+
+	// pprof endpoint on loopback for live diagnosis. When the bot
+	// stalls (stuck stdout reader, blocked goroutine, etc.), `curl
+	// http://127.0.0.1:6060/debug/pprof/goroutine?debug=2` from the
+	// host gives a full goroutine dump without killing the process.
+	// Bound to 127.0.0.1 so it's not reachable off-host. Bind failure
+	// is warn-only — pprof is diagnostic, never load-bearing.
+	go func() {
+		srv := &http.Server{Addr: "127.0.0.1:6060"}
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			b.logger.Warn().Err(err).Msg("pprof server exited")
+		}
+	}()
 
 	// Event-starvation watchdog. Exits when ctx cancels.
 	go b.runEventStarvationWatchdog(ctx)
