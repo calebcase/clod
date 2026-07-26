@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/calebcase/oops"
-	"github.com/creack/pty"
 	"github.com/rs/zerolog"
 )
 
@@ -220,15 +219,12 @@ type ControlResponse struct {
 // RunningTask represents a clod task that is currently executing.
 type RunningTask struct {
 	cmd *exec.Cmd
-	// pty is the master side of a PTY whose slave is wired to the child's
-	// stdout. We never write to it; stream-json output flows out of it.
-	pty *os.File
-	// stdin is a pipe whose reader end is the child's stdin. Writes on this
-	// pipe go straight through docker (-i, no -t) into claude's stream-json
-	// reader inside the container. We intentionally do NOT use the PTY for
-	// stdin because the kernel line discipline (canonical mode, echo, the
-	// MAX_CANON line length cap, ^C/^D interpretation) has no place in a
-	// stream-json transport.
+	// stdout is the read end of the pipe carrying claude's stream-json
+	// output. The write end lives inside the docker CLI subprocess as fd 1.
+	stdout *os.File
+	// stdin is the write end of a pipe whose read end is the child's stdin.
+	// Writes on this pipe go straight through `docker run -i` into claude's
+	// stream-json reader inside the container.
 	stdin                     *os.File
 	output                    chan string
 	done                      chan *Result
@@ -1236,29 +1232,24 @@ func (r *Runner) Start(
 		Bool("CLOD_NONINTERACTIVE", true).
 		Msg("setting environment variables for clod run")
 
-	// Wire up the child's three standard streams with three different
-	// transports, each chosen for its role:
+	// Wire up the child's three standard streams as plain pipes. Nothing in
+	// the runtime path (claude in `-p --output-format stream-json` mode, the
+	// claude-wrapper entrypoint, or the SSH-agent forwarding claude uses via
+	// SSH_AUTH_SOCK) requires a TTY on stdout — verified 2026-07-25 with a
+	// full docker run using pipes on all three fds.
 	//
-	//   stdin  — plain pipe. The bot writes stream-json messages on this,
-	//            which flow through `docker run -i` straight into claude's
-	//            stream-json reader. A PTY is wrong here: its line discipline
-	//            would echo input, enforce MAX_CANON line length, and
-	//            interpret ^C/^D — none of that belongs in a JSON transport.
-	//
-	//   stdout — PTY slave. This is claude's stream-json output channel. A
-	//            TTY on stdout keeps any TTY-sniffing tooling inside the
-	//            wrapper (ssh-add, tput, etc.) happy AND keeps docker's
-	//            buildkit from flipping into some weird "I have no terminal"
-	//            fallback.
-	//
-	//   stderr — plain pipe. All wrapper chatter (upgrade banners, docker
-	//            build progress, [clod] SSH agent lifecycle) lands here and
-	//            gets logged at debug. Keeping it off the stdout PTY is what
-	//            lets stdout stay pure stream-json.
-	//
-	// pty.Start() would have bound stdin and stdout to the same PTY and
-	// assumed stderr too, so we do the setup manually.
-	ptmx, tty, err := pty.Open()
+	// Historical note: prior to v0.38.0 stdout was a PTY slave with default
+	// (cooked) termios. That layer sits between claude's stream-json output
+	// and the bot's scanner, and its line discipline / small buffer / lack
+	// of any way to observe stalls turned out to interact badly with long-
+	// idle `docker run -i` attach sockets: after ~2h of claude idle, output
+	// resumed but never crossed docker-CLI → PTY slave → PTY master, and the
+	// bot's scanner blocked forever on an empty read. Symptoms looked like
+	// upstream claude-code #54434 (a Node event-loop wedge) but were in fact
+	// a bot-side transport failure. Plain pipes remove the line discipline
+	// entirely and make the failure mode either an EOF (recoverable) or a
+	// visible backlog (measurable via /proc/*/fdinfo).
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		cancel()
 		permFIFO.Close()
@@ -1267,16 +1258,16 @@ func (r *Runner) Start(
 	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
 		cancel()
-		_ = ptmx.Close()
-		_ = tty.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		permFIFO.Close()
 		return nil, oops.Trace(err)
 	}
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
 		cancel()
-		_ = ptmx.Close()
-		_ = tty.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		_ = stdinR.Close()
 		_ = stdinW.Close()
 		permFIFO.Close()
@@ -1284,21 +1275,18 @@ func (r *Runner) Start(
 	}
 
 	cmd.Stdin = stdinR
-	cmd.Stdout = tty
+	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
-	// Setsid puts the child in its own session (clean signal group).
-	// Setctty + Ctty=1 makes the stdout tty the child's controlling terminal
-	// — we can't use the default Ctty=0 because stdin is a pipe, not a TTY.
+	// Setsid puts the child in its own session so signals sent to our
+	// process group don't hit docker run. No Setctty — we have no TTY.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid:  true,
-		Setctty: true,
-		Ctty:    1,
+		Setsid: true,
 	}
 
 	if err := cmd.Start(); err != nil {
 		cancel()
-		_ = ptmx.Close()
-		_ = tty.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		_ = stdinR.Close()
 		_ = stdinW.Close()
 		_ = stderrR.Close()
@@ -1307,10 +1295,10 @@ func (r *Runner) Start(
 		return nil, oops.Trace(err)
 	}
 
-	// The child inherited its own copies of tty, stdinR, and stderrW. Close
-	// our copies so EOF propagates correctly when the child exits and so we
-	// don't leak fds.
-	_ = tty.Close()
+	// The child inherited its own copies of stdoutW, stdinR, and stderrW.
+	// Close our copies so EOF propagates correctly when the child exits and
+	// so we don't leak fds.
+	_ = stdoutW.Close()
 	_ = stdinR.Close()
 	_ = stderrW.Close()
 
@@ -1413,7 +1401,7 @@ func (r *Runner) Start(
 
 	task := &RunningTask{
 		cmd:                       cmd,
-		pty:                       ptmx,
+		stdout:                    stdoutR,
 		stdin:                     stdinW,
 		output:                    make(chan string, 100),
 		done:                      make(chan *Result, 1),
@@ -1613,7 +1601,7 @@ func (r *Runner) Start(
 	if prompt != "" {
 		if err := task.SendInput(prompt); err != nil {
 			cancel()
-			_ = ptmx.Close()
+			_ = stdoutR.Close()
 			_ = stdinW.Close()
 			_ = stderrR.Close()
 			permFIFO.Close()
@@ -1621,7 +1609,7 @@ func (r *Runner) Start(
 		}
 	}
 
-	// Read from PTY and parse stream-json in background
+	// Read from stdout pipe and parse stream-json in background
 	go func() {
 		defer close(task.output)
 		// Wait for the liveness ticker to fully exit before letting
@@ -1638,7 +1626,7 @@ func (r *Runner) Start(
 			}
 		}()
 		defer close(task.done)
-		defer func() { _ = ptmx.Close() }()
+		defer func() { _ = stdoutR.Close() }()
 		defer task.closeStdin()
 		defer task.cancelWakeupTimer()
 		defer permFIFO.Close()
@@ -1658,19 +1646,29 @@ func (r *Runner) Start(
 			Input map[string]any
 		}
 		toolInfos := make(map[string]toolInfo)
-		scanner := bufio.NewScanner(ptmx)
-		// Increase buffer size for long lines
+		scanner := bufio.NewScanner(stdoutR)
+		// Per-line buffer cap. Sized well above any realistic
+		// stream-json message: individual tool_result blocks routinely
+		// carry inline base64 payloads (images from Read, screenshots,
+		// PDF/attachment content), and observed sizes up to ~1MB per
+		// image are common. A single line hitting the cap causes
+		// scanner.Scan() to return false with bufio.ErrTooLong, silently
+		// dropping the connection — verified via pprof on 2026-07-25 to
+		// be the actual "wedge" mode that had been misattributed to
+		// upstream #54434 for weeks. 64MB gives massive headroom for
+		// large screenshots, encoded PDFs, etc. Errors past this cap are
+		// caught by the scanner.Err() check after the loop.
+		const stdoutScanMax = 64 * 1024 * 1024
 		buf := make([]byte, 0, 64*1024)
-		scanner.Buffer(buf, 1024*1024)
+		scanner.Buffer(buf, stdoutScanMax)
 
 		// handshaken flips to true once we parse our first valid stream-json
 		// message (normally claude's system init). Before the handshake we
 		// silently tolerate non-JSON on stdout — the wrapper *shouldn't* be
 		// writing there anymore, but we stay permissive in case any stray
-		// bytes leak through (old .clod scripts on disk, PTY echo of our own
-		// input, etc.). After the handshake, stdout is supposed to be pure
-		// stream-json, so anything non-JSON is a real protocol violation and
-		// gets logged loudly.
+		// bytes leak through (old .clod scripts on disk, etc.). After the
+		// handshake, stdout is supposed to be pure stream-json, so anything
+		// non-JSON is a real protocol violation and gets logged loudly.
 		handshaken := false
 
 		for scanner.Scan() {
@@ -2083,6 +2081,25 @@ func (r *Runner) Start(
 						Msg("unknown message type")
 				}
 			}
+		}
+
+		// Loop exited: either normal EOF (child closed stdout, usually
+		// because the container is going away) or a scanner error. On
+		// error the goroutine is about to sit in cmd.Wait until the
+		// child exits, which won't happen on its own — the scanner has
+		// stopped draining but docker keeps trying to write. Cancel the
+		// run context so the runCtx.Done watcher tears the container
+		// down; cmd.Wait then returns promptly and the deferred cleanup
+		// fires. Log the exit reason unconditionally — v0.37 and prior
+		// exited silently on ErrTooLong (2026-07-25 root cause), so
+		// leave a forensic breadcrumb even in the nil-error EOF case.
+		if scanErr := scanner.Err(); scanErr != nil {
+			r.logger.Error().
+				Err(scanErr).
+				Msg("stdout scanner exited with error — canceling run ctx to unblock cmd.Wait")
+			cancel()
+		} else {
+			r.logger.Info().Msg("stdout scanner exited on EOF")
 		}
 
 		// Wait for process to complete
