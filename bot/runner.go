@@ -1063,13 +1063,19 @@ func (r *Runner) Start(
 	taskPath, prompt, sessionID, model, permissionMode string,
 	useClaudeDirect bool,
 ) (*RunningTask, error) {
-	// Create command with timeout context. runStart is captured so the
-	// error-return path below can report actual runtime, not just the
-	// nominal deadline — a container that outlives its ctx deadline
-	// (e.g. `docker run` orphaned from bash on ctx cancel) can push
-	// cmd.Wait() to return hours past the deadline, and reporting
-	// only "timed out after 24h" hides that gap.
-	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	// Create command with a plain cancel-only context. The r.timeout
+	// value (default 24h, CLOD_BOT_TIMEOUT) is enforced as an *idle*
+	// timeout by the liveness ticker below: it cancels runCtx if we go
+	// r.timeout without any stream event from claude. That preserves
+	// the runaway backstop for genuinely-hung sessions while letting
+	// long-running-but-active sessions (multi-day agent runs) keep
+	// working. Prior to v0.38.2 this was a wall-clock WithTimeout that
+	// killed active threads at the 24h mark. runStart is captured for
+	// the error-return path below — a container that outlives its ctx
+	// cancel (e.g. `docker run` orphaned from bash on ctx cancel) can
+	// push cmd.Wait() to return long after cancel; reporting the
+	// nominal "24h" would hide that gap.
+	runCtx, cancel := context.WithCancel(ctx)
 	runStart := time.Now()
 
 	// Belt-and-suspenders: kill any orphan container whose name
@@ -1583,6 +1589,26 @@ func (r *Runner) Start(
 						//
 						// send("__WEDGE_AUTO_RESTART__")
 					}
+				}
+
+				// Idle-timeout backstop. r.timeout (default 24h) is
+				// enforced against last stream activity rather than
+				// wall-clock elapsed since start. baseline = lastAt
+				// when we've seen any activity, else runStart so a
+				// session that never emits anything still eventually
+				// aborts. Firing here cancels runCtx, which triggers
+				// the container-stop watcher; cmd.Wait then unblocks
+				// and the deferred cleanup finalizes the task.
+				baseline := lastAt
+				if baseline.IsZero() {
+					baseline = runStart
+				}
+				if idle := time.Since(baseline); idle > r.timeout {
+					r.logger.Warn().
+						Dur("idle", idle).
+						Dur("timeout", r.timeout).
+						Msg("idle-timeout exceeded — canceling run ctx")
+					cancel()
 				}
 			}
 		}
