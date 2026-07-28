@@ -14,7 +14,12 @@ type ParsedMention struct {
 // mentionPattern matches: <@BOT_ID> task_name: instructions
 // Group 1: task name (non-whitespace characters before colon)
 // Group 2: instructions (everything after colon)
-var mentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+(\S+?):\s*(.+)`)
+//
+// (?s) is required so `.` in the instructions capture matches newlines.
+// Slack messages routinely span multiple lines; without dotall the
+// second line onwards is silently discarded. All patterns in this file
+// that capture user-provided free text set (?s) for the same reason.
+var mentionPattern = regexp.MustCompile(`(?s)<@[A-Z0-9]+>\s+(\S+?):\s*(.+)`)
 
 // ParseMention parses a Slack message containing a bot mention.
 // Expected format: "@Bot task_name: instructions here"
@@ -69,7 +74,7 @@ func ParseModelPrefix(text string) (rewritten string, model string) {
 
 // ParseContinuation parses a follow-up message in a thread (no task prefix needed).
 // Just strips the bot mention and returns the rest as instructions.
-var continuationPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s*(.*)`)
+var continuationPattern = regexp.MustCompile(`(?s)<@[A-Z0-9]+>\s*(.*)`)
 
 func ParseContinuation(text string) string {
 	matches := continuationPattern.FindStringSubmatch(text)
@@ -81,7 +86,7 @@ func ParseContinuation(text string) string {
 
 // autoNamePattern matches `<@BOT> :: instructions` — the shorthand for
 // "start a new task with an auto-generated memorable name".
-var autoNamePattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+::\s*(.+)`)
+var autoNamePattern = regexp.MustCompile(`(?s)<@[A-Z0-9]+>\s+::\s*(.+)`)
 
 // namedAutoPattern matches `<@BOT> <template>:: instructions` — the
 // shorthand for "auto-name a new task, copy the named sibling as the
@@ -91,13 +96,13 @@ var autoNamePattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+::\s*(.+)`)
 // no separating whitespace — that's what disambiguates this form from
 // `<@BOT> <name>: instructions` (explicit task) and `<@BOT> :: ...`
 // (no template).
-var namedAutoPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})::\s*(.+)`)
+var namedAutoPattern = regexp.MustCompile(`(?s)<@[A-Z0-9]+>\s+([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})::\s*(.+)`)
 
 // rootMentionPattern matches `<@BOT> *: instructions` — the shorthand
 // for "run clod directly in the workspace root" (rather than a
 // subdirectory task). The base dir itself is treated as the task; it
 // gets its own `.clod/` that clod initializes when missing.
-var rootMentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+\*:\s*(.+)`)
+var rootMentionPattern = regexp.MustCompile(`(?s)<@[A-Z0-9]+>\s+\*:\s*(.+)`)
 
 // ParseRootMention returns the instructions from a `@bot *: ...`
 // message, or empty string when the text doesn't match.
@@ -114,7 +119,7 @@ func ParseRootMention(text string) string {
 // sandbox, in the workspace root". The `!:` form is visually
 // distinct from `*:` to reinforce that the user is opting out of the
 // container isolation.
-var dangerousRootMentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>\s+!:\s*(.+)`)
+var dangerousRootMentionPattern = regexp.MustCompile(`(?s)<@[A-Z0-9]+>\s+!:\s*(.+)`)
 
 // ParseDangerousRootMention returns the instructions from a `@bot !: ...`
 // message, or empty string when the text doesn't match.
