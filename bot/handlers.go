@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,7 +32,7 @@ const startMsgTemplate = ":rocket: Starting work in the `%s` domain...\n\n" +
 	"field      | values                             | notes\n" +
 	"-----------+------------------------------------+--------------------------------\n" +
 	"verbosity  | +/- or 0/1/-1 (or 💬 / 🙈)         | 🙈 silent · summary · 💬 full\n" +
-	"model      | opus|sonnet|haiku (+/- cycles)     | 🎼 · 📜 · 🌸 · point releases ok\n" +
+	"model      | fable|opus|sonnet|haiku (+/- cycles)| 📖 · 🎼 · 📜 · 🌸 · point releases ok\n" +
 	"effort     | low|medium|high|xhigh|max (+/-)    | clear → model default\n" +
 	"plan       | on|off (or +/-)                    | 💭 on by default\n" +
 	"filesync   | on|off                             | sync project dir (non-recursive)\n" +
@@ -157,6 +158,15 @@ type Handler struct {
 	// Consecutive outputs are edited into the same message to reduce notification noise.
 	lastOutputMsg sync.Map // key -> *LastOutputMsg
 
+	// lastWedgeRestartAt tracks the wall-clock time of the most-
+	// recent wedge auto-restart per progressKey. Used as a per-
+	// session cooldown: if a session wedges again within
+	// wedgeRestartCooldown of its last auto-restart, we log and
+	// give up rather than looping. Prevents the pathological case
+	// of a permanently-broken session eating restart cycles
+	// forever.
+	lastWedgeRestartAt sync.Map // key -> time.Time
+
 	defaultVerbosityLevel int
 
 	// defaultModel is the fallback model passed to `claude --model` when a
@@ -245,6 +255,7 @@ const (
 	// Model-indicator emojis. Bot adds its own reaction to the task's
 	// status message to show which model is active; a user reacting with a
 	// different model emoji switches the active model for the thread.
+	fableEmoji  = "book"           // 📖 Fable
 	opusEmoji   = "musical_score"  // 🎼 Opus
 	sonnetEmoji = "scroll"         // 📜 Sonnet
 	haikuEmoji  = "cherry_blossom" // 🌸 Haiku
@@ -256,6 +267,18 @@ const (
 	// claude can't switch permission modes mid-session in stream-json
 	// mode.
 	planModeEmoji = "thought_balloon" // 💭 plan mode
+
+	// livenessEmoji marks "SSE stream is alive" on the anchor
+	// message. Added when the runner's liveness ticker observes
+	// pings arriving within the freshness window (~90s), removed
+	// when they stop (>120s). Presence = "claude is alive, waiting
+	// on a tool or the model"; absence during an active session =
+	// "SSE stalled, likely wedged". Distinguishes long tool waits
+	// (deltas silent, pings flowing) from the CLOSE_WAIT wedge class
+	// (both silent). Chosen because :satellite_antenna: visually
+	// reads as "receiving signal" and doesn't overlap with
+	// model/verbosity/plan-mode indicators already on the anchor.
+	livenessEmoji = "satellite_antenna" // 📡 SSE alive
 
 	// Default model string when no thread preference exists and no bot
 	// default is set. Matches a common --model alias.
@@ -269,13 +292,15 @@ const (
 // modelEmojis maps model strings (as accepted by `claude --model`) to the
 // Slack emoji used for their reaction indicator.
 var modelEmojis = map[string]string{
-	"opus":               opusEmoji,
-	"sonnet":             sonnetEmoji,
-	"claude-haiku-4-5":   haikuEmoji,
+	"claude-fable-5":   fableEmoji,
+	"opus":             opusEmoji,
+	"sonnet":           sonnetEmoji,
+	"claude-haiku-4-5": haikuEmoji,
 }
 
 // emojiToModel is the reverse mapping of modelEmojis for reaction handling.
 var emojiToModel = map[string]string{
+	fableEmoji:  "claude-fable-5",
 	opusEmoji:   "opus",
 	sonnetEmoji: "sonnet",
 	haikuEmoji:  "claude-haiku-4-5",
@@ -292,9 +317,12 @@ func emojiForModel(model string) string {
 	// claude-NAME-X-Y forms to their family. Covers what claude-
 	// code writes into `.clod/claude/settings.json` when you run
 	// `/model` in a session: `opus[1m]`, `sonnet[1m]`,
-	// `claude-opus-4-7`, `claude-haiku-4-5`, etc.
+	// `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`,
+	// `claude-haiku-4-5`, etc.
 	lower := strings.ToLower(model)
 	switch {
+	case strings.Contains(lower, "fable"):
+		return fableEmoji
 	case strings.Contains(lower, "opus"):
 		return opusEmoji
 	case strings.Contains(lower, "sonnet"):
@@ -756,14 +784,17 @@ func (h *Handler) HandleMessage(ctx context.Context, ev *slackevents.MessageEven
 				h.afterPermissionResolved(ev.Channel, threadTS, perm.ToolName, resp.Behavior, logger)
 				return
 			}
-			// Not a clear yes/no. Instead of a plaintext reminder, post a
-			// permission-style block message that quotes the user's text and
-			// offers buttons to route the intent — approve the pending
-			// permission, deny it, or cancel it and redirect the agent with
-			// the typed text as new instructions. This matches the style of
-			// the original permission prompt and handles the common case
-			// (user wants to redirect mid-task, not respond yes/no).
-			h.postAmbiguousResponsePrompt(ev.Channel, threadTS, ev.User, ev.Text, progressKey, logger)
+			// Not a clear yes/no. Auto-Discuss: deny the pending
+			// permission with the user's text baked into the
+			// tool_result so claude reads it as the tool response
+			// and answers directly. Replaces the older 3-button
+			// ambiguous-response prompt (Allow / Deny / Cancel &
+			// redirect), which routinely stranded the user's
+			// message when they forgot to click — observed in
+			// eerie-eagle 2026-07-02: a user request to revive
+			// hyper.md sat unrouted for hours because it hit the
+			// ambiguous prompt.
+			h.autoDiscussPendingPermission(ev.Channel, threadTS, ev.User, ev.Text, progressKey, perm, task, logger)
 			return
 		}
 
@@ -927,7 +958,21 @@ func (h *Handler) publishHomeView(userID string, knownHash string, logger zerolo
 	if includeWorkspace {
 		rollup = h.bot.sessions.UsageRollup(usageRollupWindows)
 	}
-	view := buildHomeTabView(sessions, rollup, h.bot.PermalinkFor, h.bot.LatestPermalinkFor, userID, includeWorkspace, Version)
+	// livenessFor resolves (channel, thread) to the last-parsed
+	// stream line's timestamp — populated only for sessions with an
+	// in-memory RunningTask (i.e. currently running, this bot
+	// instance). Idle sessions and sessions from other bot instances
+	// yield zero time.Time; the formatter renders no indicator in
+	// those cases.
+	livenessFor := func(channelID, threadTS string) time.Time {
+		if v, ok := h.runningTasks.Load(key(channelID, threadTS)); ok {
+			if t, ok := v.(*RunningTask); ok && t != nil {
+				return t.LastStreamAt()
+			}
+		}
+		return time.Time{}
+	}
+	view := buildHomeTabView(sessions, rollup, h.bot.PermalinkFor, h.bot.LatestPermalinkFor, livenessFor, userID, includeWorkspace, Version)
 
 	req := slack.PublishViewContextRequest{
 		UserID: userID,
@@ -1443,11 +1488,31 @@ func (h *Handler) handleCloseCommand(
 		logger.Debug().Err(err).Msg("save after close-clear-active")
 	}
 
+	// Cancel all scheduled crons for this session. Per mcp-shim.md §4.8:
+	// closing a thread cancels its schedules. The runClod defer will
+	// stop the socket; DeleteSession removes the persisted state and
+	// stops the tickers, matching that lifecycle.
+	if h.bot.scheduling != nil {
+		if removed := h.bot.scheduling.DeleteSession(key(ev.Channel, threadTS)); len(removed) > 0 {
+			logger.Info().Strs("cron_ids", removed).Msg("cancelled crons on session close")
+			if err := h.bot.scheduling.Save(); err != nil {
+				logger.Warn().Err(err).Msg("failed to persist crons after session close")
+			}
+		}
+	}
+
 	progressKey := key(ev.Channel, threadTS)
 	var wasRunning bool
 	if taskVal, ok := h.runningTasks.Load(progressKey); ok {
 		task := taskVal.(*RunningTask)
 		wasRunning = true
+		// Mark this cancel as expected so finalizeTask suppresses
+		// its trailing message (the ":wave: Session closed." we
+		// post below is the user's confirmation; a follow-up
+		// ":warning: Task completed with error: clod execution
+		// was cancelled" or ":white_check_mark: Task completed!"
+		// 30s later — whichever fires — is just noise).
+		h.expectedTaskCancels.Store(progressKey, true)
 		logger.Info().Dur("grace_period", h.bot.gracefulShutdownTTL).Msg("graceful shutdown: close command")
 		// Run the shutdown in a goroutine so the close confirmation
 		// posts immediately. The task's own runClod loop drains
@@ -1624,6 +1689,8 @@ func (h *Handler) applyModelSet(channelID, threadTS string, session *SessionMapp
 		newModel = cycleModel(cycle, current, 1)
 	case "-":
 		newModel = cycleModel(cycle, current, -1)
+	case "fable", "claude-fable-5", fableEmoji:
+		newModel = "claude-fable-5"
 	case "opus", opusEmoji:
 		newModel = "opus"
 	case "sonnet", sonnetEmoji:
@@ -1662,7 +1729,7 @@ func (h *Handler) applyModelSet(channelID, threadTS string, session *SessionMapp
 	// the new one. Idempotent RemoveReaction on emojis we didn't add.
 	newEmoji := emojiForModel(newModel)
 	if session.ReactionAnchorTS != "" {
-		for _, e := range []string{opusEmoji, sonnetEmoji, haikuEmoji} {
+		for _, e := range []string{fableEmoji, opusEmoji, sonnetEmoji, haikuEmoji} {
 			if e == newEmoji {
 				continue
 			}
@@ -1761,6 +1828,96 @@ func (h *Handler) restartRunningTaskForSettingChange(channelID, threadTS, reason
 		// upstream Slack event ctx, which is short-lived.
 		h.runClod(context.Background(), channelID, session.UserID, session.TaskPath, session.TaskName, nudge, session.SessionID, threadTS, logger)
 	}()
+}
+
+// wedgeRestartCooldown bounds how often a single session can be
+// auto-restarted for input-response wedge (upstream #54434).
+// Chosen at 10 min: enough to notice a persistent-broken session
+// and back off, short enough that a real transient wedge that
+// re-occurs on the fresh container gets a second attempt within
+// one working session. On cooldown expiration, the next wedge
+// triggers a fresh restart.
+const wedgeRestartCooldown = 10 * time.Minute
+
+// autoRestartWedgedTask is the input-response watchdog's recovery
+// path. Same primitives as restartRunningTaskForSettingChange, but
+// gated by a per-session cooldown so a permanently-broken session
+// can't restart-loop. Called from the output-loop's
+// __WEDGE_AUTO_RESTART__ sentinel handler; runs in its own
+// goroutine because Shutdown+resume takes several seconds and we
+// mustn't block the output loop.
+func (h *Handler) autoRestartWedgedTask(channelID, threadTS string, logger zerolog.Logger) {
+	progressKey := key(channelID, threadTS)
+	// Cooldown check: skip if we auto-restarted this session very
+	// recently. Log at Warn so operators still see the wedge
+	// happened even though we're not restarting — otherwise the
+	// signal is silent whenever the cooldown is active.
+	if prev, ok := h.lastWedgeRestartAt.Load(progressKey); ok {
+		if last, _ := prev.(time.Time); time.Since(last) < wedgeRestartCooldown {
+			logger.Warn().
+				Dur("since_last_restart", time.Since(last)).
+				Dur("cooldown", wedgeRestartCooldown).
+				Msg("wedge auto-restart skipped: cooldown active (session likely persistently broken)")
+			return
+		}
+	}
+	val, ok := h.runningTasks.Load(progressKey)
+	if !ok {
+		return
+	}
+	runningTask := val.(*RunningTask)
+	session := h.bot.sessions.Get(channelID, threadTS)
+	if session == nil || session.SessionID == "" {
+		logger.Warn().Msg("can't auto-restart wedged task: no captured session id")
+		return
+	}
+	// User-initiated close wins over the watchdog. If the session has
+	// been explicitly closed (Active=false), do NOT auto-restart —
+	// spinning a fresh container back up would revive a session the
+	// user has deliberately shut down. Close paths set Active=false
+	// BEFORE cancelling the running task, so by the time this
+	// sentinel is processed the flag reflects the user's intent.
+	if !session.Active {
+		logger.Info().Msg("wedge auto-restart skipped: session was closed by user")
+		return
+	}
+	h.lastWedgeRestartAt.Store(progressKey, time.Now())
+	h.expectedTaskCancels.Store(progressKey, true)
+
+	// Post the "detected wedge" notice BEFORE Shutdown so the user
+	// sees the recovery start immediately, not only after the
+	// (potentially slow) graceful shutdown grace period.
+	if _, err := h.bot.PostMessage(channelID,
+		":arrows_counterclockwise: Detected internal claude wedge (no response to your input in 60s); auto-restarting session…",
+		threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post wedge-detected notice")
+	}
+
+	logger.Warn().Msg("auto-restarting session due to input-response wedge")
+
+	// Graceful shutdown with save-state prompt. Claude in a wedged
+	// event loop is unlikely to respond, so the grace period will
+	// probably expire and Shutdown will force-kill the container.
+	// Either path unblocks runningTask.Done() below.
+	runningTask.Shutdown(context.Background(),
+		"Auto-restarting session after detecting internal wedge (upstream claude-code #54434). "+DefaultSaveStateMessage,
+		h.bot.gracefulShutdownTTL)
+	select {
+	case <-runningTask.Done():
+	case <-time.After(60 * time.Second):
+		logger.Warn().Msg("timeout waiting for wedged task to exit; abandoning auto-restart")
+		h.expectedTaskCancels.Delete(progressKey)
+		return
+	}
+	time.Sleep(250 * time.Millisecond)
+
+	if _, err := h.bot.PostMessage(channelID,
+		":arrows_counterclockwise: Session restarted. Continuing from your last message…",
+		threadTS); err != nil {
+		logger.Debug().Err(err).Msg("failed to post wedge-resume notice")
+	}
+	nudge := "The session was auto-restarted after detecting an internal claude event-loop wedge (upstream #54434). The user's most recent message may need to be re-answered — check the thread and respond to whatever they last asked. Do not redo work already completed and reported."
+	h.runClod(context.Background(), channelID, session.UserID, session.TaskPath, session.TaskName, nudge, session.SessionID, threadTS, logger)
 }
 
 // effortLevels are the values claude-code's `/effort` command
@@ -2065,7 +2222,7 @@ func (h *Handler) handleModelReaction(ctx context.Context, ev *slackevents.React
 	// is harmless and it guarantees a stale indicator doesn't survive.
 	newEmoji := emojiForModel(newModel)
 	if session.ReactionAnchorTS != "" {
-		for _, e := range []string{opusEmoji, sonnetEmoji, haikuEmoji} {
+		for _, e := range []string{fableEmoji, opusEmoji, sonnetEmoji, haikuEmoji} {
 			if e == newEmoji {
 				continue
 			}
@@ -2977,42 +3134,20 @@ func (h *Handler) markWorkInProgress(channelID, threadTS, userMsgTS string) {
 	}
 }
 
-// clearOldestWorkInProgress pops the oldest pending user-message TS
-// for this thread and removes the work-in-progress reaction. Called
-// from postStatsMessage so each `result` event clears exactly one
-// pending reaction — the one for the user input it processed.
-// No-op when the queue is empty (e.g. results from bot-generated
-// wakeup nudges, which never marked any user message).
-func (h *Handler) clearOldestWorkInProgress(channelID, threadTS string) {
-	progressKey := key(channelID, threadTS)
-	v, ok := h.workReactions.Load(progressKey)
-	if !ok {
-		return
-	}
-	q := v.(*workReactionQueue)
-	q.mu.Lock()
-	if len(q.tss) == 0 {
-		q.mu.Unlock()
-		return
-	}
-	ts := q.tss[0]
-	q.tss = q.tss[1:]
-	q.mu.Unlock()
-	if err := h.bot.RemoveReaction(channelID, ts, workInProgressEmoji); err != nil {
-		h.logger.Debug().
-			Err(err).
-			Str("channel", channelID).
-			Str("ts", ts).
-			Msg("failed to remove work-in-progress reaction")
-	}
-}
-
 // clearAllWorkInProgress drains the queue for this thread and
-// removes every pending reaction. Called from finalizeTask so a
-// task that exits before all its result events fire (force-kill,
-// timeout, graceful shutdown) doesn't leave hourglass reactions
-// stranded on user messages. On normal completion the queue is
-// already empty here because postStatsMessage popped per-result.
+// removes every pending reaction. Called from postStatsMessage on
+// every `result` event, and from finalizeTask on task exit.
+//
+// Pop-all-on-result (not pop-oldest) because claude bundles
+// rapid-fire user inputs into a single turn: messages that arrive
+// while a turn is in flight get drained at the next turn boundary
+// inside Sjp (claude 2.1.185) via `M.messageQueue.remove(_e)`, after
+// being converted to `queued_command` attachments by `oGt`. The
+// model sees them — but as part of the same turn as the seed
+// message, so claude emits one `result` covering N user inputs.
+// Per-result 1:1 popping would leave N-1 hourglasses stranded; this
+// pops all, since by the time a result fires the queue has been
+// fully consumed.
 func (h *Handler) clearAllWorkInProgress(channelID, threadTS string) {
 	progressKey := key(channelID, threadTS)
 	v, ok := h.workReactions.LoadAndDelete(progressKey)
@@ -3133,9 +3268,9 @@ func (h *Handler) findPendingUserMessages(channelID, threadTS, sessionUserID str
 // replayPendingMessages forwards each recovered pending user message
 // to the resumed task as a fresh user input. Runs as a goroutine
 // alongside runClod: claude's stdin queues the replays after the
-// initial resume nudge, so each becomes its own turn and emits its
-// own result event — which means clearOldestWorkInProgress fires
-// once per replay, popping the hourglass FIFO in order.
+// initial resume nudge. Claude will bundle them into one or more
+// turns; clearAllWorkInProgress fires on each `result` and drains
+// the FIFO regardless of how the bundling splits.
 //
 // Waits for runClod to register the task in runningTasks before
 // sending (with a generous timeout); if the task never appears, we
@@ -3656,6 +3791,23 @@ func (h *Handler) runClod(
 	defer h.runningTasks.Delete(progressKey)
 	defer h.pendingPermissions.Delete(progressKey) // Clean up any pending permission state
 
+	// Spin up the scheduling MCP socket alongside the task. The socket
+	// lives in the same runtime dir as the FIFOs/binaries; schedbridge
+	// inside the container dials it via CLOD_RUNTIME_DIR (set below in
+	// the docker invocation). Torn down after Stdout drains so any
+	// last-second cron_delete from the agent still lands.
+	var schedSocket *SchedSocket
+	if h.bot.scheduling != nil && task.RuntimeDir() != "" {
+		var socketErr error
+		schedSocket, socketErr = h.bot.scheduling.StartSocket(progressKey, task.RuntimeDir(), task.TaskPath())
+		if socketErr != nil {
+			logger.Warn().Err(socketErr).Msg("failed to start scheduling socket; cron_* tools will be unavailable this run")
+		} else {
+			defer schedSocket.Stop()
+		}
+	}
+	_ = schedSocket // referenced only for defer; suppress unused-write in future edits
+
 	// Start watching for output files to upload to Slack.
 	outputWatchDone := make(chan struct{})
 	// shouldSync is polled every ~2s inside the watcher; honoring the
@@ -3685,6 +3837,15 @@ func (h *Handler) runClod(
 	// detection rules.
 	var incompleteSince time.Time
 	const maxIncompleteHold = 10 * time.Second
+
+	// Code-fence stitching state. When a flush leaves an unclosed
+	// fence (large code block streamed past maxIncompleteHold),
+	// codeFenceOpen carries over so the next flush can re-open the
+	// fence with the same language tag. Without this, splitting a
+	// long `cat pixlr_usage.csv`-style output would leave the tail
+	// message parsed as plain text.
+	var codeFenceOpen bool
+	var codeFenceLang string
 
 	// Function to flush the buffer with message consolidation.
 	// When force is false, the flush is deferred if the buffer
@@ -3719,7 +3880,15 @@ func (h *Handler) runClod(
 			// Slack posts.
 			newContent := strings.Trim(outputBuffer.String(), "\n\r\t")
 			if newContent != "" {
-				newContent = ConvertMarkdownToMrkdwn(newContent)
+				// Balance code fences across the flush boundary so a
+				// large fenced block that spilled past the maxIncompleteHold
+				// timeout doesn't leave its tail rendered as plain text.
+				// stitchCodeFence re-opens any fence that was carried
+				// forward from the previous flush and closes any fence
+				// still open at the tail, updating the carry-over state.
+				var stitched string
+				stitched, codeFenceOpen, codeFenceLang = stitchCodeFence(newContent, codeFenceOpen, codeFenceLang)
+				newContent = ConvertMarkdownToMrkdwn(stitched)
 
 				// Check if we can consolidate with the previous message.
 				var posted bool
@@ -3759,6 +3928,12 @@ func (h *Handler) runClod(
 					if age < maxConsolidationAge && combinedLen <= maxMessageLen {
 						combined := last.Content + separator + newContent
 						if err := h.bot.UpdateMessage(channelID, last.MessageTS, combined); err != nil {
+							// Bot.UpdateMessage already retries + logs
+							// Warn/Error internally. Falling through to
+							// PostMessage below is fine — it recovers by
+							// posting a fresh message. Debug is enough
+							// here because the loud logging already
+							// happened one layer down.
 							logger.Debug().Err(err).Msg("failed to update consolidated message, posting new")
 						} else {
 							// Update tracking with new content and time.
@@ -3776,7 +3951,23 @@ func (h *Handler) runClod(
 				// Post new message if consolidation didn't happen.
 				if !posted {
 					if msgTS, err := h.bot.PostMessage(channelID, newContent, threadTS); err != nil {
-						logger.Debug().Err(err).Msg("failed to post output message")
+						// After Bot.PostMessage's internal retries have
+						// all failed the content is truly lost — no
+						// downstream fallback. Warn with a preview so
+						// operators can grep the log and see exactly
+						// what didn't reach Slack. This was the source
+						// of the "response got lost after restart"
+						// pattern observed on 2026-07-13 — the swallow
+						// used to be at Debug (invisible by default).
+						preview := newContent
+						if len(preview) > 120 {
+							preview = preview[:117] + "..."
+						}
+						logger.Warn().
+							Err(err).
+							Int("bytes_lost", len(newContent)).
+							Str("preview", preview).
+							Msg("failed to post output message; content dropped")
 					} else {
 						// Track this as the new last message.
 						h.lastOutputMsg.Store(threadKey, &LastOutputMsg{
@@ -3797,6 +3988,48 @@ func (h *Handler) runClod(
 	permRequests := task.PermissionRequests()
 	ctrlPermRequests := task.ControlPermissionRequests()
 	sessionCaptured := task.SessionIDCaptured()
+
+	// Drain permission requests in a dedicated goroutine so they
+	// can't be starved by anything blocking the output-flushing path.
+	// Observed in eerie-eagle 2026-06-29: runClod's main select sat
+	// for 24 minutes inside the task.Output() case body while a
+	// permission request was buffered and unprocessed, and Slack
+	// never saw the AskUserQuestion prompt. The HTTP timeout we
+	// added in v0.32.4 didn't catch whatever was blocking — moving
+	// permission posting onto its own goroutine sidesteps the
+	// question of what specifically was wedged.
+	//
+	// permRequests closes when the runner's PermissionFIFO closes
+	// on task exit, which is how this goroutine knows to leave.
+	// ctrlPermRequests is never explicitly closed; ctx cancellation
+	// handles it.
+	go func() {
+		permLog := logger.With().Str("loop", "perm").Logger()
+		permLog.Info().Msg("perm-loop started")
+		defer permLog.Info().Msg("perm-loop exiting")
+		for {
+			select {
+			case req, ok := <-permRequests:
+				if !ok {
+					return
+				}
+				start := time.Now()
+				permLog.Info().Str("tool_name", req.ToolName).Msg("perm-loop: handling MCP request")
+				h.handlePermissionRequest(ctx, req, task, channelID, threadTS, threadKey, progressKey, permLog)
+				permLog.Info().Str("tool_name", req.ToolName).Dur("elapsed", time.Since(start)).Msg("perm-loop: MCP request handled")
+			case req, ok := <-ctrlPermRequests:
+				if !ok {
+					return
+				}
+				start := time.Now()
+				permLog.Info().Str("tool_name", req.ToolName).Msg("perm-loop: handling control request")
+				h.handleControlPermissionRequest(ctx, req, task, channelID, threadTS, threadKey, progressKey, permLog)
+				permLog.Info().Str("tool_name", req.ToolName).Dur("elapsed", time.Since(start)).Msg("perm-loop: control request handled")
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Process output and wait for completion
 	for {
@@ -3886,6 +4119,72 @@ func (h *Handler) runClod(
 				continue
 			}
 
+			// Runner's input-response watchdog signaled a wedge —
+			// auto-restart the session. Spawned as a goroutine so
+			// this output loop doesn't block waiting for shutdown
+			// (which needs task.done, which is drained by this same
+			// output loop). Handler applies a cooldown so a
+			// permanently-broken session can't restart-loop.
+			if content == "__WEDGE_AUTO_RESTART__" {
+				go h.autoRestartWedgedTask(channelID, threadTS, logger)
+				continue
+			}
+
+			// Liveness reaction — add/remove :satellite_antenna: on
+			// the anchor based on SSE ping freshness. The runner
+			// side is a state machine that only emits transitions,
+			// so we don't burn Slack API on repeated adds. Look up
+			// the session lazily since sessions can appear after
+			// runClod starts (thread-reply resume path).
+			if content == "__ALIVE__" || content == "__STALE__" {
+				sess := h.bot.sessions.Get(channelID, threadTS)
+				anchor := ""
+				if sess != nil {
+					anchor = sess.ReactionAnchorTS
+				}
+				// Log receipt + outcome at Info. Two per session
+				// transition (one ALIVE, one STALE per cycle) — low
+				// volume, high forensic value when a wedge is
+				// investigated later ("did the bot even see this?").
+				logger.Info().
+					Str("sentinel", content).
+					Bool("has_session", sess != nil).
+					Str("anchor", anchor).
+					Msg("liveness sentinel received")
+				if sess != nil && sess.ReactionAnchorTS != "" {
+					if content == "__ALIVE__" {
+						if err := h.bot.AddReaction(channelID, sess.ReactionAnchorTS, livenessEmoji); err != nil {
+							logger.Warn().Err(err).Msg("AddReaction(satellite) failed")
+						} else {
+							logger.Debug().Msg("AddReaction(satellite) ok")
+						}
+					} else {
+						if err := h.bot.RemoveReaction(channelID, sess.ReactionAnchorTS, livenessEmoji); err != nil {
+							logger.Warn().Err(err).Msg("RemoveReaction(satellite) failed")
+						} else {
+							logger.Debug().Msg("RemoveReaction(satellite) ok")
+						}
+					}
+				}
+				continue
+			}
+
+			// Compaction status banner — post a rolling
+			// "compacting session…" while claude summarizes context,
+			// finalized when the next real content block starts.
+			// Without this, the compaction pause looks identical to
+			// a wedge from Slack (nothing streams during compaction).
+			if content == "__COMPACT_START__" {
+				h.updateNamedProgressMessage(channelID, threadTS, "compact",
+					":broom: *Compacting session…* (claude is summarizing context to reduce tokens)", "", logger)
+				continue
+			}
+			if content == "__COMPACT_END__" {
+				h.finalizeNamedProgressMessage(channelID, threadTS, "compact",
+					":white_check_mark: *Compaction complete*", logger)
+				continue
+			}
+
 			// Check for special stats message.
 			if strings.HasPrefix(content, "__STATS__") {
 				h.clearProgressMessage(channelID, threadTS, logger)
@@ -3948,133 +4247,6 @@ func (h *Handler) runClod(
 				flushBuffer(false)
 			}
 
-		case req, ok := <-permRequests:
-			if ok {
-				// Check if this permission is already allowed by saved rules.
-				if h.isPermissionAllowed(task.taskPath, req.ToolName, req.ToolInput) {
-					logger.Info().
-						Str("tool_name", req.ToolName).
-						Msg("auto-allowing permission based on saved rule")
-					task.SendPermissionResponse(PermissionResponse{Behavior: "allow"})
-					continue
-				}
-
-				// Post formatted permission prompt with buttons to Slack.
-				flushBuffer(true) // Flush any pending output first.
-				var msgTS string
-				// Special case: AskUserQuestion gets a CLI-style picker.
-				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, logger); custom != "" {
-					msgTS = custom
-				} else {
-					// For ExitPlanMode with a long plan, upload the full
-					// plan as a snippet first so the user can read the
-					// portion that won't fit in the truncated prompt.
-					planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
-					blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
-					postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
-					var err error
-					msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
-					cancelPost()
-					if err != nil {
-						if errors.Is(err, context.DeadlineExceeded) {
-							logger.Error().Dur("deadline", permissionPostTimeout).
-								Str("tool_name", req.ToolName).
-								Msg("permission prompt post hit deadline; denying so claude doesn't hang")
-						} else {
-							logger.Error().Err(err).Msg("failed to post permission prompt")
-						}
-						// Send deny on failure to post.
-						task.SendPermissionResponse(
-							PermissionResponse{Behavior: "deny", Message: "Failed to prompt user"},
-						)
-						continue
-					}
-				}
-
-				// Track the pending permission with its message timestamp and tool details.
-				h.pendingPermissions.Store(progressKey, &PendingPermission{
-					MessageTS: msgTS,
-					ChannelID: channelID,
-					ThreadTS:  threadTS,
-					ToolName:  req.ToolName,
-					ToolInput: req.ToolInput,
-				})
-
-				// Clear consolidation since permission prompt breaks the chain.
-				h.lastOutputMsg.Delete(threadKey)
-
-				logger.Info().
-					Str("tool_name", req.ToolName).
-					Str("tool_use_id", req.ToolUseID).
-					Str("message_ts", msgTS).
-					Msg("posted permission prompt to slack, waiting for response (MCP)")
-			}
-
-		case req, ok := <-ctrlPermRequests:
-			if ok {
-				// Handle permission requests from control messages (newer protocol).
-				// Check if this permission is already allowed by saved rules.
-				if h.isPermissionAllowed(task.taskPath, req.ToolName, req.ToolInput) {
-					logger.Info().
-						Str("tool_name", req.ToolName).
-						Msg("auto-allowing control permission based on saved rule")
-					if err := task.SendControlResponse(task.pendingControlRequestID, "allow", ""); err != nil {
-						logger.Error().Err(err).Msg("failed to send auto-allow control response")
-					}
-					continue
-				}
-
-				// Post formatted permission prompt with buttons to Slack.
-				flushBuffer(true) // Flush any pending output first.
-				var msgTS string
-				// Special case: AskUserQuestion gets a CLI-style picker.
-				if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, logger); custom != "" {
-					msgTS = custom
-				} else {
-					planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
-					blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
-					postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
-					var err error
-					msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
-					cancelPost()
-					if err != nil {
-						if errors.Is(err, context.DeadlineExceeded) {
-							logger.Error().Dur("deadline", permissionPostTimeout).
-								Str("tool_name", req.ToolName).
-								Msg("control permission prompt post hit deadline; denying so claude doesn't hang")
-						} else {
-							logger.Error().Err(err).Msg("failed to post control permission prompt")
-						}
-						// Send deny on failure to post.
-						if err := task.SendControlResponse(task.pendingControlRequestID, "deny", "Failed to prompt user"); err != nil {
-							logger.Error().Err(err).Msg("failed to send deny control response")
-						}
-						continue
-					}
-				}
-
-				// Track the pending permission with its message timestamp, tool details, and control request ID.
-				h.pendingPermissions.Store(progressKey, &PendingPermission{
-					MessageTS:           msgTS,
-					ChannelID:           channelID,
-					ThreadTS:            threadTS,
-					ToolName:            req.ToolName,
-					ToolInput:           req.ToolInput,
-					ControlRequestID:    task.pendingControlRequestID,
-					IsControlPermission: true,
-				})
-
-				// Clear consolidation since permission prompt breaks the chain.
-				h.lastOutputMsg.Delete(threadKey)
-
-				logger.Info().
-					Str("tool_name", req.ToolName).
-					Str("tool_use_id", req.ToolUseID).
-					Str("request_id", task.pendingControlRequestID).
-					Str("message_ts", msgTS).
-					Msg("posted permission prompt to slack, waiting for response (control)")
-			}
-
 		case <-ticker.C:
 			// Periodic flush + heartbeat. The heartbeat bumps the
 			// session's UpdatedAt so resume-on-restart can judge
@@ -4123,6 +4295,19 @@ func (h *Handler) finalizeTask(
 	result *Result,
 	logger zerolog.Logger,
 ) {
+	// task.done is read in two places: RunningTask.Shutdown drains it
+	// during graceful shutdown, and runClod's select reads it on
+	// normal exit. The runner closes the channel on goroutine exit
+	// (defer close(task.done)). When Shutdown wins the race, the
+	// subsequent runClod read returns the zero value (nil) instead
+	// of the *Result. Dereferencing result.Error here used to SIGSEGV
+	// and crash the entire bot, taking every other session with it
+	// (eerie-eagle 2026-06-29). Treat the nil-result race as a clean
+	// shutdown — Shutdown already handled the real exit semantics.
+	if result == nil {
+		logger.Info().Msg("finalizeTask got nil result; treating as clean shutdown exit (Shutdown drained the done channel first)")
+		result = &Result{}
+	}
 	// Clear any work-in-progress reactions that didn't get popped
 	// by their result event — on normal completion this is a no-op
 	// (postStatsMessage already drained the queue per result), but
@@ -4130,6 +4315,20 @@ func (h *Handler) finalizeTask(
 	// entries and we don't want hourglasses stranded on user
 	// messages.
 	h.clearAllWorkInProgress(channelID, threadTS)
+	// Clear the liveness reaction — the session just ended, so
+	// the "SSE alive" indicator would be stale until manually
+	// removed. RemoveReaction is idempotent, so this is a safe
+	// no-op when the reaction wasn't added (session ended before
+	// the freshness threshold ever tripped alive).
+	if sess := h.bot.sessions.Get(channelID, threadTS); sess != nil && sess.ReactionAnchorTS != "" {
+		if err := h.bot.RemoveReaction(channelID, sess.ReactionAnchorTS, livenessEmoji); err != nil {
+			logger.Debug().Err(err).Msg("failed to clear liveness reaction on task end")
+		}
+	}
+	// Also clean up a lingering compact banner if the session
+	// ended mid-compaction (rare but possible on shutdown/timeout).
+	h.finalizeNamedProgressMessage(channelID, threadTS, "compact",
+		":white_check_mark: *Compaction complete*", logger)
 	var finalMsg string
 	cleanExit := result.Error == nil
 	progressKey := key(channelID, threadTS)
@@ -4150,11 +4349,16 @@ func (h *Handler) finalizeTask(
 			Msg("task completed successfully")
 		finalMsg = ":white_check_mark: Task completed!"
 	}
-	// Skip the "...cancelled" warning when the bot itself cancelled
-	// the task for a known reason (currently: mid-session model
-	// swap). The follow-up code path posts its own status so the
-	// user knows what's happening.
-	if !(expectedCancel && result.Error != nil) {
+	// Skip the trailing "completed" / "completed with error" post
+	// when the bot itself initiated this shutdown for a known
+	// reason: `@bot close` (the user already saw the ":wave:
+	// Session closed." confirmation), a mid-session model swap
+	// (handleSetCommand posts its own follow-up), etc. Applies
+	// regardless of clean vs. error exit, since whether the
+	// graceful save-state turn finished or the grace period
+	// expired and we force-killed is an internal detail the user
+	// doesn't need a separate Slack post about.
+	if !expectedCancel {
 		if _, err := h.bot.PostMessage(channelID, finalMsg, threadTS); err != nil {
 			logger.Error().Err(err).Msg("failed to post final task message")
 		}
@@ -4415,10 +4619,152 @@ const permissionPostTimeout = 30 * time.Second
 // upstream and then nothing until the next event. Now every branch
 // emits a debug-level breadcrumb so future failures show which step
 // dropped the request.
+// handlePermissionRequest is the MCP-FIFO permission path extracted
+// from runClod so it can run in its own goroutine. Posts the
+// permission prompt (AskUserQuestion picker or generic blocks) to
+// Slack, records the pending entry, and sends a deny on failure so
+// claude doesn't hang.
+//
+// Decoupled from output flushing — the inline flushBuffer(true) call
+// that used to precede the post is gone; the ticker will catch any
+// trailing buffered output within ~2s. Worst case the prompt
+// appears in Slack just ahead of the final assistant chunk; that's
+// a much smaller failure mode than the entire prompt being lost
+// because output flushing is stuck.
+func (h *Handler) handlePermissionRequest(
+	ctx context.Context,
+	req PermissionRequest,
+	task *RunningTask,
+	channelID, threadTS, threadKey, progressKey string,
+	logger zerolog.Logger,
+) {
+	// Auto-allow via saved rules.
+	if h.isPermissionAllowed(task.taskPath, req.ToolName, req.ToolInput) {
+		logger.Info().
+			Str("tool_name", req.ToolName).
+			Msg("auto-allowing permission based on saved rule")
+		task.SendPermissionResponse(PermissionResponse{Behavior: "allow"})
+		return
+	}
+
+	var msgTS string
+	if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, false, "", logger); custom != "" {
+		msgTS = custom
+	} else {
+		// For ExitPlanMode with a long plan, upload the full plan as
+		// a snippet first so the user can read the portion that
+		// won't fit in the truncated prompt.
+		planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
+		blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
+		postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
+		var err error
+		msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
+		cancelPost()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				logger.Error().Dur("deadline", permissionPostTimeout).
+					Str("tool_name", req.ToolName).
+					Msg("permission prompt post hit deadline; denying so claude doesn't hang")
+			} else {
+				logger.Error().Err(err).Msg("failed to post permission prompt")
+			}
+			task.SendPermissionResponse(
+				PermissionResponse{Behavior: "deny", Message: "Failed to prompt user"},
+			)
+			return
+		}
+	}
+
+	h.pendingPermissions.Store(progressKey, &PendingPermission{
+		MessageTS: msgTS,
+		ChannelID: channelID,
+		ThreadTS:  threadTS,
+		ToolName:  req.ToolName,
+		ToolInput: req.ToolInput,
+	})
+
+	// Clear consolidation since permission prompt breaks the chain.
+	h.lastOutputMsg.Delete(threadKey)
+
+	logger.Info().
+		Str("tool_name", req.ToolName).
+		Str("tool_use_id", req.ToolUseID).
+		Str("message_ts", msgTS).
+		Msg("posted permission prompt to slack, waiting for response (MCP)")
+}
+
+// handleControlPermissionRequest is the control_response permission
+// path extracted from runClod so it can run in its own goroutine.
+// Same shape as handlePermissionRequest but dispatches via
+// task.SendControlResponse instead of the MCP FIFO.
+func (h *Handler) handleControlPermissionRequest(
+	ctx context.Context,
+	req PermissionRequest,
+	task *RunningTask,
+	channelID, threadTS, threadKey, progressKey string,
+	logger zerolog.Logger,
+) {
+	if h.isPermissionAllowed(task.taskPath, req.ToolName, req.ToolInput) {
+		logger.Info().
+			Str("tool_name", req.ToolName).
+			Msg("auto-allowing control permission based on saved rule")
+		if err := task.SendControlResponse(task.pendingControlRequestID, "allow", ""); err != nil {
+			logger.Error().Err(err).Msg("failed to send auto-allow control response")
+		}
+		return
+	}
+
+	var msgTS string
+	if custom := h.tryPostAskUserQuestionPrompt(ctx, req, channelID, threadTS, progressKey, true, task.pendingControlRequestID, logger); custom != "" {
+		msgTS = custom
+	} else {
+		planAttached := h.maybeUploadLongPlan(req, channelID, threadTS, logger)
+		blocks := h.buildPermissionBlocks(req, progressKey, planAttached)
+		postCtx, cancelPost := context.WithTimeout(ctx, permissionPostTimeout)
+		var err error
+		msgTS, err = h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
+		cancelPost()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				logger.Error().Dur("deadline", permissionPostTimeout).
+					Str("tool_name", req.ToolName).
+					Msg("control permission prompt post hit deadline; denying so claude doesn't hang")
+			} else {
+				logger.Error().Err(err).Msg("failed to post control permission prompt")
+			}
+			if err := task.SendControlResponse(task.pendingControlRequestID, "deny", "Failed to prompt user"); err != nil {
+				logger.Error().Err(err).Msg("failed to send deny control response")
+			}
+			return
+		}
+	}
+
+	h.pendingPermissions.Store(progressKey, &PendingPermission{
+		MessageTS:           msgTS,
+		ChannelID:           channelID,
+		ThreadTS:            threadTS,
+		ToolName:            req.ToolName,
+		ToolInput:           req.ToolInput,
+		ControlRequestID:    task.pendingControlRequestID,
+		IsControlPermission: true,
+	})
+
+	h.lastOutputMsg.Delete(threadKey)
+
+	logger.Info().
+		Str("tool_name", req.ToolName).
+		Str("tool_use_id", req.ToolUseID).
+		Str("request_id", task.pendingControlRequestID).
+		Str("message_ts", msgTS).
+		Msg("posted permission prompt to slack, waiting for response (control)")
+}
+
 func (h *Handler) tryPostAskUserQuestionPrompt(
 	ctx context.Context,
 	req PermissionRequest,
 	channelID, threadTS, progressKey string,
+	isControlPermission bool,
+	controlRequestID string,
 	logger zerolog.Logger,
 ) string {
 	logger = logger.With().Str("phase", "askuserquestion").Logger()
@@ -4445,19 +4791,23 @@ func (h *Handler) tryPostAskUserQuestionPrompt(
 
 	postCtx, cancel := context.WithTimeout(ctx, permissionPostTimeout)
 	defer cancel()
+	postStart := time.Now()
+	logger.Info().Int("num_blocks", len(blocks)).Msg("calling PostMessageBlocksContext for AskUserQuestion")
 	msgTS, err := h.bot.PostMessageBlocksContext(postCtx, channelID, blocks, threadTS)
+	postElapsed := time.Since(postStart)
 	if err != nil {
 		// Distinguish deadline from other failures so the operator
 		// can tell "Slack was slow" from "Slack rejected the
 		// payload" — they call for different fixes.
 		if errors.Is(err, context.DeadlineExceeded) {
-			logger.Error().Dur("deadline", permissionPostTimeout).
+			logger.Error().Dur("deadline", permissionPostTimeout).Dur("elapsed", postElapsed).
 				Msg("AskUserQuestion post hit deadline; falling back to generic permission prompt")
 		} else {
-			logger.Error().Err(err).Msg("failed to post AskUserQuestion prompt; falling back to generic permission prompt")
+			logger.Error().Err(err).Dur("elapsed", postElapsed).Msg("failed to post AskUserQuestion prompt; falling back to generic permission prompt")
 		}
 		return ""
 	}
+	logger.Info().Dur("elapsed", postElapsed).Str("message_ts", msgTS).Msg("PostMessageBlocksContext returned for AskUserQuestion")
 
 	// Seed Selections with recommended defaults so a single Submit click
 	// submits the same answer the radio/checkbox initially shows.
@@ -4474,11 +4824,13 @@ func (h *Handler) tryPostAskUserQuestionPrompt(
 	}
 
 	h.askQuestionStates.Store(progressKey, &askUserQuestionState{
-		MessageTS:  msgTS,
-		ChannelID:  channelID,
-		ThreadTS:   threadTS,
-		Questions:  questions,
-		Selections: selections,
+		MessageTS:           msgTS,
+		ChannelID:           channelID,
+		ThreadTS:            threadTS,
+		Questions:           questions,
+		Selections:          selections,
+		IsControlPermission: isControlPermission,
+		ControlRequestID:    controlRequestID,
 	})
 
 	logger.Info().
@@ -4488,10 +4840,81 @@ func (h *Handler) tryPostAskUserQuestionPrompt(
 	return msgTS
 }
 
+// autoDiscussPendingPermission denies the pending permission and
+// forwards the user's typed text to claude in the deny message, so
+// claude reads their reply as the tool_result and responds directly.
+// This replaces the older ambiguous-response prompt for the "user
+// typed something instead of clicking allow/deny" case — that UI
+// routinely stranded messages when users forgot to click a button.
+//
+// The instruction to claude is deliberately blunt: read the user's
+// message and reply to it, don't dump reasoning or re-invoke the
+// tool. In practice claude interpreted the shorter Discuss deny as
+// "explain everything you were considering" and buried the user's
+// point; the new phrasing pushes it to respond directly.
+//
+// If the pending permission was an AskUserQuestion the associated
+// state entry is also cleared and the prompt message updated so
+// the thread reflects that the question was deferred into
+// discussion. For a generic permission we update its prompt
+// message the same way.
+func (h *Handler) autoDiscussPendingPermission(
+	channelID, threadTS, userID, userText, progressKey string,
+	perm *PendingPermission,
+	task *RunningTask,
+	logger zerolog.Logger,
+) {
+	discussMsg := "The user replied with a message instead of choosing an option or answering yes/no. Read their message and respond to it directly in the thread. Do not dump reasoning or a summary — answer the specific thing they said. Do not re-invoke the tool immediately; wait for their next reply.\n\nThey said:\n\n" + userText
+
+	resp := PermissionResponse{Behavior: "deny", Message: discussMsg}
+
+	logger.Info().
+		Bool("is_control", perm.IsControlPermission).
+		Str("tool_name", perm.ToolName).
+		Int("text_bytes", len(userText)).
+		Msg("auto-discuss: denying pending permission with user's message")
+
+	if perm.IsControlPermission && perm.ControlRequestID != "" {
+		if err := task.SendControlResponse(perm.ControlRequestID, resp.Behavior, resp.Message); err != nil {
+			logger.Error().Err(err).Msg("auto-discuss: failed to send control response")
+		}
+	} else {
+		task.SendPermissionResponse(resp)
+	}
+	h.pendingPermissions.Delete(progressKey)
+
+	// If the pending was an AskUserQuestion, clear its state and
+	// use its own prompt-message TS for the update (that's the
+	// message the user was staring at when they typed).
+	updateChannelID := perm.ChannelID
+	updateMessageTS := perm.MessageTS
+	if stateVal, ok := h.askQuestionStates.LoadAndDelete(progressKey); ok {
+		state := stateVal.(*askUserQuestionState)
+		if state.ChannelID != "" && state.MessageTS != "" {
+			updateChannelID = state.ChannelID
+			updateMessageTS = state.MessageTS
+		}
+	}
+
+	if updateChannelID != "" && updateMessageTS != "" {
+		updated := fmt.Sprintf(":speech_balloon: *Discussion requested* by <@%s>\n>%s",
+			userID, strings.ReplaceAll(userText, "\n", "\n>"))
+		if err := h.bot.UpdateMessage(updateChannelID, updateMessageTS, updated); err != nil {
+			logger.Debug().Err(err).Msg("auto-discuss: failed to update prompt message")
+		}
+	}
+
+	h.afterPermissionResolved(channelID, threadTS, perm.ToolName, "deny", logger)
+}
+
 // postAmbiguousResponsePrompt posts a permission-style block message when the
 // user types something during a pending permission that doesn't parse as
 // yes/no. Offers three buttons: treat as allow, treat as deny, or cancel the
 // pending permission and redirect the agent with the typed text as new input.
+//
+// Deprecated as of 2026-07-02: the primary path is now
+// autoDiscussPendingPermission. Retained for potential future
+// re-use / reference.
 func (h *Handler) postAmbiguousResponsePrompt(
 	channelID, threadTS, userID, userText, progressKey string,
 	logger zerolog.Logger,
@@ -4645,6 +5068,7 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "askq_checkbox"
 	isAskQuestionFinal := action.ActionID == "askq_submit" ||
 		action.ActionID == "askq_cancel"
+	isAskQuestionDiscuss := action.ActionID == "askq_discuss"
 	isInitSelect := action.ActionID == "init_image" ||
 		action.ActionID == "init_ssh" ||
 		action.ActionID == "init_model" ||
@@ -4666,7 +5090,7 @@ func (h *Handler) HandleBlockAction(
 		action.ActionID == "upload_cancel"
 	isLargeUploadFinal := action.ActionID == "upload_large_proceed" ||
 		action.ActionID == "upload_large_cancel"
-	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal && !isHomeRefresh && !isUploadFinal && !isLargeUploadFinal {
+	if !isPermissionAction && !isAmbiguousAction && !isAskQuestionSelect && !isAskQuestionFinal && !isAskQuestionDiscuss && !isInitSelect && !isInitFinal && !isDangerousFinal && !isSlackRefFinal && !isHomeRefresh && !isUploadFinal && !isLargeUploadFinal {
 		logger.Debug().Msg("ignoring non-permission action")
 		return
 	}
@@ -4710,6 +5134,11 @@ func (h *Handler) HandleBlockAction(
 
 	if isAskQuestionFinal {
 		h.handleAskQuestionFinal(callback, action, actionValue, logger)
+		return
+	}
+
+	if isAskQuestionDiscuss {
+		h.openAskQuestionDiscussModal(callback, actionValue, logger)
 		return
 	}
 
@@ -4760,10 +5189,15 @@ func (h *Handler) HandleBlockAction(
 	}
 	pending := pendingVal.(*PendingPermission)
 
-	// Send the response to Claude via FIFO or control message
+	// Send the response to Claude via FIFO or control message.
+	// The message field flows straight to claude as the
+	// permission tool result, so it must not name the human —
+	// the agent has no business knowing who clicked the button.
+	// Slack-side audit ("denied by <@user>") happens separately
+	// via the UpdateMessage call below.
 	resp := PermissionResponse{Behavior: actionValue.Behavior}
 	if actionValue.Behavior == "deny" {
-		resp.Message = fmt.Sprintf("User %s denied permission", callback.User.Name)
+		resp.Message = "User denied permission"
 	}
 
 	logger.Info().
@@ -5571,10 +6005,22 @@ func (h *Handler) handleAskQuestionFinal(
 	}
 	task := taskVal.(*RunningTask)
 
+	// pendingPermissions is the parallel bookkeeping map used for the
+	// generic permission button path. For AskUserQuestion we treat
+	// askQuestionStates (already found above) as the source of truth
+	// for dispatch — the IsControlPermission/ControlRequestID fields
+	// were copied there at creation time. Falling back to state-only
+	// dispatch keeps the answer flowing even when the pending entry
+	// has been lost (2026-06-22 eerie-eagle incident: Submit click
+	// silently no-op'd because pendingPermissions lookup failed).
 	pendingVal, hasPending := h.pendingPermissions.LoadAndDelete(actionValue.ThreadKey)
 	var pending *PendingPermission
 	if hasPending {
 		pending = pendingVal.(*PendingPermission)
+	} else {
+		logger.Warn().
+			Str("thread_key", actionValue.ThreadKey).
+			Msg("pendingPermissions missing for askq submit; dispatching from askQuestionStates")
 	}
 
 	isCancel := action.ActionID == "askq_cancel"
@@ -5594,25 +6040,47 @@ func (h *Handler) handleAskQuestionFinal(
 	// answers out of the message body. This keeps the tool invocation from
 	// racing with user input and is the documented pattern for surfacing
 	// user-provided context when a tool can't run.
+	// This message becomes the MCP tool_result for the agent's
+	// request_permission call — strip identity. Surfacing the
+	// Slack username here taught the agent the user's name in
+	// the eerie-eagle session and propagated into agent memory
+	// (June 2026 finding); the human-side audit of who clicked
+	// happens via the Slack message update below.
 	resp := PermissionResponse{}
 	var answerSummary string
 	if isCancel {
 		resp.Behavior = "deny"
-		resp.Message = fmt.Sprintf("User %s cancelled the question prompt.", callback.User.Name)
+		resp.Message = "User cancelled the question prompt."
 	} else {
 		resp.Behavior = "deny"
 		answerSummary = formatAskUserQuestionAnswer(state)
 		resp.Message = "AskUserQuestion is unavailable in this environment; the user answered directly:\n" + answerSummary
 	}
 
+	// Dispatch source-of-truth: prefer pendingPermissions (the existing
+	// path) but fall back to the dispatch fields mirrored into
+	// askUserQuestionState so a missing pending entry doesn't strand
+	// claude waiting on the FIFO.
+	isControl := state.IsControlPermission
+	ctrlReqID := state.ControlRequestID
 	if hasPending {
-		if pending.IsControlPermission && pending.ControlRequestID != "" {
-			if err := task.SendControlResponse(pending.ControlRequestID, resp.Behavior, resp.Message); err != nil {
-				logger.Error().Err(err).Msg("failed to send control response for askq")
-			}
-		} else {
-			task.SendPermissionResponse(resp)
+		isControl = pending.IsControlPermission
+		ctrlReqID = pending.ControlRequestID
+	}
+	logger.Info().
+		Bool("is_control", isControl).
+		Str("ctrl_req_id", ctrlReqID).
+		Bool("has_pending", hasPending).
+		Bool("is_cancel", isCancel).
+		Str("behavior", resp.Behavior).
+		Int("message_bytes", len(resp.Message)).
+		Msg("dispatching askq response")
+	if isControl && ctrlReqID != "" {
+		if err := task.SendControlResponse(ctrlReqID, resp.Behavior, resp.Message); err != nil {
+			logger.Error().Err(err).Msg("failed to send control response for askq")
 		}
+	} else {
+		task.SendPermissionResponse(resp)
 	}
 
 	// Update the prompt message with the outcome.
@@ -5625,6 +6093,198 @@ func (h *Handler) handleAskQuestionFinal(
 	}
 	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, updated); err != nil {
 		logger.Error().Err(err).Msg("failed to update askq prompt after final click")
+	}
+}
+
+// askqDiscussModalCallbackID identifies the modal view opened by the
+// Discuss button on an AskUserQuestion prompt. Used both when opening
+// the modal (view.CallbackID) and when routing the view_submission
+// event so we ignore unrelated modals.
+const askqDiscussModalCallbackID = "askq_discuss_modal"
+
+// askqDiscussModalPrivateMetadata is the JSON payload the modal
+// carries in ModalViewRequest.PrivateMetadata. Slack returns it
+// verbatim on view_submission, letting us recover the thread + the
+// original prompt message TS without a side-channel lookup.
+type askqDiscussModalPrivateMetadata struct {
+	ThreadKey        string `json:"tk"`
+	OrigChannelID    string `json:"c"`
+	OrigMessageTS    string `json:"m"`
+	OrigResponseType string `json:"r,omitempty"`
+}
+
+// openAskQuestionDiscussModal shows a text-input modal in response
+// to the Discuss button click. Instead of dispatching the deny
+// immediately (which was leaving claude to guess what the user
+// wanted to discuss), we collect the user's opening message,
+// dispatch on modal-submit, and pass their text through to claude
+// as the tool_result body so the agent responds to what was
+// actually asked instead of dumping context first.
+func (h *Handler) openAskQuestionDiscussModal(
+	callback *slack.InteractionCallback,
+	actionValue PermissionActionValue,
+	logger zerolog.Logger,
+) {
+	metaBytes, err := json.Marshal(askqDiscussModalPrivateMetadata{
+		ThreadKey:     actionValue.ThreadKey,
+		OrigChannelID: callback.Channel.ID,
+		OrigMessageTS: callback.Message.Timestamp,
+	})
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to marshal askq discuss modal metadata")
+		return
+	}
+
+	titleText := slack.NewTextBlockObject("plain_text", "Discuss the question", false, false)
+	submitText := slack.NewTextBlockObject("plain_text", "Send to Claude", false, false)
+	closeText := slack.NewTextBlockObject("plain_text", "Cancel", false, false)
+
+	promptHeader := slack.NewSectionBlock(
+		slack.NewTextBlockObject(
+			"mrkdwn",
+			"Type what you'd like to say before Claude proceeds. Your message becomes the tool result Claude reads next — so it responds directly instead of restating the options.",
+			false, false,
+		),
+		nil, nil,
+	)
+
+	input := slack.NewPlainTextInputBlockElement(
+		slack.NewTextBlockObject("plain_text", "e.g. Explain why option [1] is worse than [0] in this case, then ask me again.", false, false),
+		"askq_discuss_text",
+	)
+	input.Multiline = true
+
+	inputBlock := slack.NewInputBlock(
+		"askq_discuss_input",
+		slack.NewTextBlockObject("plain_text", "Your message", false, false),
+		nil,
+		input,
+	)
+
+	modal := slack.ModalViewRequest{
+		Type:            slack.VTModal,
+		Title:           titleText,
+		Submit:          submitText,
+		Close:           closeText,
+		Blocks:          slack.Blocks{BlockSet: []slack.Block{promptHeader, inputBlock}},
+		CallbackID:      askqDiscussModalCallbackID,
+		PrivateMetadata: string(metaBytes),
+	}
+
+	if _, err := h.bot.client.OpenView(callback.TriggerID, modal); err != nil {
+		logger.Error().Err(err).Msg("failed to open askq discuss modal")
+		return
+	}
+	logger.Info().Str("thread_key", actionValue.ThreadKey).Msg("opened askq discuss modal")
+}
+
+// HandleViewSubmission dispatches a modal-submit callback. Currently
+// only the askq_discuss_modal is wired; unknown callback_ids are
+// ignored (silently ack'd by the socketmode middleware).
+func (h *Handler) HandleViewSubmission(ctx context.Context, callback *slack.InteractionCallback) {
+	logger := h.logger.With().
+		Str("view_callback_id", callback.View.CallbackID).
+		Str("user", callback.User.ID).
+		Logger()
+	switch callback.View.CallbackID {
+	case askqDiscussModalCallbackID:
+		h.handleAskQuestionDiscussSubmit(callback, logger)
+	default:
+		logger.Debug().Msg("unhandled view submission callback_id")
+	}
+}
+
+// handleAskQuestionDiscussSubmit dispatches the discuss response
+// once the modal is submitted. Mirrors handleAskQuestionFinal's
+// dispatch semantics (deny + control-or-MCP based on the pending
+// entry / mirrored state fields), but with the user's typed message
+// baked into the tool_result body so claude has something concrete
+// to respond to.
+func (h *Handler) handleAskQuestionDiscussSubmit(
+	callback *slack.InteractionCallback,
+	logger zerolog.Logger,
+) {
+	var meta askqDiscussModalPrivateMetadata
+	if err := json.Unmarshal([]byte(callback.View.PrivateMetadata), &meta); err != nil {
+		logger.Error().Err(err).Msg("failed to parse askq discuss modal private_metadata")
+		return
+	}
+	logger = logger.With().Str("thread_key", meta.ThreadKey).Logger()
+
+	userText := ""
+	if inputVals, ok := callback.View.State.Values["askq_discuss_input"]; ok {
+		if action, ok := inputVals["askq_discuss_text"]; ok {
+			userText = strings.TrimSpace(action.Value)
+		}
+	}
+
+	stateVal, ok := h.askQuestionStates.LoadAndDelete(meta.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no AskUserQuestion state found for discuss submit; prompt is stale")
+		if err := h.bot.UpdateMessage(meta.OrigChannelID, meta.OrigMessageTS, ":warning: This question prompt is no longer active."); err != nil {
+			logger.Error().Err(err).Msg("failed to update stale askq message after discuss submit")
+		}
+		return
+	}
+	state := stateVal.(*askUserQuestionState)
+
+	taskVal, ok := h.runningTasks.Load(meta.ThreadKey)
+	if !ok {
+		logger.Warn().Msg("no running task for askq discuss submit")
+		return
+	}
+	task := taskVal.(*RunningTask)
+
+	pendingVal, hasPending := h.pendingPermissions.LoadAndDelete(meta.ThreadKey)
+	var pending *PendingPermission
+	if hasPending {
+		pending = pendingVal.(*PendingPermission)
+	} else {
+		logger.Warn().Msg("pendingPermissions missing for askq discuss submit; dispatching from askQuestionStates")
+	}
+
+	// Build the deny message with the user's opening in-line so
+	// Claude has both the "discuss, don't re-prompt" nudge AND the
+	// user's specific opening in front of it as the tool result.
+	resp := PermissionResponse{Behavior: "deny"}
+	if userText != "" {
+		resp.Message = "The user wants to discuss the question before answering. They said:\n\n" + userText + "\n\nRespond to their message directly. Don't re-invoke AskUserQuestion immediately — continue the conversation in the thread and wait for their reply."
+	} else {
+		resp.Message = "The user wants to discuss the question before answering. Don't re-invoke AskUserQuestion immediately — continue the conversation in the thread: share your reasoning behind each option, ask whatever follow-ups you need, and wait for their reply."
+	}
+
+	isControl := state.IsControlPermission
+	ctrlReqID := state.ControlRequestID
+	if hasPending {
+		isControl = pending.IsControlPermission
+		ctrlReqID = pending.ControlRequestID
+	}
+	logger.Info().
+		Bool("is_control", isControl).
+		Str("ctrl_req_id", ctrlReqID).
+		Bool("has_pending", hasPending).
+		Int("user_text_bytes", len(userText)).
+		Int("message_bytes", len(resp.Message)).
+		Msg("dispatching askq discuss response")
+	if isControl && ctrlReqID != "" {
+		if err := task.SendControlResponse(ctrlReqID, resp.Behavior, resp.Message); err != nil {
+			logger.Error().Err(err).Msg("failed to send control response for askq discuss")
+		}
+	} else {
+		task.SendPermissionResponse(resp)
+	}
+
+	// Update the original prompt so the thread reflects who
+	// requested the discussion and what they said.
+	var updated string
+	if userText != "" {
+		updated = fmt.Sprintf(":speech_balloon: *Discussion requested* by <@%s>\n>%s",
+			callback.User.ID, strings.ReplaceAll(userText, "\n", "\n>"))
+	} else {
+		updated = fmt.Sprintf(":speech_balloon: *Discussion requested* by <@%s> — reply in this thread to continue.", callback.User.ID)
+	}
+	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, updated); err != nil {
+		logger.Error().Err(err).Msg("failed to update askq prompt after discuss submit")
 	}
 }
 
@@ -5669,13 +6329,15 @@ func (h *Handler) handleAmbiguousAction(
 		pending = pendingVal.(*PendingPermission)
 	}
 
-	// Build the permission response.
+	// Build the permission response. Message goes to claude as
+	// the tool result — strip identity. Slack-side audit happens
+	// separately via the prompt-update path below.
 	resp := PermissionResponse{Behavior: actionValue.Behavior}
 	switch {
 	case actionValue.Redirect:
-		resp.Message = fmt.Sprintf("User %s cancelled the pending permission to redirect with new instructions.", callback.User.Name)
+		resp.Message = "User cancelled the pending permission to redirect with new instructions."
 	case actionValue.Behavior == "deny":
-		resp.Message = fmt.Sprintf("User %s denied permission", callback.User.Name)
+		resp.Message = "User denied permission"
 	}
 
 	if hasPending {
@@ -5960,12 +6622,12 @@ func (h *Handler) postStatsMessage(channelID, threadTS, statsJSON string) {
 		return
 	}
 
-	// Clear the oldest pending work-in-progress reaction for this
-	// thread — this result event corresponds to the user input that
-	// took the front of the queue. A no-op when the queue is empty
-	// (e.g. the turn that just ended was a ScheduleWakeup wake or
-	// some other bot-initiated input that never marked a user msg).
-	h.clearOldestWorkInProgress(channelID, threadTS)
+	// Drain every pending work-in-progress reaction for this thread.
+	// See clearAllWorkInProgress for why this is pop-all rather than
+	// pop-oldest. A no-op when the queue is empty (e.g. the turn that
+	// just ended was a ScheduleWakeup wake or some other
+	// bot-initiated input that never marked a user msg).
+	h.clearAllWorkInProgress(channelID, threadTS)
 
 	cumulativeCost, cumulativeTurns := h.bot.sessions.AddStats(channelID, threadTS, stats.CostUSD, stats.NumTurns)
 	if err := h.bot.sessions.Save(); err != nil {

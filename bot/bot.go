@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof" // side-effect: register /debug/pprof/* on DefaultServeMux
 	"os"
+	"strings"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/calebcase/oops"
@@ -16,6 +20,26 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
+// slackHTTPTimeout is the per-request deadline applied to every
+// Slack JSON API call (chat.postMessage, chat.update, files.upload,
+// etc.) via the shared *http.Client. Slack's p99 for these endpoints
+// is comfortably under 5s; anything past 30s is a hung connection
+// or a backend stall, not slow processing.
+//
+// Why this matters: the runClod main loop (handlers.go:3788+) does
+// PostMessage / UpdateMessage inline from its task.Output() case
+// body. Without a deadline a single hung HTTP call wedges the entire
+// select — including the permRequests case — so AskUserQuestion
+// prompts never reach Slack and the agent stalls. Observed in
+// eerie-eagle on 2026-06-26: a flushBuffer post hung at 11:23, the
+// agent's tool_use:AskUserQuestion that came 3 seconds later sat
+// unprocessed for 16 minutes until manual FIFO injection.
+//
+// WebSocket connections are hijacked from net/http after upgrade and
+// are NOT subject to this deadline, so Socket Mode stays connected
+// indefinitely; only the JSON API hop inherits the limit.
+const slackHTTPTimeout = 30 * time.Second
+
 // Bot manages the Slack connection and event handling.
 type Bot struct {
 	client        *slack.Client
@@ -24,6 +48,7 @@ type Bot struct {
 	auth          *Authorizer
 	domains       *DomainRegistry
 	sessions      *SessionStore
+	scheduling    *SchedulingRegistry
 	runner        *Runner
 	files         *FileHandler
 	logger        zerolog.Logger
@@ -45,6 +70,25 @@ type Bot struct {
 	// was posted after).
 	latestPostTS sync.Map // key "channel:thread" -> string messageTS
 
+	// lastEventAt is the unix-nano timestamp of the most-recent
+	// Slack event routed through the socketmode middleware
+	// (excluding pings, which flow through slack-go internally and
+	// don't reach our handlers). Used by the event-starvation
+	// watchdog as a cheap first-pass indicator that something MIGHT
+	// be wrong — a real starvation is then confirmed by polling
+	// Slack directly (see runEventStarvationWatchdog) so a quiet
+	// Sunday afternoon doesn't fire the warn every minute.
+	lastEventAt atomic.Int64
+
+	// lastMessageTSByThread tracks the highest inbound Slack
+	// message TS we've observed on each session thread, keyed by
+	// "channelID:threadTS". Updated when handleCallbackEvent
+	// dispatches a MessageEvent or AppMentionEvent. Used by the
+	// starvation watchdog to poll conversations.replies with
+	// oldest=<this> and detect messages Slack has that we
+	// haven't received via Socket Mode.
+	lastMessageTSByThread sync.Map // key "channel:thread" -> string TS
+
 	// permalinkCache memoizes chat.getPermalink lookups so the
 	// Home-tab renderer doesn't re-hit the API on every publish.
 	// Key: "channel:ts". Value: string url. Permalinks for a
@@ -60,6 +104,7 @@ func NewBot(
 	auth *Authorizer,
 	domains *DomainRegistry,
 	sessions *SessionStore,
+	scheduling *SchedulingRegistry,
 	runner *Runner,
 	verboseTools []string,
 	verbosityLevel int,
@@ -70,6 +115,7 @@ func NewBot(
 	client := slack.New(
 		botToken,
 		slack.OptionAppLevelToken(appToken),
+		slack.OptionHTTPClient(&http.Client{Timeout: slackHTTPTimeout}),
 	)
 
 	socket := socketmode.New(
@@ -87,6 +133,7 @@ func NewBot(
 		auth:                auth,
 		domains:             domains,
 		sessions:            sessions,
+		scheduling:          scheduling,
 		runner:              runner,
 		files:               NewFileHandler(client, logger),
 		logger:              logger.With().Str("component", "bot").Logger(),
@@ -113,8 +160,191 @@ func (b *Bot) ResumeActiveSessions(ctx context.Context, maxAge time.Duration) {
 	b.handler.ResumeActiveSessions(ctx, maxAge)
 }
 
+// slackEventStarvationThreshold is how long we allow the event
+// pipe to be silent (no non-ping events) before we start actively
+// probing Slack for missed messages. 5 min is well past any
+// normal quiet period.
+const slackEventStarvationThreshold = 5 * time.Minute
+
+// runEventStarvationWatchdog probes Slack directly to confirm real
+// starvation rather than relying on a naked timeout. Every minute,
+// if the local event pipe has been silent longer than
+// slackEventStarvationThreshold, iterate the currently-running
+// tasks and call conversations.replies on each session's thread
+// with oldest = the last message TS we processed via Socket Mode.
+// Any returned messages are ones Slack has but we don't — the
+// smoking gun for socket-mode starvation.
+//
+// Design choices to keep noise low:
+//  - Only probes while at least one task is actively running.
+//    A truly idle bot has no expected events, so silence is
+//    normal and shouldn't fire.
+//  - Only warns when Slack itself confirms missed messages. Time
+//    alone is not enough to justify a warn.
+//  - Each thread warns at most once per starvation episode; the
+//    warn is repeated only after a fresh event arrives (which
+//    clears the lastWarnedTS memory).
+//
+// Runs bounded by ctx so it exits cleanly on Shutdown.
+func (b *Bot) runEventStarvationWatchdog(ctx context.Context) {
+	// Prime lastEventAt so a startup silence isn't reported.
+	b.lastEventAt.Store(time.Now().UnixNano())
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	// lastWarnedForTS tracks the last TS we already warned about
+	// per thread so we don't repeat the same warn every minute for
+	// the same stuck message. Cleared implicitly when a newer
+	// message arrives and updates lastMessageTSByThread.
+	var lastWarnedForTS sync.Map // key "channel:thread" -> string TS
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			last := time.Unix(0, b.lastEventAt.Load())
+			since := now.Sub(last)
+			if since < slackEventStarvationThreshold {
+				continue
+			}
+			// Only probe if the bot has any running task.
+			// Idle bot → silence is expected → don't waste
+			// Slack API calls confirming the obvious.
+			if b.handler == nil {
+				continue
+			}
+			activeCount := 0
+			b.handler.runningTasks.Range(func(k, v any) bool {
+				activeCount++
+				return true
+			})
+			if activeCount == 0 {
+				continue
+			}
+			b.probeMissedMessages(ctx, since, &lastWarnedForTS)
+		}
+	}
+}
+
+// probeMissedMessages walks the currently-running tasks and asks
+// Slack directly via conversations.replies whether it has messages
+// beyond the last TS we've processed. Any returned messages are
+// proof of a socket-mode starvation and get logged at Warn.
+//
+// Errors from the Slack API are logged at Debug — the probe is
+// diagnostic, so a transient failure isn't itself an alarm.
+func (b *Bot) probeMissedMessages(ctx context.Context, silence time.Duration, lastWarnedForTS *sync.Map) {
+	if b.client == nil {
+		return
+	}
+	b.handler.runningTasks.Range(func(k, v any) bool {
+		key, _ := k.(string)
+		// key format is "channelID:threadTS"; split on the first
+		// colon. threadTS itself doesn't contain a colon.
+		colon := strings.Index(key, ":")
+		if colon < 0 {
+			return true
+		}
+		channelID := key[:colon]
+		threadTS := key[colon+1:]
+
+		lastTSAny, _ := b.lastMessageTSByThread.Load(key)
+		lastTS, _ := lastTSAny.(string)
+		if lastTS == "" {
+			// No baseline to compare against — we haven't
+			// observed any message on this thread yet.
+			// Fall back to the thread's own TS so we can at
+			// least see if there's ANY message we've missed.
+			lastTS = threadTS
+		}
+
+		params := &slack.GetConversationRepliesParameters{
+			ChannelID: channelID,
+			Timestamp: threadTS,
+			Oldest:    lastTS,
+			Limit:     20,
+		}
+		msgs, _, _, err := b.client.GetConversationRepliesContext(ctx, params)
+		if err != nil {
+			b.logger.Debug().
+				Err(err).
+				Str("channel", channelID).
+				Str("thread", threadTS).
+				Msg("starvation probe: conversations.replies failed")
+			return true
+		}
+		// Slack returns messages >= oldest inclusive AND
+		// conversations.replies ALWAYS includes the thread parent
+		// as the first item regardless of oldest. Filter to
+		// strictly-newer TS so we don't false-positive on either.
+		// Slack TS is "seconds.microseconds" as a fixed-width
+		// string, so plain string > compares correctly.
+		var missed []slack.Message
+		for i := range msgs {
+			if msgs[i].Timestamp > lastTS {
+				missed = append(missed, msgs[i])
+			}
+		}
+		if len(missed) == 0 {
+			return true
+		}
+		// Highest TS in the missed set — used as the "already
+		// warned for this" cursor so we don't repeat every
+		// minute for a persistent starvation.
+		highestMissed := missed[0].Timestamp
+		for i := 1; i < len(missed); i++ {
+			if missed[i].Timestamp > highestMissed {
+				highestMissed = missed[i].Timestamp
+			}
+		}
+		if prevAny, ok := lastWarnedForTS.Load(key); ok {
+			if prev, _ := prevAny.(string); prev == highestMissed {
+				return true
+			}
+		}
+		lastWarnedForTS.Store(key, highestMissed)
+
+		// Summarize the missed messages for the log — user_id
+		// + text head so the operator can see what got stranded.
+		summaries := make([]string, 0, len(missed))
+		for _, m := range missed {
+			text := m.Text
+			if len(text) > 80 {
+				text = text[:77] + "..."
+			}
+			summaries = append(summaries, fmt.Sprintf("ts=%s user=%s text=%q", m.Timestamp, m.User, text))
+		}
+		b.logger.Warn().
+			Str("channel", channelID).
+			Str("thread", threadTS).
+			Dur("silence", silence).
+			Str("last_seen_ts", lastTS).
+			Int("missed_count", len(missed)).
+			Strs("missed", summaries).
+			Msg("Slack event pipe starvation CONFIRMED: Slack has messages we did not receive")
+		return true
+	})
+}
+
 func (b *Bot) Run(ctx context.Context) error {
 	b.logger.Info().Msg("starting socket mode connection")
+
+	// pprof endpoint on loopback for live diagnosis. When the bot
+	// stalls (stuck stdout reader, blocked goroutine, etc.), `curl
+	// http://127.0.0.1:6060/debug/pprof/goroutine?debug=2` from the
+	// host gives a full goroutine dump without killing the process.
+	// Bound to 127.0.0.1 so it's not reachable off-host. Bind failure
+	// is warn-only — pprof is diagnostic, never load-bearing.
+	go func() {
+		srv := &http.Server{Addr: "127.0.0.1:6060"}
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			b.logger.Warn().Err(err).Msg("pprof server exited")
+		}
+	}()
+
+	// Event-starvation watchdog. Exits when ctx cancels.
+	go b.runEventStarvationWatchdog(ctx)
 
 	// Use the socketmode handler instead of manually reading from Events channel
 	err := b.socketHandler.RunEventLoopContext(ctx)
@@ -168,6 +398,7 @@ func (b *Bot) registerEventHandlers() {
 
 // handleEventsAPIMiddleware is the socketmode handler for Events API events.
 func (b *Bot) handleEventsAPIMiddleware(evt *socketmode.Event, client *socketmode.Client) {
+	b.lastEventAt.Store(time.Now().UnixNano())
 	fmt.Printf(">>> EVENTS API: %+v\n", evt.Type)
 
 	eventsAPIEvent, ok := evt.Data.(slackevents.EventsAPIEvent)
@@ -184,6 +415,7 @@ func (b *Bot) handleEventsAPIMiddleware(evt *socketmode.Event, client *socketmod
 
 // handleInteractiveMiddleware is the socketmode handler for interactive events.
 func (b *Bot) handleInteractiveMiddleware(evt *socketmode.Event, client *socketmode.Client) {
+	b.lastEventAt.Store(time.Now().UnixNano())
 	fmt.Printf(">>> INTERACTIVE EVENT: %+v\n", evt.Type)
 	b.logger.Info().Msg("received interactive event via socketmode handler")
 
@@ -220,8 +452,10 @@ func (b *Bot) handleEventsAPIEvent(ctx context.Context, evt slackevents.EventsAP
 func (b *Bot) handleCallbackEvent(ctx context.Context, innerEvent slackevents.EventsAPIInnerEvent) {
 	switch ev := innerEvent.Data.(type) {
 	case *slackevents.AppMentionEvent:
+		b.bumpLastMessageTS(ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp)
 		b.handler.HandleAppMention(ctx, ev)
 	case *slackevents.MessageEvent:
+		b.bumpLastMessageTS(ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp)
 		b.handler.HandleMessage(ctx, ev)
 	case *slackevents.ReactionAddedEvent:
 		b.handler.HandleReactionAdded(ctx, ev)
@@ -236,7 +470,60 @@ func (b *Bot) handleCallbackEvent(ctx context.Context, innerEvent slackevents.Ev
 	}
 }
 
-// PostMessage sends a message to a channel.
+// bumpLastMessageTS records the TS of a Slack message the bot
+// received via Socket Mode, keyed by the thread it belongs to. The
+// starvation watchdog polls conversations.replies with
+// oldest=<this> to confirm Slack has no additional messages we
+// haven't seen. threadTS falls back to messageTS for top-level
+// messages (Slack's convention for treating a lone message as its
+// own thread parent).
+func (b *Bot) bumpLastMessageTS(channelID, threadTS, messageTS string) {
+	if channelID == "" || messageTS == "" {
+		return
+	}
+	if threadTS == "" {
+		threadTS = messageTS
+	}
+	k := channelID + ":" + threadTS
+	// Store the max — Slack event delivery is generally ordered
+	// but a defensive max avoids regressing on out-of-order events.
+	if prev, ok := b.lastMessageTSByThread.Load(k); ok {
+		if s, _ := prev.(string); slackTSGreater(s, messageTS) {
+			return
+		}
+	}
+	b.lastMessageTSByThread.Store(k, messageTS)
+}
+
+// slackTSGreater returns true if a > b as Slack timestamps.
+// Slack TS is "seconds.microseconds" as a string; string
+// comparison works because both halves are fixed-width.
+func slackTSGreater(a, b string) bool {
+	return a > b
+}
+
+// slackPostRetryBackoffs is the retry schedule for transient Slack
+// API failures on PostMessage / UpdateMessage. Total wall clock
+// ~3.5s across 3 retries. Slack's server side handles rate limits
+// with 429 + Retry-After; slack-go's client honors that
+// transparently, so this outer retry is for network blips and 5xx
+// only. Kept small enough that a real outage doesn't stall the
+// output loop for long. The 2026-07-13 "response got lost after
+// restart" bug traced to handlers.go swallowing PostMessage errors
+// at Debug — with retries here the transient failures self-heal
+// before the caller sees an error at all.
+var slackPostRetryBackoffs = []time.Duration{
+	500 * time.Millisecond,
+	1500 * time.Millisecond,
+	3000 * time.Millisecond,
+}
+
+// PostMessage sends a message to a channel with retry-on-transient
+// -failure. Bot.PostMessage is the single fan-in for claude → Slack
+// traffic; every call is logged (Info on success, Warn on retry,
+// Error on final failure) so a "response got lost" investigation
+// can grep one file. Preview capped at 80 chars keeps the log
+// readable without dumping full model output.
 func (b *Bot) PostMessage(channelID, text string, threadTS string) (string, error) {
 	opts := []slack.MsgOption{
 		slack.MsgOptionText(text, false),
@@ -244,11 +531,52 @@ func (b *Bot) PostMessage(channelID, text string, threadTS string) (string, erro
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
-
-	_, ts, err := b.client.PostMessage(channelID, opts...)
+	preview := text
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+	start := time.Now()
+	var ts string
+	var err error
+	for attempt := 0; attempt <= len(slackPostRetryBackoffs); attempt++ {
+		if attempt > 0 {
+			time.Sleep(slackPostRetryBackoffs[attempt-1])
+		}
+		_, ts, err = b.client.PostMessage(channelID, opts...)
+		if err == nil {
+			break
+		}
+		if attempt < len(slackPostRetryBackoffs) {
+			b.logger.Warn().
+				Err(err).
+				Int("attempt", attempt+1).
+				Str("channel", channelID).
+				Str("thread", threadTS).
+				Int("bytes", len(text)).
+				Str("preview", preview).
+				Msg("PostMessage failed, retrying")
+		}
+	}
+	elapsed := time.Since(start)
 	if err != nil {
+		b.logger.Error().
+			Err(err).
+			Str("channel", channelID).
+			Str("thread", threadTS).
+			Int("bytes", len(text)).
+			Str("preview", preview).
+			Dur("elapsed", elapsed).
+			Msg("PostMessage failed after all retries; message lost")
 		return "", oops.Trace(err)
 	}
+	b.logger.Info().
+		Str("channel", channelID).
+		Str("thread", threadTS).
+		Str("ts", ts).
+		Int("bytes", len(text)).
+		Str("preview", preview).
+		Dur("elapsed", elapsed).
+		Msg("PostMessage ok")
 	b.recordPost(channelID, threadTS, ts)
 	return ts, nil
 }
@@ -259,24 +587,44 @@ func (b *Bot) PostMessage(channelID, text string, threadTS string) (string, erro
 // thread (edit-eligible) or was superseded (post-new-required). A
 // zero thread argument is normalized to the root-post ts so top-
 // level posts and their thread replies share the same bucket.
+//
+// Also mirrored onto the persisted SessionMapping so the Home tab's
+// `[latest →]` link survives a bot restart. Without persistence,
+// idle/closed sessions (which never post again to repopulate the
+// in-memory map) lose their jump link forever after a restart.
 func (b *Bot) recordPost(channelID, threadTS, messageTS string) {
 	if messageTS == "" {
 		return
 	}
 	k := channelID + ":" + threadTS
+	normalizedThreadTS := threadTS
 	if threadTS == "" {
 		k = channelID + ":" + messageTS
+		normalizedThreadTS = messageTS
 	}
 	b.latestPostTS.Store(k, messageTS)
+	if b.sessions != nil {
+		b.sessions.SetLatestPostTS(channelID, normalizedThreadTS, messageTS)
+	}
 }
 
 // LatestPostTS returns the TS of the most-recent post tracked for
-// (channel, thread). Empty string if the bot has posted nothing in
-// this bucket yet.
+// (channel, thread). Prefers the in-memory sync.Map (hot path used
+// by the file sync watcher on every message) and falls back to the
+// persisted SessionMapping.LatestPostTS when the map is cold — the
+// map empties on every bot restart, so without the fallback every
+// idle/closed session's `[latest →]` link would vanish on the next
+// bounce. Empty string if the bot has posted nothing in this bucket
+// and no persisted value exists either.
 func (b *Bot) LatestPostTS(channelID, threadTS string) string {
 	v, _ := b.latestPostTS.Load(channelID + ":" + threadTS)
-	s, _ := v.(string)
-	return s
+	if s, _ := v.(string); s != "" {
+		return s
+	}
+	if b.sessions != nil {
+		return b.sessions.LatestPostTS(channelID, threadTS)
+	}
+	return ""
 }
 
 // LatestPermalinkFor returns a clickable Slack permalink to the
@@ -321,13 +669,61 @@ func (b *Bot) PermalinkFor(channelID, messageTS string) string {
 	return url
 }
 
-// UpdateMessage updates an existing message.
+// UpdateMessage updates an existing message with the same retry
+// policy as PostMessage.
 func (b *Bot) UpdateMessage(channelID, ts, text string) error {
-	_, _, _, err := b.client.UpdateMessage(
-		channelID,
-		ts,
-		slack.MsgOptionText(text, false),
-	)
+	preview := text
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+	start := time.Now()
+	var err error
+	for attempt := 0; attempt <= len(slackPostRetryBackoffs); attempt++ {
+		if attempt > 0 {
+			time.Sleep(slackPostRetryBackoffs[attempt-1])
+		}
+		_, _, _, err = b.client.UpdateMessage(channelID, ts, slack.MsgOptionText(text, false))
+		if err == nil {
+			break
+		}
+		if attempt < len(slackPostRetryBackoffs) {
+			b.logger.Warn().
+				Err(err).
+				Int("attempt", attempt+1).
+				Str("channel", channelID).
+				Str("ts", ts).
+				Int("bytes", len(text)).
+				Str("preview", preview).
+				Msg("UpdateMessage failed, retrying")
+		}
+	}
+	elapsed := time.Since(start)
+	if err != nil {
+		b.logger.Error().
+			Err(err).
+			Str("channel", channelID).
+			Str("ts", ts).
+			Int("bytes", len(text)).
+			Str("preview", preview).
+			Dur("elapsed", elapsed).
+			Msg("UpdateMessage failed after all retries; edit lost")
+		return oops.Trace(err)
+	}
+	b.logger.Info().
+		Str("channel", channelID).
+		Str("ts", ts).
+		Int("bytes", len(text)).
+		Str("preview", preview).
+		Dur("elapsed", elapsed).
+		Msg("UpdateMessage ok")
+	return nil
+}
+
+// DeleteMessage deletes a message the bot posted. Used by the
+// output-file consolidator when swapping a prior fileshare bundle
+// for a fresh one containing more files.
+func (b *Bot) DeleteMessage(channelID, ts string) error {
+	_, _, err := b.client.DeleteMessage(channelID, ts)
 	if err != nil {
 		return oops.Trace(err)
 	}
@@ -456,6 +852,11 @@ func (b *Bot) handleInteractiveCallback(ctx context.Context, callback slack.Inte
 				Msg("processing block action")
 			b.handler.HandleBlockAction(ctx, &callback, action)
 		}
+	case slack.InteractionTypeViewSubmission:
+		b.logger.Info().
+			Str("view_callback_id", callback.View.CallbackID).
+			Msg("processing view submission")
+		b.handler.HandleViewSubmission(ctx, &callback)
 	default:
 		b.logger.Debug().
 			Str("type", string(callback.Type)).

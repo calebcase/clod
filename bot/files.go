@@ -52,16 +52,6 @@ type DownloadedFile struct {
 type uploadedFile struct {
 	modTime        time.Time // Last modification time when uploaded
 	lastUploadTime time.Time // When the file was last uploaded (for rate limiting)
-	// messageTS is the Slack ts of the most recent sync post for
-	// this file. Populated only for inline-text syncs (code-block
-	// chat.postMessage); empty for file-upload path since
-	// UploadFileV2 doesn't give us a usable message TS and
-	// chat.update can't replace file-attached content anyway.
-	messageTS string
-	// inlineText records whether the last sync for this file was
-	// posted inline (chat.postMessage + code block) so the next
-	// sync can decide whether an in-place edit is possible.
-	inlineText bool
 }
 
 // DownloadToMemory downloads a Slack file to memory using the slack-go client.
@@ -202,8 +192,8 @@ func (f *FileHandler) UploadFromTaskOutputs(
 		return nil, oops.Trace(err)
 	}
 
-	// Use UploadFileV2 (the new API).
-	params := slack.UploadFileV2Parameters{
+	// Use UploadFile (v2 API is now default in slack-go 0.27).
+	params := slack.UploadFileParameters{
 		File:            localPath,
 		FileSize:        int(info.Size()),
 		Filename:        filepath.Base(localPath),
@@ -213,7 +203,7 @@ func (f *FileHandler) UploadFromTaskOutputs(
 		InitialComment:  comment,
 	}
 
-	summary, err := f.client.UploadFileV2(params)
+	summary, err := f.client.UploadFile(params)
 	if err != nil {
 		return nil, oops.Trace(err)
 	}
@@ -242,7 +232,7 @@ func (f *FileHandler) UploadSnippet(
 		Str("channel", channelID).
 		Msg("uploading snippet to Slack")
 
-	params := slack.UploadFileV2Parameters{
+	params := slack.UploadFileParameters{
 		Content:         content,
 		FileSize:        len(content),
 		Filename:        title + ".txt",
@@ -252,7 +242,7 @@ func (f *FileHandler) UploadSnippet(
 		ThreadTimestamp: threadTS,
 	}
 
-	summary, err := f.client.UploadFileV2(params)
+	summary, err := f.client.UploadFile(params)
 	if err != nil {
 		return nil, oops.Trace(err)
 	}
@@ -415,20 +405,18 @@ func (f *FileHandler) WatchOutputs(
 // small JSON files that users tend to iterate on.
 const inlineSyncMaxBytes = 16 * 1024
 
-// uploadNewFiles checks for and uploads any new or modified files in the task directory.
+// uploadNewFiles checks for and uploads any new or modified files in
+// the task directory. Every eligible file becomes its own Slack
+// message — no consolidation, no edit-in-place. Earlier iterations
+// tried both (per-file edit-in-place, then multi-file bundling into
+// one message) and both dropped legitimate updates on the floor.
+// See git history around v0.34.0 → v0.36.x for what got ripped out.
 //
 // Two post paths:
 //   - inline (small text, valid UTF-8): chat.postMessage with a code
-//     block containing the full content. Editable via chat.update.
-//     When the same file is re-synced and the bot hasn't posted
-//     anything else to the thread since, the previous message is
-//     updated in place rather than a new one being posted — this
-//     stops iterative edits of the same script from flooding the
-//     thread.
+//     block containing the full content.
 //   - file-share (binary or larger than inlineSyncMaxBytes): the
-//     existing files.uploadV2 path. Slack's API doesn't let us
-//     meaningfully edit a file-share message's attached content, so
-//     this path always posts a new message.
+//     existing files.uploadV2 path via UploadFromTaskOutputs.
 func (f *FileHandler) uploadNewFiles(
 	taskPath string,
 	channelID string,
@@ -503,27 +491,19 @@ func (f *FileHandler) uploadNewFiles(
 		inlineCandidate := len(content) <= inlineSyncMaxBytes && isPrintableUTF8(content)
 
 		if inlineCandidate {
-			messageTS, usedEdit := f.syncInline(channelID, threadTS, name, content, tracked)
-			if messageTS != "" {
+			if err := f.postInline(channelID, threadTS, name, content); err != nil {
+				f.logger.Warn().Err(err).Str("file", name).Msg("inline post failed; falling back to file-share")
+			} else {
 				uploaded[name] = &uploadedFile{
 					modTime:        info2.ModTime(),
 					lastUploadTime: time.Now(),
-					messageTS:      messageTS,
-					inlineText:     true,
 				}
-				f.logger.Debug().
-					Str("file", name).
-					Bool("edited", usedEdit).
-					Str("message_ts", messageTS).
-					Msg("inline file sync posted")
 				continue
 			}
-			// Fall through to file-upload path on inline failure.
 		}
 
 		// Binary / large / inline-failed: use the file-upload path.
-		_, err = f.UploadFromTaskOutputs(localPath, channelID, threadTS, fmt.Sprintf(":outbox_tray: Output: `%s`", name))
-		if err != nil {
+		if _, err := f.UploadFromTaskOutputs(localPath, channelID, threadTS, fmt.Sprintf(":outbox_tray: Output: `%s`", name)); err != nil {
 			f.logger.Error().Err(err).Str("file", name).Msg("failed to upload output file")
 			continue
 		}
@@ -534,64 +514,38 @@ func (f *FileHandler) uploadNewFiles(
 	}
 }
 
-// syncInline posts (or edits) a code-block message carrying the file's
-// content. Edits only when the bot hasn't posted anything else on
-// this thread since the previous inline sync message for this file —
-// otherwise posts a new message so the update lands below the
-// interleaved activity. Returns the resolved Slack message TS and
-// whether an in-place edit was used.
-func (f *FileHandler) syncInline(
-	channelID, threadTS, name string,
-	content []byte,
-	tracked *uploadedFile,
-) (string, bool) {
-	body := formatInlineSyncMessage(name, content)
-
-	// Edit path: previous inline sync message exists, and the thread's
-	// latest bot post is still that message.
-	if tracked != nil && tracked.inlineText && tracked.messageTS != "" && f.bot != nil {
-		if f.bot.LatestPostTS(channelID, threadTS) == tracked.messageTS {
-			if err := f.bot.UpdateMessage(channelID, tracked.messageTS, body); err == nil {
-				return tracked.messageTS, true
-			} else {
-				f.logger.Warn().Err(err).Str("file", name).Msg("inline sync edit failed; falling back to post-new")
-			}
+// postInline writes one file's content as a code-block message. Every
+// call produces a fresh Slack message — no chat.update, no bundling.
+// Called by uploadNewFiles; the caller decides inline vs file-share
+// based on size + printability.
+func (f *FileHandler) postInline(channelID, threadTS, name string, content []byte) error {
+	trimmed := trimTrailingNewlines(content)
+	body := fmt.Sprintf(":outbox_tray: Output: `%s`\n```\n%s\n```", name, string(trimmed))
+	if f.bot != nil {
+		if _, err := f.bot.PostMessage(channelID, body, threadTS); err != nil {
+			return oops.Trace(err)
 		}
+		return nil
 	}
-
-	// Post-new path.
-	if f.bot == nil {
-		// AttachBot wasn't wired; posting falls back to direct client call.
-		opts := []slack.MsgOption{slack.MsgOptionText(body, false)}
-		if threadTS != "" {
-			opts = append(opts, slack.MsgOptionTS(threadTS))
-		}
-		_, ts, err := f.client.PostMessage(channelID, opts...)
-		if err != nil {
-			f.logger.Error().Err(err).Str("file", name).Msg("failed to post inline sync (no bot)")
-			return "", false
-		}
-		return ts, false
+	// Fallback for the bot-less test path.
+	opts := []slack.MsgOption{slack.MsgOptionText(body, false)}
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
-	ts, err := f.bot.PostMessage(channelID, body, threadTS)
-	if err != nil {
-		f.logger.Error().Err(err).Str("file", name).Msg("failed to post inline sync")
-		return "", false
+	if _, _, err := f.client.PostMessage(channelID, opts...); err != nil {
+		return oops.Trace(err)
 	}
-	return ts, false
+	return nil
 }
 
-// formatInlineSyncMessage renders `name` + content as a mrkdwn
-// message with a code block. Tabs inside content are preserved;
-// trailing whitespace is trimmed so the closing fence stays flush.
-func formatInlineSyncMessage(name string, content []byte) string {
-	text := string(content)
-	// Trim only trailing newlines so the closing ``` sits on its
-	// own line without extra blank padding.
-	for len(text) > 0 && (text[len(text)-1] == '\n' || text[len(text)-1] == '\r') {
-		text = text[:len(text)-1]
+// trimTrailingNewlines strips \n and \r from the end of content so the
+// closing code fence sits flush.
+func trimTrailingNewlines(content []byte) []byte {
+	end := len(content)
+	for end > 0 && (content[end-1] == '\n' || content[end-1] == '\r') {
+		end--
 	}
-	return fmt.Sprintf(":outbox_tray: Output: `%s`\n```\n%s\n```", name, text)
+	return content[:end]
 }
 
 // isPrintableUTF8 reports whether b looks like printable text. We
