@@ -95,16 +95,6 @@ type Bot struct {
 	// given (channel, ts) are stable forever, so the cache is
 	// append-only.
 	permalinkCache sync.Map
-
-	// injectedMessageTS records message TSes we dispatched from the
-	// starvation probe (conversations.replies backfill). If Slack
-	// later re-delivers the same message via Socket Mode (which
-	// happens when the applink was late but eventually recovered),
-	// handleCallbackEvent checks this map and drops the duplicate.
-	// Key: "channel:ts". Value: time.Time when injected — used only
-	// by the periodic pruner to age entries out. Entries are also
-	// removed on the socket-mode dedup hit.
-	injectedMessageTS sync.Map
 }
 
 // NewBot creates a new Bot instance.
@@ -237,58 +227,10 @@ func (b *Bot) runEventStarvationWatchdog(ctx context.Context) {
 	}
 }
 
-// channelTypeFromID infers Slack's `channel_type` string from the
-// channel ID prefix so a probe-injected MessageEvent carries the
-// same value Socket Mode would have populated. Slack's public
-// convention: C = public channel, G = private channel/group, D = DM,
-// (M = mpim, but we treat as group).
-func channelTypeFromID(channelID string) string {
-	if channelID == "" {
-		return ""
-	}
-	switch channelID[0] {
-	case 'D':
-		return "im"
-	case 'G', 'M':
-		return "group"
-	case 'C':
-		return "channel"
-	}
-	return ""
-}
-
-// dropIfProbeInjected returns true when the given (channel, ts) was
-// already dispatched via the starvation-probe backfill. Slack Socket
-// Mode can late-deliver events the applink held during a routing blip;
-// without this guard the recovered message would be processed twice —
-// once from the probe injection and once from the delayed WS delivery
-// — producing a duplicate reply. The entry is removed on hit so a
-// legitimate future event with the same ts (implausible for Slack but
-// belt-and-suspenders) isn't silently swallowed.
-func (b *Bot) dropIfProbeInjected(channelID, ts, source string) bool {
-	if ts == "" {
-		return false
-	}
-	key := channelID + ":" + ts
-	if _, ok := b.injectedMessageTS.LoadAndDelete(key); ok {
-		b.logger.Info().
-			Str("channel", channelID).
-			Str("ts", ts).
-			Str("source", source).
-			Msg("dropping duplicate socket-mode delivery for probe-injected message")
-		return true
-	}
-	return false
-}
-
 // probeMissedMessages walks the currently-running tasks and asks
 // Slack directly via conversations.replies whether it has messages
-// beyond the last TS we've processed. Any returned message is
-// injected back through the same handler path a live socket-mode
-// delivery would have taken — treating Socket Mode as best-effort
-// and using this probe as the durability layer. injectedMessageTS
-// records the dispatched TS so a late Socket Mode redelivery of
-// the same message is dropped as a duplicate.
+// beyond the last TS we've processed. Any returned messages are
+// proof of a socket-mode starvation and get logged at Warn.
 //
 // Errors from the Slack API are logged at Debug — the probe is
 // diagnostic, so a transient failure isn't itself an alarm.
@@ -380,45 +322,7 @@ func (b *Bot) probeMissedMessages(ctx context.Context, silence time.Duration, la
 			Str("last_seen_ts", lastTS).
 			Int("missed_count", len(missed)).
 			Strs("missed", summaries).
-			Msg("Slack event pipe starvation CONFIRMED: Slack has messages we did not receive — injecting via handler")
-
-		// Inject each missed message back through HandleMessage.
-		// Thread replies (both DM and channel) arrive on Socket Mode
-		// as MessageEvent, so a synthetic MessageEvent gives us
-		// symmetric routing — HandleMessage's DM leading-mention
-		// re-dispatcher (handlers.go ~line 712) will hand it to
-		// HandleAppMention if applicable. Mark the TS as injected
-		// BEFORE dispatching so if the delayed Socket Mode delivery
-		// races us (unlikely but possible), dropIfProbeInjected wins.
-		for _, m := range missed {
-			// Skip messages authored by the bot / other bots — bots
-			// route through separate handlers and the socket-mode
-			// dispatcher filters them; injecting one here would run
-			// the "message from a bot" path twice.
-			if m.BotID != "" || m.SubType == "bot_message" {
-				continue
-			}
-			key := channelID + ":" + m.Timestamp
-			b.injectedMessageTS.Store(key, time.Now())
-			b.bumpLastMessageTS(channelID, m.ThreadTimestamp, m.Timestamp)
-			synthetic := &slackevents.MessageEvent{
-				Type:            "message",
-				User:            m.User,
-				Text:            m.Text,
-				TimeStamp:       m.Timestamp,
-				ThreadTimeStamp: m.ThreadTimestamp,
-				Channel:         channelID,
-				ChannelType:     channelTypeFromID(channelID),
-				EventTimeStamp:  m.Timestamp,
-				ClientMsgID:     m.ClientMsgID,
-			}
-			b.logger.Info().
-				Str("channel", channelID).
-				Str("ts", m.Timestamp).
-				Str("user", m.User).
-				Msg("injecting probe-recovered message via HandleMessage")
-			b.handler.HandleMessage(ctx, synthetic)
-		}
+			Msg("Slack event pipe starvation CONFIRMED: Slack has messages we did not receive")
 		return true
 	})
 }
@@ -548,15 +452,9 @@ func (b *Bot) handleEventsAPIEvent(ctx context.Context, evt slackevents.EventsAP
 func (b *Bot) handleCallbackEvent(ctx context.Context, innerEvent slackevents.EventsAPIInnerEvent) {
 	switch ev := innerEvent.Data.(type) {
 	case *slackevents.AppMentionEvent:
-		if b.dropIfProbeInjected(ev.Channel, ev.TimeStamp, "app_mention") {
-			return
-		}
 		b.bumpLastMessageTS(ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp)
 		b.handler.HandleAppMention(ctx, ev)
 	case *slackevents.MessageEvent:
-		if b.dropIfProbeInjected(ev.Channel, ev.TimeStamp, "message") {
-			return
-		}
 		b.bumpLastMessageTS(ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp)
 		b.handler.HandleMessage(ctx, ev)
 	case *slackevents.ReactionAddedEvent:
