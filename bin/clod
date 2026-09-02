@@ -222,11 +222,9 @@ ENV PATH="$PATH:$USER_HOME/bin:$USER_HOME/.local/bin"
 # container rebuilds are reproducible and so we can roll forward
 # deliberately when we've read the changelog. Upstream install.sh
 # takes 'stable', 'latest', or a MAJOR.MINOR.PATCH string as the
-# first positional arg. Bumped 2026-07-22: 2.1.210 → 2.1.217 to
-# pick up the quadratic message-normalization fix (v2.1.216); the
-# SSE-stall wedge class (upstream #54434) is unaffected — still
-# open, no fix in 211–217.
-RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.217
+# first positional arg. Bumped 2026-09-02: 2.1.217 → 2.1.258
+# (latest) to roll forward to the current release.
+RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.258
 
 # Pre-populate ~/.ssh/known_hosts with the published SSH host keys
 # for the major git forges so the agent doesn't get an interactive
