@@ -57,6 +57,7 @@ func buildHomeTabView(
 	rollup map[string][]UsageTotals,
 	permalinkFor func(channelID, messageTS string) string,
 	latestPermalinkFor func(channelID, threadTS string) string,
+	livenessFor func(channelID, threadTS string) time.Time,
 	userID string,
 	includeWorkspace bool,
 	botVersion string,
@@ -92,7 +93,7 @@ func buildHomeTabView(
 	recent := filterRecent(mine, now, personalSectionRecency)
 	blocks = append(blocks, slack.NewDividerBlock())
 	blocks = append(blocks, buildUsageHeader("Your recent sessions (active in the last 7 days)", recent))
-	blocks = append(blocks, buildSessionRows(recent, now, false, permalinkFor, latestPermalinkFor)...)
+	blocks = append(blocks, buildSessionRows(recent, now, false, permalinkFor, latestPermalinkFor, livenessFor)...)
 
 	if includeWorkspace {
 		blocks = append(blocks, slack.NewDividerBlock())
@@ -160,7 +161,7 @@ func buildUsageHeader(title string, sessions []*SessionMapping) slack.Block {
 // -session blocks, most-recently-updated first. When `showUser` is
 // true each row prefixes the owner with <@UID>, for the workspace
 // section where rows span users.
-func buildSessionRows(sessions []*SessionMapping, now time.Time, showUser bool, permalinkFor func(channelID, messageTS string) string, latestPermalinkFor func(channelID, threadTS string) string) []slack.Block {
+func buildSessionRows(sessions []*SessionMapping, now time.Time, showUser bool, permalinkFor func(channelID, messageTS string) string, latestPermalinkFor func(channelID, threadTS string) string, livenessFor func(channelID, threadTS string) time.Time) []slack.Block {
 	sorted := append([]*SessionMapping(nil), sessions...)
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].UpdatedAt.After(sorted[j].UpdatedAt)
@@ -179,7 +180,7 @@ func buildSessionRows(sessions []*SessionMapping, now time.Time, showUser bool, 
 	rows := make([]slack.Block, 0, len(sorted))
 	for _, s := range sorted {
 		rows = append(rows, slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", formatSessionLine(s, now, showUser, permalinkFor, latestPermalinkFor), false, false),
+			slack.NewTextBlockObject("mrkdwn", formatSessionLine(s, now, showUser, permalinkFor, latestPermalinkFor, livenessFor), false, false),
 			nil, nil,
 		))
 	}
@@ -194,10 +195,30 @@ func buildSessionRows(sessions []*SessionMapping, now time.Time, showUser bool, 
 // bot post, a `[latest →]` link is rendered alongside the task
 // name so users can jump straight to the most recent activity
 // without scrolling from the anchor.
-func formatSessionLine(s *SessionMapping, now time.Time, showUser bool, permalinkFor func(channelID, messageTS string) string, latestPermalinkFor func(channelID, threadTS string) string) string {
+func formatSessionLine(s *SessionMapping, now time.Time, showUser bool, permalinkFor func(channelID, messageTS string) string, latestPermalinkFor func(channelID, threadTS string) string, livenessFor func(channelID, threadTS string) time.Time) string {
 	status := ":white_circle: idle"
 	if s.Active {
 		status = ":large_green_circle: active"
+		// Overlay stream-freshness info for active sessions so the
+		// user can distinguish "actively producing output" from
+		// "silent — could be tool-wait or wedged" without opening
+		// the thread. livenessFor returns the timestamp of the
+		// most-recent parsed stream line, or zero if not currently
+		// running or nothing seen yet. Thresholds match the
+		// runner's __ALIVE__/__STALE__ ticker.
+		if livenessFor != nil {
+			if lastAt := livenessFor(s.ChannelID, s.ThreadTS); !lastAt.IsZero() {
+				since := now.Sub(lastAt)
+				switch {
+				case since < 60*time.Second:
+					status += fmt.Sprintf(" · :satellite_antenna: streaming (%s)", humanizeDuration(since))
+				case since < 5*time.Minute:
+					status += fmt.Sprintf(" · :hourglass_flowing_sand: quiet (%s)", humanizeDuration(since))
+				default:
+					status += fmt.Sprintf(" · :warning: silent for %s", humanizeDuration(since))
+				}
+			}
+		}
 	}
 
 	// Prefer the reaction anchor (the user's @-mention that kicked
@@ -404,13 +425,13 @@ func buildHomeHelpBlocks() []slack.Block {
 		"• `@bot :: <instructions>` — start a session in a fresh auto-named domain; pick a template or Custom setup in the two-step init dialog\n" +
 		"• `@bot *: <instructions>` — start a session in the workspace root itself (no per-domain subdirectory). Filesync and plan mode default off.\n" +
 		"• `@bot !: <instructions>` — start a host-direct session — runs claude directly on the host (no docker sandbox; confirmation required)\n" +
-		"• Any of the above can be prefixed with a model name to pick a specific model up front: `@bot opus services: …`, `@bot sonnet[1m] :: …`, `@bot claude-haiku-4-5 *: …` etc. Same models `@bot set model=` accepts (`opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`, `claude-(opus|sonnet|haiku)-X.Y…`, plus optional `[1m]` suffix for 1M-context variants)."
+		"• Any of the above can be prefixed with a model name to pick a specific model up front: `@bot opus services: …`, `@bot sonnet[1m] :: …`, `@bot claude-fable-5 *: …`, `@bot claude-opus-4-8 :: …`, `@bot claude-haiku-4-5 *: …` etc. Same models `@bot set model=` accepts (`fable`, `opus`, `sonnet`, `haiku`, `best`, `default`, `opusplan`, `claude-(fable|opus|sonnet|haiku)-X.Y…`, plus optional `[1m]` suffix for 1M-context variants on opus/sonnet)."
 
 	perThread := "*Per-session commands* (any active thread)\n" +
 		"• `@bot close` — stop the agent and close the session. Auto-resume on bot restart is disabled until you @-mention again.\n" +
 		"• `@bot upload <path>` — upload a host-filesystem file (or directory, with a recursive-vs-top-level prompt) into this thread. >5 files get zipped to /tmp first.\n" +
 		"• `@bot allow @user` / `@bot disallow @user` — manage who else can drive this session\n" +
-		"• `@bot set model=opus|sonnet|haiku|best|default|opusplan` — switch model family. `+` / `-` to cycle, or send 🎼 / 📜 / 🌸. Specific releases also work: `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, etc., plus 1M-context variants `opus[1m]` / `sonnet[1m]`. While the agent is running, the bot cancels and resumes with the new model.\n" +
+		"• `@bot set model=fable|opus|sonnet|haiku|best|default|opusplan` — switch model family. `+` / `-` to cycle (fable is excluded from the cycle — top-tier pricing; opt in explicitly). Or send 📖 / 🎼 / 📜 / 🌸. Specific releases also work: `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5`, etc., plus 1M-context variants `opus[1m]` / `sonnet[1m]`. While the agent is running, the bot cancels and resumes with the new model.\n" +
 		"• `@bot set effort=low|medium|high|xhigh|max` — set how long claude thinks per turn. `+` / `-` to step. `clear` removes the override (model default applies). While the agent is running, the bot cancels and resumes with the new effort.\n" +
 		"• `@bot set verbosity=0|1|-1` — silent / summary / full. Or 🙈 / 💬\n" +
 		"• `@bot set plan=on|off` — toggle plan mode. Or `+` / `-` / 💭\n" +

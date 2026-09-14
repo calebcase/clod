@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -12,7 +14,7 @@ import (
 )
 
 // Version is the bot version. Update this when releasing.
-const Version = "0.32.0"
+const Version = "0.38.5"
 
 type Flags struct {
 	Log struct {
@@ -41,9 +43,9 @@ type Flags struct {
 
 	VerbosityLevel int `kong:"default='0',env='CLOD_BOT_VERBOSITY_LEVEL',help='Default verbosity level: -1 (silent), 0 (summary), 1 (full)'"`
 
-	DefaultModel string `kong:"default='',env='CLOD_BOT_DEFAULT_MODEL',help='Default claude --model to use (e.g. opus, sonnet, claude-haiku-4-5). Empty defers to claude default.'"`
+	DefaultModel string `kong:"default='',env='CLOD_BOT_DEFAULT_MODEL',help='Default claude --model to use (e.g. fable, opus, sonnet, claude-fable-5, claude-opus-4-8, claude-haiku-4-5). Empty defers to claude default.'"`
 
-	GracefulShutdownTTL time.Duration `kong:"default='30s',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
+	GracefulShutdownTTL time.Duration `kong:"default='2m',env='CLOD_BOT_GRACEFUL_SHUTDOWN_TTL',help='Time to wait for graceful shutdown'"`
 
 	ResumeStaleAfter time.Duration `kong:"default='30m',env='CLOD_BOT_RESUME_STALE_AFTER',help='Active sessions older than this are treated as stale on startup (flag cleared, no auto-resume). Set to 0 to disable auto-resume entirely.'"`
 }
@@ -80,6 +82,20 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		Str("path", cli.SessionStorePath).
 		Msg("loaded sessions from storage")
 
+	// SchedulingRegistry backs the cron_* / bg_* MCP shim served by
+	// bot/schedbridge in each session container. Storage lives next to
+	// sessions.json under a `crons.json` sibling (see mcp-shim.md §4.3).
+	// Ticker starts inside NewSchedulingRegistry's Start so persisted
+	// crons resume at boot.
+	scheduling, err := NewSchedulingRegistry(deriveCronsPath(cli.SessionStorePath), logger)
+	if err != nil {
+		return err
+	}
+	scheduling.Start()
+	logger.Info().
+		Str("path", deriveCronsPath(cli.SessionStorePath)).
+		Msg("scheduling registry loaded")
+
 	// Resolve the workspace README path relative to the workspace
 	// dir when it isn't already absolute, so the default
 	// `README.md` lands at `<WorkspacePath>/README.md`.
@@ -96,6 +112,7 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		auth,
 		domains,
 		sessions,
+		scheduling,
 		runner,
 		cli.VerboseTools,
 		cli.VerbosityLevel,
@@ -123,6 +140,47 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 	// Signal handling (buffer of 2 to catch second signal for force exit)
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
+	// SIGUSR1 handler: dump every goroutine's stack to a
+	// timestamped file under /tmp so a live wedge can be inspected
+	// without killing the process. Handy for the recurring perm-loop
+	// wedge (eerie-eagle 2026-06 to 2026-07) where the goroutine is
+	// visibly alive but not selecting from its channel — we need
+	// the stack to know where it's actually parked.
+	//
+	// Usage: kill -USR1 <bot pid>. Output goes to
+	// /tmp/clod-bot-stacks-<UTC timestamp>.txt.
+	usr1 := make(chan os.Signal, 1)
+	signal.Notify(usr1, syscall.SIGUSR1)
+	go func() {
+		for range usr1 {
+			ts := time.Now().UTC().Format("20060102T150405Z")
+			path := fmt.Sprintf("/tmp/clod-bot-stacks-%s.txt", ts)
+			// Grow the buffer until the full stack fits. Starts
+			// at 1 MiB; goroutine dumps rarely exceed a few MiB
+			// but caps at 64 MiB so a runaway can't OOM the box.
+			bufSize := 1 << 20
+			const maxBuf = 64 << 20
+			var out []byte
+			for {
+				buf := make([]byte, bufSize)
+				n := runtime.Stack(buf, true)
+				if n < bufSize || bufSize >= maxBuf {
+					out = buf[:n]
+					break
+				}
+				bufSize *= 2
+			}
+			if err := os.WriteFile(path, out, 0o644); err != nil {
+				logger.Error().Err(err).Str("path", path).Msg("SIGUSR1: failed to write goroutine stack dump")
+				continue
+			}
+			logger.Warn().
+				Str("path", path).
+				Int("bytes", len(out)).
+				Msg("SIGUSR1: wrote goroutine stack dump")
+		}
+	}()
 
 	select {
 	case <-signals:
@@ -157,9 +215,24 @@ func (cli *CLI) Run(ctx *context.Context, logger zerolog.Logger) (err error) {
 		}
 	}
 
+	// Stop the scheduling engine so no more ticks fire mid-shutdown.
+	// Note: this does NOT cancel per-session sockets; those are
+	// tied to runClod lifecycle and torn down when the containers exit.
+	// It only stops the cron engine goroutine itself.
+	scheduling.Stop()
+
 	// Save sessions before exit
 	if saveErr := sessions.Save(); saveErr != nil {
 		logger.Error().Err(saveErr).Msg("failed to save sessions")
+		if err == nil {
+			err = saveErr
+		}
+	}
+	// Save scheduling registry too. UpdateFireResult saves per-tick
+	// already, so this is a belt-and-suspenders capture of any
+	// last-second Add/Delete that didn't survive to disk yet.
+	if saveErr := scheduling.Save(); saveErr != nil {
+		logger.Error().Err(saveErr).Msg("failed to save scheduling registry")
 		if err == nil {
 			err = saveErr
 		}

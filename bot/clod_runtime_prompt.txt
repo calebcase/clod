@@ -1,1 +1,15 @@
-Runtime: you run inside an ephemeral docker container that may be interrupted and restarted. Only files under the current working directory (the project dir, bind-mounted from the host) persist across restarts — /tmp, /root, /home, and everything outside cwd vanish when the container exits. Save progress notes, logs, and any state you'd need to resume into files under cwd (a dedicated subdir is fine, but avoid `.clod/` which the wrapper owns). On startup, look for that state first and continue from where you left off instead of redoing completed work. Background jobs (including the Monitor tool) die with the container; re-establish them on resume if still needed.
+Runtime: you run inside an ephemeral docker container that may be interrupted and restarted (user changes `model`/`effort`, container is closed, graceful shutdown, etc.). Only files under the current working directory (bind-mounted from the host) persist — `/tmp`, `/root`, `/home`, and everything outside cwd vanish when the container exits. Save progress notes, logs, and any state you'd need to resume into files under cwd (avoid `.clod/`, the wrapper owns it). On startup, look for that state first and continue from where you left off instead of redoing completed work.
+
+Scheduling: this runtime provides its own scheduling MCP tools that are safe across container restarts and turn-end-waiting — use these in preference to Claude-native alternatives:
+
+- `cron_create` / `cron_list` / `cron_delete` (server: `scheduling`) — schedule a shell command to run on a recurring interval, driven by the bot on the host. The command runs outside the docker container, so restarts and turn-end-waiting don't stop it. Use for watchdogs, periodic health checks, "keep advancing every N minutes" workflows. Prefer this over Claude-native `CronCreate` / `CronList` / `CronDelete` and `ScheduleWakeup` — those are session-scheduler-scoped and go dormant the moment you end a turn with no outstanding tool call.
+
+Do NOT use these features — they do not survive our harness:
+
+- Claude-native `CronCreate` / `CronList` / `CronDelete`, `ScheduleWakeup`, `/loop` dynamic mode — session-scheduler-scoped; go dormant on turn-end-waiting, drop on restart. If you `CronCreate` a watchdog and end your turn cleanly, it will silently stop firing until the user @-mentions again.
+- Bash `run_in_background=true` + `Monitor` + `BashOutput` — the process dies with the container on any restart, and Monitor/BashOutput can't be re-attached after `--resume`. Use `nohup ... &` inside a `bash -c` for fire-and-forget host-side jobs whose lifetime is bounded by the container staying up; the survived-across-restarts alternative for that class of work will be `bg_run` (phase 2, not yet available).
+
+Complementary practices:
+
+- Persist enough state in files under cwd (progress markers, next-step notes, pending work items, PIDs, log paths) that any future @-mention — minutes to days later, possibly after a restart — can pick up cleanly.
+- For "watch until X happens then do Y" workflows: `cron_create` handles the watch (a shell command that checks and appends to a log); the react-to-result step happens when the user @-mentions and you read the log. If you need the action step to happen autonomously without a user @-mention, ask the user to set up host-side cron/systemd to poke the bot on their schedule.

@@ -414,3 +414,72 @@ func bufferLooksIncomplete(s string) bool {
 	}
 	return false
 }
+
+// stitchCodeFence keeps a streaming code fence balanced across a
+// flush boundary. When claude streams a long code block (e.g.
+// `cat pixlr_usage.csv` output), the runClod flusher chops it into
+// ~1500-char Slack posts. Without stitching, the fence opens in one
+// message and closes in another — Slack renders the tail as plain
+// text because that message's mrkdwn parser never sees the opener.
+//
+// Invariant: the returned `out` always has balanced fences. If the
+// caller's content leaves a fence open, stitchCodeFence appends a
+// closing ``` and returns nowOpen=true so the next flush can
+// re-open with the same language tag.
+//
+// Fence-language handling: an opener like "```csv" carries "csv" as
+// the info string; the closer is a bare "```". stitchCodeFence
+// captures the language from the opener and re-emits it on
+// re-open so syntax highlighting survives the stitch.
+//
+// Only fences at the start of a line count, matching the CommonMark
+// rule and bufferLooksIncomplete's detection.
+func stitchCodeFence(content string, openAtStart bool, langAtStart string) (out string, nowOpen bool, nowLang string) {
+	// Walk the CONTENT (not the concatenated output) to decide the
+	// final fence state. Any prepended opener we add on the way out
+	// is bookkeeping for downstream messages, not new fence
+	// markup — the content already reflects whatever fences the
+	// stream itself contains.
+	open := openAtStart
+	lang := langAtStart
+	for i := 0; i < len(content); {
+		atLineStart := i == 0 || content[i-1] == '\n'
+		if !atLineStart {
+			i++
+			continue
+		}
+		if i+3 > len(content) || content[i:i+3] != "```" {
+			i++
+			continue
+		}
+		j := i + 3
+		lineEnd := j
+		for lineEnd < len(content) && content[lineEnd] != '\n' {
+			lineEnd++
+		}
+		info := strings.TrimSpace(content[j:lineEnd])
+		if open {
+			open = false
+			lang = ""
+		} else {
+			open = true
+			lang = info
+		}
+		i = lineEnd
+	}
+
+	var b strings.Builder
+	if openAtStart {
+		b.WriteString("```")
+		b.WriteString(langAtStart)
+		b.WriteByte('\n')
+	}
+	b.WriteString(content)
+	if open {
+		if !strings.HasSuffix(content, "\n") {
+			b.WriteByte('\n')
+		}
+		b.WriteString("```")
+	}
+	return b.String(), open, lang
+}

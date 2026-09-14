@@ -19,10 +19,13 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
+	"time"
 )
 
 const (
@@ -195,18 +198,26 @@ func handleToolCall(id json.RawMessage, rawParams json.RawMessage) {
 	}
 	requestFIFO := filepath.Join(runtimeDir, fifoRequestName)
 	responseFIFO := filepath.Join(runtimeDir, fifoResponseName)
-	if _, err := os.Stat(requestFIFO); err != nil {
-		logf("request FIFO missing at %s: %v", requestFIFO, err)
-		respondResult(id, denyResult("Permission system not available"))
-		return
-	}
-	if _, err := os.Stat(responseFIFO); err != nil {
-		logf("response FIFO missing at %s: %v", responseFIFO, err)
-		respondResult(id, denyResult("Permission system not available"))
-		return
-	}
 
-	logf("permission requested for tool: %s", args.ToolName)
+	// Per-request correlation tag. Pairs with the bot's resp_id
+	// so log lines from a hung FIFO open can be matched across
+	// process boundaries. The June 2026 deadlock had both sides
+	// blocked in wait_for_partner on the same path; without
+	// per-request ids the cause was unrecoverable from the logs.
+	reqID := shortHexID()
+	reqStat := fifoStat(requestFIFO)
+	respStat := fifoStat(responseFIFO)
+	logf("[req=%s] permission requested tool=%s req_fifo=%s req_stat=%s resp_fifo=%s resp_stat=%s",
+		reqID, args.ToolName, requestFIFO, reqStat, responseFIFO, respStat)
+
+	if reqStat == "missing" {
+		respondResult(id, denyResult("Permission system not available (request FIFO missing)"))
+		return
+	}
+	if respStat == "missing" {
+		respondResult(id, denyResult("Permission system not available (response FIFO missing)"))
+		return
+	}
 
 	// Build the request the bot expects and send it over the request FIFO.
 	// Opening a FIFO for write blocks until a reader is present (the bot);
@@ -220,40 +231,54 @@ func handleToolCall(id json.RawMessage, rawParams json.RawMessage) {
 		return
 	}
 
+	logf("[req=%s] opening request FIFO for write", reqID)
+	openStart := time.Now()
+	openDone := make(chan struct{})
+	go pingBlocked(openDone, "[req="+reqID+"] still blocked opening request FIFO", openStart)
 	reqFile, err := os.OpenFile(requestFIFO, os.O_WRONLY, 0)
+	close(openDone)
 	if err != nil {
-		logf("open request FIFO: %v", err)
+		logf("[req=%s] open request FIFO failed after %s: %v", reqID, time.Since(openStart), err)
 		respondResult(id, denyResult(fmt.Sprintf("Open request FIFO: %v", err)))
 		return
 	}
+	logf("[req=%s] opened request FIFO after %s; writing payload (%d bytes)", reqID, time.Since(openStart), len(reqPayload)+1)
 	if _, err := reqFile.Write(append(reqPayload, '\n')); err != nil {
 		_ = reqFile.Close()
-		logf("write request FIFO: %v", err)
+		logf("[req=%s] write request FIFO: %v", reqID, err)
 		respondResult(id, denyResult(fmt.Sprintf("Write request FIFO: %v", err)))
 		return
 	}
 	_ = reqFile.Close()
+	logf("[req=%s] request FIFO closed; opening response FIFO for read", reqID)
 
+	respOpenStart := time.Now()
+	respOpenDone := make(chan struct{})
+	go pingBlocked(respOpenDone, "[req="+reqID+"] still blocked opening response FIFO", respOpenStart)
 	respFile, err := os.Open(responseFIFO)
+	close(respOpenDone)
 	if err != nil {
-		logf("open response FIFO: %v", err)
+		logf("[req=%s] open response FIFO failed after %s: %v", reqID, time.Since(respOpenStart), err)
 		respondResult(id, denyResult(fmt.Sprintf("Open response FIFO: %v", err)))
 		return
 	}
 	defer respFile.Close()
+	logf("[req=%s] opened response FIFO after %s; waiting for line", reqID, time.Since(respOpenStart))
 
 	scanner := bufio.NewScanner(respFile)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	readStart := time.Now()
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
-			logf("read response FIFO: %v", err)
+			logf("[req=%s] read response FIFO failed after %s: %v", reqID, time.Since(readStart), err)
 		} else {
-			logf("empty response from bot")
+			logf("[req=%s] empty response from bot after %s", reqID, time.Since(readStart))
 		}
 		respondResult(id, denyResult("Empty response from permission system"))
 		return
 	}
 	line := scanner.Text()
+	logf("[req=%s] read %d-byte response after %s", reqID, len(line), time.Since(readStart))
 
 	var resp botResponse
 	if err := json.Unmarshal([]byte(line), &resp); err != nil {
@@ -308,5 +333,60 @@ func main() {
 	}
 	if err := reader.Err(); err != nil {
 		logf("stdin scanner: %v", err)
+	}
+}
+
+// shortHexID returns an 8-character random hex string to tag log
+// lines for one MCP request_permission call. Pairs with the bot's
+// resp_id when comparing the two halves of the FIFO handshake.
+func shortHexID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "????????"
+	}
+	return fmt.Sprintf("%x", b[:])
+}
+
+// fifoStat returns a short human-readable description of a FIFO at
+// `path`: "missing" if the path doesn't exist, "not-fifo" if it's
+// a regular file/symlink/etc, or "fifo inode=N dev=N mode=...". The
+// inode/dev pair is what we'd compare across processes to detect a
+// path that was re-created behind our back; mode catches the
+// chmod-stripped-the-write-bit class of misconfiguration.
+func fifoStat(path string) string {
+	st, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "missing"
+		}
+		return fmt.Sprintf("stat-error:%v", err)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Sprintf("mode=%s (non-unix sys)", st.Mode())
+	}
+	kind := "regular"
+	if st.Mode()&os.ModeNamedPipe != 0 {
+		kind = "fifo"
+	}
+	return fmt.Sprintf("%s inode=%d dev=%d mode=%s", kind, sys.Ino, sys.Dev, st.Mode())
+}
+
+// pingBlocked logs a "still blocked" notice every 30s until done is
+// closed. Intended to be launched in a goroutine before a syscall
+// expected to be fast but known to wedge under certain failure
+// modes (FIFO opens with no rendezvous partner). The launching
+// goroutine MUST close `done` after the syscall returns or this
+// will leak.
+func pingBlocked(done <-chan struct{}, msg string, start time.Time) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			logf("%s (blocked for %s)", msg, time.Since(start))
+		}
 	}
 }

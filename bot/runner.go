@@ -13,11 +13,11 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/calebcase/oops"
-	"github.com/creack/pty"
 	"github.com/rs/zerolog"
 )
 
@@ -219,15 +219,12 @@ type ControlResponse struct {
 // RunningTask represents a clod task that is currently executing.
 type RunningTask struct {
 	cmd *exec.Cmd
-	// pty is the master side of a PTY whose slave is wired to the child's
-	// stdout. We never write to it; stream-json output flows out of it.
-	pty *os.File
-	// stdin is a pipe whose reader end is the child's stdin. Writes on this
-	// pipe go straight through docker (-i, no -t) into claude's stream-json
-	// reader inside the container. We intentionally do NOT use the PTY for
-	// stdin because the kernel line discipline (canonical mode, echo, the
-	// MAX_CANON line length cap, ^C/^D interpretation) has no place in a
-	// stream-json transport.
+	// stdout is the read end of the pipe carrying claude's stream-json
+	// output. The write end lives inside the docker CLI subprocess as fd 1.
+	stdout *os.File
+	// stdin is the write end of a pipe whose read end is the child's stdin.
+	// Writes on this pipe go straight through `docker run -i` into claude's
+	// stream-json reader inside the container.
 	stdin                     *os.File
 	output                    chan string
 	done                      chan *Result
@@ -279,6 +276,63 @@ type RunningTask struct {
 	// a bot restart mid-task doesn't orphan the thread.
 	sessionIDCaptured chan string
 	sessionIDOnce     sync.Once
+	// inputWaitingSince is the unix-nano timestamp of the most-
+	// recent SendInput call for which no downstream stream event
+	// has yet arrived. Set by SendInput; cleared by the stream
+	// parser on the next parsed line. Used by the liveness ticker
+	// to detect the specific wedge class where claude receives
+	// stdin bytes but its Node event loop never gets around to
+	// composing a new HTTP request — same fingerprint as upstream
+	// #54434 observed on eagle 2026-07-13 11:50Z where the user's
+	// question sat un-processed for 30+ minutes despite all our
+	// proxy / connection layer being healthy.
+	//
+	// Threshold picked at 2m: a normal turn from stdin input to
+	// first stream event runs 1–5s (claude spawns request +
+	// upstream latency); 2m is well past any legitimate cold-
+	// start jitter, upstream throttling, or the user glancing at
+	// slack between an askq and a follow-up text message, but
+	// still short enough that a genuine wedge is caught within a
+	// couple minutes. Bumped from 60s on 2026-07-21 after several
+	// false-positive fires where user was mid-typing a response.
+	inputWaitingSince atomic.Int64
+
+	// lastStreamAt is the timestamp of the most-recent parsed line
+	// from claude's stream-json stdout. Used by the liveness ticker
+	// as a proxy for "the model is actively producing output".
+	//
+	// A v0.36.6 attempt used SSE `ping` events as the heartbeat, on
+	// the theory that Anthropic sends them every ~15s. That was
+	// wrong for this transport: claude's `--output-format
+	// stream-json` does NOT forward SSE pings to stdout — zero
+	// `"type":"ping"` events appear across the entire log corpus.
+	// Fallback: any parsed stream line counts (content_block_delta,
+	// system.*, message_*, assistant, user, result). During active
+	// model generation these fire multiple times per second, so a
+	// short freshness window reliably captures "actively
+	// producing". Absence of stream events does NOT prove wedged
+	// though — legitimate long tool waits (a background bash job
+	// running python for hours) produce zero events. Absence is a
+	// hint, not a verdict; the Home tab and reaction let the user
+	// interpret it with context they have and the bot doesn't
+	// (what the model was asked to do, how long the tool takes).
+	//
+	// sync/atomic holder because the writer is the stream parser
+	// goroutine and the reader is the liveness ticker.
+	lastStreamAt atomic.Value // time.Time
+	// compactPending is set when the stream emits a
+	// `system.subtype:"compact_boundary"` marker, and cleared on the
+	// next content_block_start. The handler surfaces the paired
+	// __COMPACT_START__/__COMPACT_END__ sentinels as a rolling
+	// "compacting session…" status message so the user can
+	// distinguish a legitimate compaction pause from a wedge.
+	compactPending atomic.Bool
+	// livenessDone is closed by the liveness ticker goroutine when
+	// it returns (via runCtx.Done). The outer stream-parsing
+	// goroutine waits on it before running close(task.output) so
+	// the ticker's __ALIVE__/__STALE__ sends can never race the
+	// close. See runCtx cancel defer chain in the outer goroutine.
+	livenessDone chan struct{}
 }
 
 // closeStdin closes the bot's end of the child's stdin pipe. It's safe to
@@ -479,12 +533,30 @@ func (t *RunningTask) SendInputWithImages(text string, images []ImageData) error
 	if _, err := t.stdin.Write(append(data, '\n')); err != nil {
 		return oops.Trace(err)
 	}
+	// Arm the input-response watchdog. The liveness ticker will
+	// warn if no stream event arrives within its threshold. Only
+	// arm if not already armed — repeated SendInput without an
+	// intervening response (rare but possible for control
+	// messages during a running turn) shouldn't reset the clock
+	// and hide a wedge.
+	t.inputWaitingSince.CompareAndSwap(0, time.Now().UnixNano())
 	return nil
 }
 
 // Output returns the channel for receiving output chunks.
 func (t *RunningTask) Output() <-chan string {
 	return t.output
+}
+
+// LastStreamAt returns the timestamp of the most recently parsed
+// line from claude's stream-json output, or zero if nothing has been
+// seen yet. Read by the Home-tab renderer to display a per-session
+// freshness indicator without needing to reach into runner internals.
+func (t *RunningTask) LastStreamAt() time.Time {
+	if v := t.lastStreamAt.Load(); v != nil {
+		return v.(time.Time)
+	}
+	return time.Time{}
 }
 
 // PermissionRequests returns the channel for receiving permission requests from the FIFO.
@@ -495,11 +567,44 @@ func (t *RunningTask) PermissionRequests() <-chan PermissionRequest {
 	return t.permissionFIFO.Requests()
 }
 
+// RuntimeDir returns the absolute path to this task's runtime dir
+// (where FIFOs, sockets, and embedded bridge binaries live). Used by
+// the handler to start / stop the scheduling MCP socket alongside
+// the task lifecycle.
+func (t *RunningTask) RuntimeDir() string {
+	if t.permissionFIFO == nil {
+		return ""
+	}
+	return t.permissionFIFO.RuntimeDir()
+}
+
+// TaskPath returns the domain dir the task is running inside. Same
+// value handlers.go passed to Runner.Start; re-exposed here so
+// scheduling.StartSocket doesn't have to be threaded a duplicate
+// parameter.
+func (t *RunningTask) TaskPath() string {
+	return t.taskPath
+}
+
 // SendPermissionResponse sends a response to a permission request.
 func (t *RunningTask) SendPermissionResponse(resp PermissionResponse) {
-	if t.permissionFIFO != nil {
-		t.permissionFIFO.SendResponse(resp)
+	if t.permissionFIFO == nil {
+		t.logger.Warn().
+			Str("behavior", resp.Behavior).
+			Msg("SendPermissionResponse called with nil permissionFIFO; dropping silently would strand claude")
+		return
 	}
+	t.permissionFIFO.SendResponse(resp)
+	// Arm the input-response watchdog. A permission response is
+	// input to claude just like a text message: claude should
+	// process it and emit stream events. Without arming here,
+	// post-askq wedges (claude receives the response, then its
+	// event loop stalls before producing any output) are invisible
+	// to the watchdog — the earlier SendInput arm was disarmed by
+	// the askq tool_use stream event, so nothing is left to time
+	// out on. See 2026-07-18 eagle silence between 09:28 askq
+	// answer and no further output.
+	t.inputWaitingSince.CompareAndSwap(0, time.Now().UnixNano())
 }
 
 // ControlPermissionRequests returns the channel for receiving permission requests
@@ -531,8 +636,15 @@ func (t *RunningTask) SendControlResponse(requestID, behavior, message string) e
 		Str("behavior", behavior).
 		Msg("sending control_response")
 
-	_, err = t.stdin.Write(append(data, '\n'))
-	return oops.Trace(err)
+	if _, err := t.stdin.Write(append(data, '\n')); err != nil {
+		return oops.Trace(err)
+	}
+	// Arm the input-response watchdog. Same reasoning as
+	// SendPermissionResponse — the control_response IS the input
+	// claude is blocked on, and a wedge processing it would
+	// otherwise be undetectable.
+	t.inputWaitingSince.CompareAndSwap(0, time.Now().UnixNano())
+	return nil
 }
 
 // Done returns the channel that receives the final result.
@@ -588,6 +700,13 @@ func (t *RunningTask) Shutdown(ctx context.Context, saveStateMsg string, gracePe
 	select {
 	case <-t.done:
 		log.Info().Msg("task exited gracefully within grace period")
+		// Belt-and-suspenders: `docker run --rm` should already have
+		// removed the container when its main process exited, but
+		// don't take that on faith. A redundant stop is cheap
+		// (no-op on an already-cleaned container) and closes the
+		// "session closed but container still running" hole for
+		// daemon-delay / --rm-failure edge cases. See stopContainer.
+		t.stopContainer("graceful path")
 		return true
 	case <-timer.C:
 		log.Warn().Msg("grace period expired; forcing")
@@ -641,27 +760,47 @@ func (t *RunningTask) forceKill() {
 		t.cancel()
 	}
 
-	// Stop the container directly. Tolerate every failure mode:
-	// claude-direct mode (no suffix), container already gone,
-	// docker daemon unreachable.
+	// Stop the container directly. Delegates to stopContainer so the
+	// graceful path can call the same logic — see stopContainer's doc
+	// for why we don't rely on `docker run --rm` autocleanup alone.
+	t.stopContainer("force path")
+}
+
+// stopContainer explicitly `docker stop`s the session's container by
+// runtime-suffix filter. Called from both Shutdown branches:
+//
+//   - Graceful path: `docker run --rm` should have already removed
+//     the container when its main process exited, but daemon delays,
+//     stuck processes, or `--rm` failures leave orphans; a redundant
+//     `docker stop` here is cheap (no-op when the container is
+//     already gone) and closes the "session closed but container
+//     still up" hole.
+//   - Force path: after SIGKILL'ing the process group the docker
+//     client may have died before it could tell the daemon anything,
+//     so the daemon still owns the container. Explicit stop by name
+//     brings it down.
+//
+// Tolerates every failure mode: claude-direct mode (no suffix),
+// container already gone, docker daemon unreachable. `pathLabel`
+// tags log entries so it's clear which branch triggered the call.
+func (t *RunningTask) stopContainer(pathLabel string) {
 	if t.runtimeSuffix == "" {
 		return
 	}
-	// Filter by container name suffix. The bash wrapper builds
-	// names as `clod-<task>-<id>-<suffix>`, so `name=<suffix>$`
-	// (an exact-tail match via regex anchor) hits exactly our
-	// container. Use a short timeout on docker ps so a hung
+	// Filter by container name suffix. The bash wrapper builds names
+	// as `clod-<task>-<id>-<suffix>`, so `name=<suffix>$` (regex tail
+	// anchor) hits exactly our container. Short timeout so a hung
 	// daemon doesn't stall shutdown.
 	psCtx, psCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer psCancel()
 	psOut, err := exec.CommandContext(psCtx, "docker", "ps", "-q", "--filter", "name="+t.runtimeSuffix+"$").Output()
 	if err != nil {
-		t.logger.Debug().Err(err).Str("suffix", t.runtimeSuffix).Msg("docker ps lookup failed; skipping explicit container stop")
+		t.logger.Debug().Err(err).Str("suffix", t.runtimeSuffix).Str("path", pathLabel).Msg("docker ps lookup failed; skipping explicit container stop")
 		return
 	}
 	cids := strings.Fields(string(psOut))
 	if len(cids) == 0 {
-		t.logger.Debug().Str("suffix", t.runtimeSuffix).Msg("no running container matched runtime suffix")
+		t.logger.Debug().Str("suffix", t.runtimeSuffix).Str("path", pathLabel).Msg("no running container matched runtime suffix")
 		return
 	}
 	for _, cid := range cids {
@@ -669,10 +808,74 @@ func (t *RunningTask) forceKill() {
 		err := exec.CommandContext(stopCtx, "docker", "stop", "-t", "5", cid).Run()
 		stopCancel()
 		if err != nil {
-			t.logger.Warn().Err(err).Str("cid", cid).Msg("docker stop failed (force path)")
+			t.logger.Warn().Err(err).Str("cid", cid).Str("path", pathLabel).Msg("docker stop failed")
 		} else {
-			t.logger.Info().Str("cid", cid).Msg("docker stop ok (force path)")
+			t.logger.Info().Str("cid", cid).Str("path", pathLabel).Msg("docker stop ok")
 		}
+	}
+}
+
+// stopOrphanContainersForTaskPath finds every running container whose
+// name matches this task's `clod-<name>-<id>-*` prefix and issues a
+// `docker stop` on it. Called from Runner.Start immediately before
+// spawning the new container so that a leftover container from a
+// prior invocation cannot coexist with the fresh one for the same
+// session.
+//
+// This is a belt-and-suspenders defense against the class of bug
+// where a runClod goroutine's exit path completed (map entry
+// Delete-d, next runClod started) but the underlying container did
+// not tear down — observed on eerie-eagle 2026-07-17 where two
+// containers ran `claude --resume 4ba521cf...` in parallel for 15h.
+// Root cause of the goroutine-vs-container divergence is unclear,
+// but a defensive sweep here makes the "two containers per session"
+// state impossible regardless of upstream cause.
+//
+// name/id come from <taskPath>/.clod/name and .clod/id, the same
+// files bin/clod reads to construct the container name (see line
+// ~524 of bin/clod). Every failure mode is tolerated (missing files,
+// docker daemon unreachable, stop timeout): we don't want the
+// orphan-check to block a legitimate task start.
+func stopOrphanContainersForTaskPath(taskPath string, logger zerolog.Logger) {
+	nameBytes, err := os.ReadFile(filepath.Join(taskPath, ".clod", "name"))
+	if err != nil {
+		logger.Debug().Err(err).Msg("orphan-check: no .clod/name; skipping")
+		return
+	}
+	idBytes, err := os.ReadFile(filepath.Join(taskPath, ".clod", "id"))
+	if err != nil {
+		logger.Debug().Err(err).Msg("orphan-check: no .clod/id; skipping")
+		return
+	}
+	name := strings.ToLower(strings.TrimSpace(string(nameBytes)))
+	id := strings.TrimSpace(string(idBytes))
+	if name == "" || id == "" {
+		return
+	}
+	prefix := fmt.Sprintf("^clod-%s-%s-", name, id)
+	psCtx, psCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer psCancel()
+	out, err := exec.CommandContext(psCtx, "docker", "ps", "-q", "--filter", "name="+prefix).Output()
+	if err != nil {
+		logger.Debug().Err(err).Str("prefix", prefix).Msg("orphan-check: docker ps failed; skipping")
+		return
+	}
+	cids := strings.Fields(string(out))
+	if len(cids) == 0 {
+		return
+	}
+	logger.Warn().
+		Strs("cids", cids).
+		Str("prefix", prefix).
+		Msg("orphan containers found for this task; stopping before new spawn")
+	for _, cid := range cids {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := exec.CommandContext(stopCtx, "docker", "stop", "-t", "5", cid).Run(); err != nil {
+			logger.Warn().Err(err).Str("cid", cid).Msg("orphan-check: docker stop failed")
+		} else {
+			logger.Info().Str("cid", cid).Msg("orphan-check: docker stop ok")
+		}
+		stopCancel()
 	}
 }
 
@@ -860,8 +1063,28 @@ func (r *Runner) Start(
 	taskPath, prompt, sessionID, model, permissionMode string,
 	useClaudeDirect bool,
 ) (*RunningTask, error) {
-	// Create command with timeout context.
-	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	// Create command with a plain cancel-only context. The r.timeout
+	// value (default 24h, CLOD_BOT_TIMEOUT) is enforced as an *idle*
+	// timeout by the liveness ticker below: it cancels runCtx if we go
+	// r.timeout without any stream event from claude. That preserves
+	// the runaway backstop for genuinely-hung sessions while letting
+	// long-running-but-active sessions (multi-day agent runs) keep
+	// working. Prior to v0.38.2 this was a wall-clock WithTimeout that
+	// killed active threads at the 24h mark. runStart is captured for
+	// the error-return path below — a container that outlives its ctx
+	// cancel (e.g. `docker run` orphaned from bash on ctx cancel) can
+	// push cmd.Wait() to return long after cancel; reporting the
+	// nominal "24h" would hide that gap.
+	runCtx, cancel := context.WithCancel(ctx)
+	runStart := time.Now()
+
+	// Belt-and-suspenders: kill any orphan container whose name
+	// matches this task's prefix before we spawn a new one. Prevents
+	// the "two containers per session" state observed 2026-07-17.
+	// Safe to call unconditionally: a normally-completed task leaves
+	// no matching container behind, so this is a no-op in the
+	// common case.
+	stopOrphanContainersForTaskPath(taskPath, r.logger)
 
 	// Create permission FIFO for MCP communication (must be done before building args).
 	// Pass empty string to generate a unique runtime suffix for concurrent instances.
@@ -1015,29 +1238,24 @@ func (r *Runner) Start(
 		Bool("CLOD_NONINTERACTIVE", true).
 		Msg("setting environment variables for clod run")
 
-	// Wire up the child's three standard streams with three different
-	// transports, each chosen for its role:
+	// Wire up the child's three standard streams as plain pipes. Nothing in
+	// the runtime path (claude in `-p --output-format stream-json` mode, the
+	// claude-wrapper entrypoint, or the SSH-agent forwarding claude uses via
+	// SSH_AUTH_SOCK) requires a TTY on stdout — verified 2026-07-25 with a
+	// full docker run using pipes on all three fds.
 	//
-	//   stdin  — plain pipe. The bot writes stream-json messages on this,
-	//            which flow through `docker run -i` straight into claude's
-	//            stream-json reader. A PTY is wrong here: its line discipline
-	//            would echo input, enforce MAX_CANON line length, and
-	//            interpret ^C/^D — none of that belongs in a JSON transport.
-	//
-	//   stdout — PTY slave. This is claude's stream-json output channel. A
-	//            TTY on stdout keeps any TTY-sniffing tooling inside the
-	//            wrapper (ssh-add, tput, etc.) happy AND keeps docker's
-	//            buildkit from flipping into some weird "I have no terminal"
-	//            fallback.
-	//
-	//   stderr — plain pipe. All wrapper chatter (upgrade banners, docker
-	//            build progress, [clod] SSH agent lifecycle) lands here and
-	//            gets logged at debug. Keeping it off the stdout PTY is what
-	//            lets stdout stay pure stream-json.
-	//
-	// pty.Start() would have bound stdin and stdout to the same PTY and
-	// assumed stderr too, so we do the setup manually.
-	ptmx, tty, err := pty.Open()
+	// Historical note: prior to v0.38.0 stdout was a PTY slave with default
+	// (cooked) termios. That layer sits between claude's stream-json output
+	// and the bot's scanner, and its line discipline / small buffer / lack
+	// of any way to observe stalls turned out to interact badly with long-
+	// idle `docker run -i` attach sockets: after ~2h of claude idle, output
+	// resumed but never crossed docker-CLI → PTY slave → PTY master, and the
+	// bot's scanner blocked forever on an empty read. Symptoms looked like
+	// upstream claude-code #54434 (a Node event-loop wedge) but were in fact
+	// a bot-side transport failure. Plain pipes remove the line discipline
+	// entirely and make the failure mode either an EOF (recoverable) or a
+	// visible backlog (measurable via /proc/*/fdinfo).
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		cancel()
 		permFIFO.Close()
@@ -1046,16 +1264,16 @@ func (r *Runner) Start(
 	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
 		cancel()
-		_ = ptmx.Close()
-		_ = tty.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		permFIFO.Close()
 		return nil, oops.Trace(err)
 	}
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
 		cancel()
-		_ = ptmx.Close()
-		_ = tty.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		_ = stdinR.Close()
 		_ = stdinW.Close()
 		permFIFO.Close()
@@ -1063,21 +1281,18 @@ func (r *Runner) Start(
 	}
 
 	cmd.Stdin = stdinR
-	cmd.Stdout = tty
+	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
-	// Setsid puts the child in its own session (clean signal group).
-	// Setctty + Ctty=1 makes the stdout tty the child's controlling terminal
-	// — we can't use the default Ctty=0 because stdin is a pipe, not a TTY.
+	// Setsid puts the child in its own session so signals sent to our
+	// process group don't hit docker run. No Setctty — we have no TTY.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid:  true,
-		Setctty: true,
-		Ctty:    1,
+		Setsid: true,
 	}
 
 	if err := cmd.Start(); err != nil {
 		cancel()
-		_ = ptmx.Close()
-		_ = tty.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		_ = stdinR.Close()
 		_ = stdinW.Close()
 		_ = stderrR.Close()
@@ -1086,10 +1301,10 @@ func (r *Runner) Start(
 		return nil, oops.Trace(err)
 	}
 
-	// The child inherited its own copies of tty, stdinR, and stderrW. Close
-	// our copies so EOF propagates correctly when the child exits and so we
-	// don't leak fds.
-	_ = tty.Close()
+	// The child inherited its own copies of stdoutW, stdinR, and stderrW.
+	// Close our copies so EOF propagates correctly when the child exits and
+	// so we don't leak fds.
+	_ = stdoutW.Close()
 	_ = stdinR.Close()
 	_ = stderrW.Close()
 
@@ -1127,9 +1342,34 @@ func (r *Runner) Start(
 			}
 			stderrTail = append(stderrTail, line)
 			stderrMu.Unlock()
-			r.logger.Debug().
-				Str("stderr", line).
-				Msg("clod wrapper stderr")
+			// Bridge-emitted diagnostic lines land at Info —
+			// they're the in-container half of the FIFO handshake
+			// (permbridge) and the socket handshake (schedbridge),
+			// and the only way to debug a deadlock or a flapping
+			// MCP subprocess after the fact. Symmetric treatment
+			// for both bridges; prior to 0.36.9 only permbridge
+			// was promoted and schedbridge stderr was invisible
+			// in default logs, which made the 2026-07-10 flapping
+			// investigation harder than it needed to be.
+			// Everything else (docker build chatter, SSH agent
+			// banners) stays at debug to keep the log readable.
+			if strings.HasPrefix(line, "[permbridge]") {
+				r.logger.Info().
+					Str("stderr", line).
+					Msg("permbridge stderr")
+			} else if strings.HasPrefix(line, "[schedbridge]") {
+				r.logger.Info().
+					Str("stderr", line).
+					Msg("schedbridge stderr")
+			} else if strings.HasPrefix(line, "[clodproxy]") || strings.HasPrefix(line, "[wrapper]") {
+				r.logger.Info().
+					Str("stderr", line).
+					Msg("container helper stderr")
+			} else {
+				r.logger.Debug().
+					Str("stderr", line).
+					Msg("clod wrapper stderr")
+			}
 
 			// Forward selected lines as progress so the user can see
 			// the container is being prepared (docker build + SSH agent
@@ -1167,7 +1407,7 @@ func (r *Runner) Start(
 
 	task := &RunningTask{
 		cmd:                       cmd,
-		pty:                       ptmx,
+		stdout:                    stdoutR,
 		stdin:                     stdinW,
 		output:                    make(chan string, 100),
 		done:                      make(chan *Result, 1),
@@ -1189,6 +1429,191 @@ func (r *Runner) Start(
 		task.notifySessionID(sessionID)
 	}
 
+	// Watch runCtx.Done and stop the container as soon as our ctx
+	// says "stop", NOT after cmd.Wait returns. The v0.36.4 attempt
+	// placed the stopContainer call after cmd.Wait, which turned out
+	// to be a no-op: exec.CommandContext SIGKILLs bash on ctx.Done,
+	// but its docker-run child gets orphaned to init and keeps the
+	// stdout/stderr pipes open. cmd.Wait blocks on those pipes
+	// closing, which happens only when docker run exits, which
+	// happens only when the container exits, which we're supposed to
+	// be causing here — chicken and egg. See 2026-07-09 eagle
+	// post-mortem: deadline fired at 01:15:39Z, "docker stop
+	// (runctx path)" didn't log until 21:35:17Z — a 20h gap where
+	// cmd.Wait was blocked on pipes held open by an orphaned docker
+	// run.
+	//
+	// Watcher exits when runCtx.Done fires (either via WithTimeout
+	// deadline, Shutdown's forceKill -> cancel, or parent-ctx
+	// propagation). No task-done path — stopContainer is a no-op on
+	// an already-gone container, so if the run completed cleanly
+	// and the watcher fires later during bot shutdown it just
+	// silently confirms the container is gone.
+	go func() {
+		<-runCtx.Done()
+		task.logger.Info().
+			Err(runCtx.Err()).
+			Str("suffix", task.runtimeSuffix).
+			Msg("runCtx.Done fired — stopping container without waiting for cmd.Wait")
+		task.stopContainer("runctx-watcher")
+	}()
+
+	// Liveness ticker: watches lastPingAt (updated by the SSE `ping`
+	// case) and toggles __ALIVE__ / __STALE__ sentinels on the output
+	// channel when the freshness state flips. The handler translates
+	// those into an add/remove of a liveness reaction on the anchor
+	// message. Design rationale:
+	//
+	//   - content_block_delta events can go 2–3 hours silent in
+	//     healthy long-running sessions (eagle model-training work),
+	//     so a heartbeat driven by deltas false-positives constantly.
+	//   - Anthropic sends pings every ~15–20s to keep the SSE alive
+	//     regardless of what the model is doing, so ping freshness
+	//     is a stable signal.
+	//   - Fresh threshold (90s) gives headroom over the ~20s ping
+	//     interval so a single dropped ping doesn't flip the state;
+	//     stale threshold (120s) adds hysteresis so we don't churn
+	//     add/remove on a marginal connection.
+	//   - Runner owns the state machine so the handler only sees
+	//     transitions (one __ALIVE__ per becoming-fresh, one
+	//     __STALE__ per becoming-stale) — no repeated reaction API
+	//     hits.
+	livenessDone := make(chan struct{})
+	task.livenessDone = livenessDone
+	go func() {
+		defer close(livenessDone)
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		var alive bool
+		// inputWedgeWarnedAt tracks the input-arming timestamp we
+		// most recently warned about, so we don't spam the same
+		// wedge every tick. A fresh SendInput resets
+		// inputWaitingSince to a new nanosecond value, which
+		// distinguishes it from the one we already warned about.
+		var inputWedgeWarnedFor int64
+		// Sends are gated on runCtx to avoid racing the outer
+		// goroutine's `close(task.output)`. The outer goroutine's
+		// defer chain cancels runCtx first, then waits on
+		// livenessDone before allowing close(task.output) to run —
+		// so once we return via <-runCtx.Done() here, the outer
+		// goroutine unblocks and closes task.output. Never send
+		// after ctx cancels.
+		send := func(msg string) {
+			select {
+			case task.output <- msg:
+			case <-runCtx.Done():
+			}
+		}
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				var lastAt time.Time
+				if v := task.lastStreamAt.Load(); v != nil {
+					lastAt = v.(time.Time)
+				}
+				// Undefined lastAt means no line observed yet;
+				// treat as not-fresh so we don't add the liveness
+				// reaction before we've seen anything.
+				since := time.Since(lastAt)
+				fresh := !lastAt.IsZero() && since < 60*time.Second
+				stale := lastAt.IsZero() || since > 90*time.Second
+				// Per-tick state at Debug (fires every 15s per
+				// session, would flood the log at Info). Transitions
+				// stay at Info because they are rare and useful for
+				// forensics of any wedge investigation.
+				r.logger.Debug().
+					Time("last_stream_at", lastAt).
+					Dur("since", since).
+					Bool("fresh", fresh).
+					Bool("stale", stale).
+					Bool("alive_prev", alive).
+					Msg("liveness tick")
+				if fresh && !alive {
+					alive = true
+					r.logger.Info().Dur("since_last_stream", since).Msg("liveness transition -> ALIVE")
+					send("__ALIVE__")
+				} else if stale && alive {
+					alive = false
+					r.logger.Info().Dur("since_last_stream", since).Msg("liveness transition -> STALE")
+					send("__STALE__")
+				}
+				// Input-response watchdog: SendInput → stream event
+				// should be near-instant (1–5s typical). If it's
+				// been >60s and we haven't warned for THIS input
+				// event yet, warn. This catches the 2026-07-13
+				// wedge class where claude receives stdin but its
+				// Node event loop never composes a new HTTP
+				// request — invisible to the HTTP-layer probes,
+				// visible here.
+				//
+				// Gate on "we've seen a stream event before" via
+				// lastAt.IsZero(). Cold-start (docker build + image
+				// pull + claude boot) can take multiple minutes for
+				// a brand-new session directory. Firing the watchdog
+				// during that window is always a false positive —
+				// claude hasn't started reading stdin yet, so of
+				// course there's no response. Once claude has ever
+				// spoken, the container is warm and any subsequent
+				// input-without-response IS a real wedge.
+				//
+				// No awaitingUserResponse gate — 2026-07-22 revert.
+				// Previously we suppressed the watchdog while claude
+				// was blocked on an askq to avoid firing during user
+				// think-time, but the state was hard to keep in sync
+				// with every permission-answer code path (missing a
+				// clear point left the watchdog permanently disabled
+				// on the task, wedging eagle 2026-07-22 for hours).
+				// Simpler and more robust: if the user types during
+				// an askq and the answer takes >2m, accept the
+				// occasional false-positive container restart. Full
+				// container shutdown is idempotent.
+				armed := task.inputWaitingSince.Load()
+				if armed != 0 && armed != inputWedgeWarnedFor && !lastAt.IsZero() {
+					waited := time.Since(time.Unix(0, armed))
+					if waited > 2*time.Minute {
+						r.logger.Warn().
+							Dur("waited", waited).
+							Msg("claude did not respond to input within 2m — likely internal event-loop wedge (upstream claude-code #54434 class); auto-restart DISABLED per user directive 2026-07-22")
+						inputWedgeWarnedFor = armed
+						// Auto-restart disabled 2026-07-22 — the
+						// watchdog was firing false positives that
+						// killed containers mid-response. Detection
+						// stays on (Warn above) as forensic signal,
+						// but no __WEDGE_AUTO_RESTART__ sentinel is
+						// sent, so the handler never restarts. Real
+						// wedges will now require manual bot/session
+						// restart. To re-enable: uncomment the send
+						// below.
+						//
+						// send("__WEDGE_AUTO_RESTART__")
+					}
+				}
+
+				// Idle-timeout backstop. r.timeout (default 24h) is
+				// enforced against last stream activity rather than
+				// wall-clock elapsed since start. baseline = lastAt
+				// when we've seen any activity, else runStart so a
+				// session that never emits anything still eventually
+				// aborts. Firing here cancels runCtx, which triggers
+				// the container-stop watcher; cmd.Wait then unblocks
+				// and the deferred cleanup finalizes the task.
+				baseline := lastAt
+				if baseline.IsZero() {
+					baseline = runStart
+				}
+				if idle := time.Since(baseline); idle > r.timeout {
+					r.logger.Warn().
+						Dur("idle", idle).
+						Dur("timeout", r.timeout).
+						Msg("idle-timeout exceeded — canceling run ctx")
+					cancel()
+				}
+			}
+		}
+	}()
+
 	// Start permission FIFO listener
 	permFIFO.Start(runCtx)
 
@@ -1202,7 +1627,7 @@ func (r *Runner) Start(
 	if prompt != "" {
 		if err := task.SendInput(prompt); err != nil {
 			cancel()
-			_ = ptmx.Close()
+			_ = stdoutR.Close()
 			_ = stdinW.Close()
 			_ = stderrR.Close()
 			permFIFO.Close()
@@ -1210,14 +1635,35 @@ func (r *Runner) Start(
 		}
 	}
 
-	// Read from PTY and parse stream-json in background
+	// Read from stdout pipe and parse stream-json in background
 	go func() {
 		defer close(task.output)
+		// Wait for the liveness ticker to fully exit before letting
+		// the close(task.output) defer above run. The ticker sends
+		// __ALIVE__/__STALE__ into task.output; without this
+		// barrier a slow ticker could still be in-flight when the
+		// close fires and panic. Registered after close(task.output)
+		// so it runs FIRST (LIFO). livenessDone is closed by the
+		// ticker on exit; nil check tolerates test paths that skip
+		// the ticker setup.
+		defer func() {
+			if task.livenessDone != nil {
+				<-task.livenessDone
+			}
+		}()
 		defer close(task.done)
-		defer func() { _ = ptmx.Close() }()
+		defer func() { _ = stdoutR.Close() }()
 		defer task.closeStdin()
 		defer task.cancelWakeupTimer()
 		defer permFIFO.Close()
+		// Cancel runCtx on ANY exit path so goroutines observing
+		// ctx.Done (liveness ticker, stopContainer watcher) shut
+		// down promptly. Registered LAST here so it runs FIRST in
+		// the defer chain (LIFO) — before the livenessDone wait
+		// above. Also fixes a pre-existing minor leak where
+		// clean-exit runs left runCtx uncancelled until parent-ctx
+		// propagation.
+		defer cancel()
 
 		var outputBuilder strings.Builder
 		// Track tool_use IDs to their names and inputs so we can show context in results.
@@ -1226,19 +1672,29 @@ func (r *Runner) Start(
 			Input map[string]any
 		}
 		toolInfos := make(map[string]toolInfo)
-		scanner := bufio.NewScanner(ptmx)
-		// Increase buffer size for long lines
+		scanner := bufio.NewScanner(stdoutR)
+		// Per-line buffer cap. Sized well above any realistic
+		// stream-json message: individual tool_result blocks routinely
+		// carry inline base64 payloads (images from Read, screenshots,
+		// PDF/attachment content), and observed sizes up to ~1MB per
+		// image are common. A single line hitting the cap causes
+		// scanner.Scan() to return false with bufio.ErrTooLong, silently
+		// dropping the connection — verified via pprof on 2026-07-25 to
+		// be the actual "wedge" mode that had been misattributed to
+		// upstream #54434 for weeks. 64MB gives massive headroom for
+		// large screenshots, encoded PDFs, etc. Errors past this cap are
+		// caught by the scanner.Err() check after the loop.
+		const stdoutScanMax = 64 * 1024 * 1024
 		buf := make([]byte, 0, 64*1024)
-		scanner.Buffer(buf, 1024*1024)
+		scanner.Buffer(buf, stdoutScanMax)
 
 		// handshaken flips to true once we parse our first valid stream-json
 		// message (normally claude's system init). Before the handshake we
 		// silently tolerate non-JSON on stdout — the wrapper *shouldn't* be
 		// writing there anymore, but we stay permissive in case any stray
-		// bytes leak through (old .clod scripts on disk, PTY echo of our own
-		// input, etc.). After the handshake, stdout is supposed to be pure
-		// stream-json, so anything non-JSON is a real protocol violation and
-		// gets logged loudly.
+		// bytes leak through (old .clod scripts on disk, etc.). After the
+		// handshake, stdout is supposed to be pure stream-json, so anything
+		// non-JSON is a real protocol violation and gets logged loudly.
 		handshaken := false
 
 		for scanner.Scan() {
@@ -1273,6 +1729,28 @@ func (r *Runner) Start(
 			}
 			handshaken = true
 
+			// Liveness signal: every parsed line proves the model
+			// (or claude itself) is currently producing output.
+			// The ticker uses this to toggle the __ALIVE__/__STALE__
+			// reaction. See RunningTask.lastStreamAt for why this
+			// is bumped on every line rather than a periodic
+			// keep-alive (there isn't one in stream-json).
+			task.lastStreamAt.Store(time.Now())
+
+			// Clear the input-response watchdog. A stream event
+			// arriving from claude means it processed some stdin
+			// input; we're no longer waiting on a first-response
+			// to a specific SendInput call. If a follow-up
+			// SendInput happens without an intervening response
+			// it will re-arm.
+			if prev := task.inputWaitingSince.Swap(0); prev != 0 {
+				elapsed := time.Since(time.Unix(0, prev))
+				r.logger.Info().
+					Dur("since_input", elapsed).
+					Str("type", msg.Type).
+					Msg("input-response watchdog disarmed by stream event")
+			}
+
 			// Extract session ID if present
 			if msg.SessionID != "" && task.sessionID == "" {
 				task.sessionID = msg.SessionID
@@ -1297,6 +1775,24 @@ func (r *Runner) Start(
 						Str("session_id", task.sessionID).
 						Msg("captured session ID from system init")
 					task.notifySessionID(msg.SessionID)
+				}
+				// Compaction boundary: claude signals that it's
+				// summarizing history to reduce context. Nothing
+				// visible flows during compaction, so from Slack the
+				// gap looks identical to a wedge. Surface a
+				// __COMPACT_START__ sentinel and let the handler
+				// post a rolling "compacting session…" banner. The
+				// paired __COMPACT_END__ fires on the next
+				// content_block_start (real work resuming).
+				if msg.Subtype == "compact_boundary" {
+					if task.compactPending.CompareAndSwap(false, true) {
+						r.logger.Info().Msg("compact_boundary observed — surfacing status")
+						select {
+						case task.output <- "__COMPACT_START__":
+						default:
+							r.logger.Warn().Msg("output channel full, dropping __COMPACT_START__")
+						}
+					}
 				}
 			case "assistant":
 				// Assistant messages contain text output and tool_use requests.
@@ -1412,6 +1908,17 @@ func (r *Runner) Start(
 				r.logger.Info().
 					Bool("has_content_block", msg.ContentBlock != nil).
 					Msg("received content_block_start")
+				// If a compact_boundary was surfaced earlier in this
+				// run, the next content_block_start is the model
+				// producing real output again — pair the sentinel so
+				// the handler can finalize its "compacting…" banner.
+				if task.compactPending.CompareAndSwap(true, false) {
+					select {
+					case task.output <- "__COMPACT_END__":
+					default:
+						r.logger.Warn().Msg("output channel full, dropping __COMPACT_END__")
+					}
+				}
 				if msg.ContentBlock != nil {
 					r.logger.Info().
 						Str("block_type", msg.ContentBlock.Type).
@@ -1578,13 +2085,12 @@ func (r *Runner) Start(
 						Str("subtype", ctrlReq.Subtype).
 						Msg("unhandled control_request subtype")
 				}
-			case "content_block_stop", "message_start", "message_delta", "message_stop", "ping":
+			case "content_block_stop", "message_start", "message_delta", "message_stop":
 				// These are part of the streaming protocol but we don't need to act on them.
 				// content_block_stop: marks end of a content block
 				// message_start: marks beginning of assistant message
 				// message_delta: contains stop_reason and usage (we get this from result)
 				// message_stop: marks end of assistant message
-				// ping: keep-alive signal
 				r.logger.Debug().Str("type", msg.Type).Msg("received streaming marker")
 			case "error":
 				// Error event from Claude API
@@ -1603,6 +2109,25 @@ func (r *Runner) Start(
 			}
 		}
 
+		// Loop exited: either normal EOF (child closed stdout, usually
+		// because the container is going away) or a scanner error. On
+		// error the goroutine is about to sit in cmd.Wait until the
+		// child exits, which won't happen on its own — the scanner has
+		// stopped draining but docker keeps trying to write. Cancel the
+		// run context so the runCtx.Done watcher tears the container
+		// down; cmd.Wait then returns promptly and the deferred cleanup
+		// fires. Log the exit reason unconditionally — v0.37 and prior
+		// exited silently on ErrTooLong (2026-07-25 root cause), so
+		// leave a forensic breadcrumb even in the nil-error EOF case.
+		if scanErr := scanner.Err(); scanErr != nil {
+			r.logger.Error().
+				Err(scanErr).
+				Msg("stdout scanner exited with error — canceling run ctx to unblock cmd.Wait")
+			cancel()
+		} else {
+			r.logger.Info().Msg("stdout scanner exited on EOF")
+		}
+
 		// Wait for process to complete
 		err := cmd.Wait()
 
@@ -1612,19 +2137,49 @@ func (r *Runner) Start(
 		}
 
 		if err != nil {
-			// Check if it was a timeout
-			if runCtx.Err() == context.DeadlineExceeded {
-				result.Error = oops.New("clod execution timed out after %v", r.timeout)
-			} else if runCtx.Err() == context.Canceled {
-				result.Error = oops.New("clod execution was cancelled")
-			} else {
-				// Include the recent stderr tail so the caller can surface
-				// the actual reason to the user (SSH agent missing, auth
-				// required, etc.) instead of "exit status 1".
-				if tail := snapshotStderrTail(); tail != "" {
-					result.Error = oops.New("%s\n```\n%s\n```", err.Error(), tail)
+			// Report the actual runtime, not just the nominal deadline.
+			// A container that outlives ctx cancellation (docker isn't
+			// killed by Go's SIGKILL of the bash intermediate) can push
+			// cmd.Wait to return hours past the deadline; "timed out
+			// after 24h" hides that. See 2026-07-06 eagle post-mortem:
+			// deadline fired at Jul 6 09:44:27, cmd.Wait didn't return
+			// until docker stop at Jul 6 22:46:59, but the error text
+			// still just read "timed out after 24h0m0s".
+			runtimeElapsed := time.Since(runStart)
+			// Container teardown on ctx cancel/timeout is handled by
+			// the runCtx.Done watcher goroutine spawned at task
+			// start — it fires stopContainer immediately when the
+			// ctx signals, not after cmd.Wait unblocks. v0.36.4
+			// tried calling stopContainer here and hit a chicken-
+			// and-egg deadlock: cmd.Wait was blocked on the
+			// stdout/stderr pipes held open by orphaned docker run,
+			// so this branch didn't execute until the container was
+			// stopped some other way. See the watcher's block
+			// comment for details.
+			switch runCtx.Err() {
+			case context.DeadlineExceeded:
+				if runtimeElapsed > r.timeout+time.Minute {
+					result.Error = oops.New(
+						"clod execution timed out (deadline %v elapsed %v ago; process kept running until now, total runtime %v)",
+						r.timeout, runtimeElapsed-r.timeout, runtimeElapsed,
+					)
 				} else {
-					result.Error = oops.Trace(err)
+					result.Error = oops.New("clod execution timed out after %v", r.timeout)
+				}
+			case context.Canceled:
+				result.Error = oops.New("clod execution was cancelled after %v", runtimeElapsed)
+			default:
+				// Neither we-timed-it-out nor we-cancelled-it. The
+				// child died on its own — could be `docker stop` from
+				// outside, OOM, a permbridge crash, an image issue,
+				// etc. Include the stderr tail so the caller can
+				// surface the actual reason to the user (SSH agent
+				// missing, auth required, etc.) instead of "exit
+				// status 1".
+				if tail := snapshotStderrTail(); tail != "" {
+					result.Error = oops.New("clod exited unexpectedly after %v: %s\n```\n%s\n```", runtimeElapsed, err.Error(), tail)
+				} else {
+					result.Error = oops.New("clod exited unexpectedly after %v: %w", runtimeElapsed, err)
 				}
 			}
 		}

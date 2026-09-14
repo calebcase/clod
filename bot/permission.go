@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/calebcase/oops"
 	"github.com/rs/zerolog"
@@ -27,6 +28,27 @@ import (
 //go:embed permbridge/permbridge.linux-amd64
 var permBridgeBinary []byte
 
+// schedBridgeBinary is the scheduling MCP shim companion to permbridge.
+// It advertises cron_create / cron_list / cron_delete (and later bg_*
+// tools) and forwards each call over a Unix socket to the bot process.
+// Same static-linux/amd64 build as permbridge — no base image
+// dependencies. Rebuild via bot/schedbridge/build.sh. See mcp-shim.md
+// for the shim design; scheduling.go / schedsocket.go for the bot half.
+//
+//go:embed schedbridge/schedbridge.linux-amd64
+var schedBridgeBinary []byte
+
+// clodProxyBinary is the in-container HTTP → HTTPS reverse proxy that
+// stands between claude and api.anthropic.com. Its job is to force
+// turnover of the outbound keep-alive pool so claude doesn't wedge
+// on a silently half-closed socket (upstream claude-code #54434
+// class). The wrapper starts it before claude and sets
+// ANTHROPIC_BASE_URL to point at its loopback listen address.
+// Rebuild via bot/clodproxy/build.sh.
+//
+//go:embed clodproxy/clodproxy.linux-amd64
+var clodProxyBinary []byte
+
 const (
 	// FIFORequestName is the name of the FIFO for permission requests (hook writes, bot reads)
 	FIFORequestName = "permission_request.fifo"
@@ -36,6 +58,21 @@ const (
 	// inside the runtime directory. The container sees it at the same path
 	// (the runtime dir is bind-mounted in with its host path).
 	MCPBridgeName = "permbridge"
+	// SchedBridgeName is the filename for the scheduling-shim companion
+	// binary. Written next to permbridge in the runtime dir and pointed
+	// at from the same mcp_config.json.
+	SchedBridgeName = "schedbridge"
+	// ClodProxyName is the filename for the in-container HTTP → HTTPS
+	// reverse proxy binary. Written next to the other bridges in the
+	// runtime dir; the wrapper spawns it before claude and sets
+	// ANTHROPIC_BASE_URL=http://127.0.0.1:8788/ so claude routes
+	// through it. See clodproxy/main.go for the wedge-mitigation
+	// rationale.
+	ClodProxyName = "clodproxy"
+	// SchedSocketName is the Unix socket the bot listens on and
+	// schedbridge dials into. Lives inside the runtime dir so both
+	// sides of the bind-mount see the same path.
+	SchedSocketName = "schedbridge.sock"
 	// MCPConfigName is the name of the MCP config file
 	MCPConfigName = "mcp_config.json"
 )
@@ -67,6 +104,13 @@ type PermissionFIFO struct {
 	responses     chan PermissionResponse
 	logger        zerolog.Logger
 	cancel        context.CancelFunc
+	// writerDone is closed when writeResponses returns. SendResponse
+	// consults it (non-blocking) so a queue-into-dead-writer is loud
+	// instead of silent. Before this channel existed, a writer that
+	// exited via ctx.Done() would silently absorb responses into the
+	// buffered channel and callers would spin waiting for permbridge
+	// forever — that was the eagle wedge on 2026-07-06.
+	writerDone chan struct{}
 }
 
 // ContextFileName is the filename of the combined onboarding context written
@@ -197,6 +241,32 @@ func NewPermissionFIFO(domainPath string, runtimeSuffix string, domainReadmePath
 		return nil, oops.Trace(err)
 	}
 
+	// Drop schedbridge next to permbridge. Same rationale: static
+	// binary + bind-mounted runtime dir means the container can exec
+	// it with no interpreter dependency. If we ever move to a
+	// multi-arch build (arm64 macs etc.) both binaries will need
+	// per-arch embeds picked at build time.
+	schedPath := filepath.Join(runtimeDir, SchedBridgeName)
+	if len(schedBridgeBinary) == 0 {
+		return nil, oops.New("embedded schedbridge binary is empty; rebuild via bot/schedbridge/build.sh")
+	}
+	if err := os.WriteFile(schedPath, schedBridgeBinary, 0o755); err != nil {
+		return nil, oops.Trace(err)
+	}
+
+	// Drop clodproxy next to the bridges. The wrapper (Dockerfile_wrapper
+	// in bin/clod) spawns it before claude and sets ANTHROPIC_BASE_URL
+	// so claude routes API calls through it. See clodproxy/main.go for
+	// why the workaround exists (upstream claude-code #54434
+	// between-turn CLOSE_WAIT pool wedges).
+	proxyPath := filepath.Join(runtimeDir, ClodProxyName)
+	if len(clodProxyBinary) == 0 {
+		return nil, oops.New("embedded clodproxy binary is empty; rebuild via bot/clodproxy/build.sh")
+	}
+	if err := os.WriteFile(proxyPath, clodProxyBinary, 0o755); err != nil {
+		return nil, oops.Trace(err)
+	}
+
 	// Create the FIFOs
 	if err := syscall.Mkfifo(requestPath, 0600); err != nil {
 		return nil, oops.Trace(err)
@@ -215,6 +285,7 @@ func NewPermissionFIFO(domainPath string, runtimeSuffix string, domainReadmePath
 		contextPath:   contextPath,
 		requests:      make(chan PermissionRequest, 10),
 		responses:     make(chan PermissionResponse, 10),
+		writerDone:    make(chan struct{}),
 		logger:        logger.With().Str("component", "permission_fifo").Logger(),
 	}, nil
 }
@@ -272,11 +343,47 @@ func (p *PermissionFIFO) readRequests(ctx context.Context) {
 			p.logger.Info().
 				Str("tool_name", req.ToolName).
 				Str("tool_use_id", req.ToolUseID).
-				Msg("received permission request")
+				Int("buffered", len(p.requests)).
+				Msg("permission request read from FIFO; handing to consumer")
 
+			// Watchdog: if the channel send blocks (consumer wedged or
+			// missing) we want LOUD evidence rather than a silent stall.
+			// In normal operation send is instant; the watchdog only
+			// fires when the consumer side is misbehaving.
+			sendStart := time.Now()
+			watchdogDone := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-watchdogDone:
+						return
+					case <-ticker.C:
+						p.logger.Warn().
+							Str("tool_name", req.ToolName).
+							Dur("blocked_for", time.Since(sendStart)).
+							Int("buffered", len(p.requests)).
+							Msg("permission request send is still blocked (consumer not draining)")
+					}
+				}
+			}()
 			select {
 			case p.requests <- req:
+				close(watchdogDone)
+				// Post-send log so we can distinguish "reader saw it"
+				// from "consumer received it" during wedge debugging.
+				// Without this, eagle-style wedges show only the
+				// pre-send "received" line and the missing next-step
+				// log has to be reverse-engineered from goroutine
+				// dumps. See the 07-05 wedge analysis for why.
+				p.logger.Info().
+					Str("tool_name", req.ToolName).
+					Str("tool_use_id", req.ToolUseID).
+					Dur("send_wait", time.Since(sendStart)).
+					Msg("permission request delivered to consumer")
 			case <-ctx.Done():
+				close(watchdogDone)
 				_ = file.Close()
 				return
 			}
@@ -293,43 +400,144 @@ func (p *PermissionFIFO) readRequests(ctx context.Context) {
 }
 
 // writeResponses writes permission responses to the FIFO.
+//
+// Each step is logged at Info level with structured fields so the
+// June 2026 FIFO-deadlock recurrence can be diagnosed without
+// having to attach gdb to the running bot. Key fields:
+//
+//   - resp_id: short random tag that ties the log lines for one
+//     response together; pairs with permbridge's per-request id.
+//   - fifo_path: absolute path of the response FIFO we're about
+//     to open. Bot and permbridge MUST log identical paths; if
+//     they diverge that's the bug.
+//   - fifo_inode / fifo_dev / fifo_mode: stat of the FIFO at
+//     open time. If the file got recreated between bot-side
+//     creation and use, inode will differ from what permbridge
+//     sees on its end.
+//   - open_blocked_for_ms / write_blocked_for_ms: time spent in
+//     the open / write syscalls. The deadlock symptom was open
+//     blocking indefinitely; a watchdog goroutine logs "still
+//     blocked on open" every 30s so a hung send is loud in the
+//     log instead of silent.
 func (p *PermissionFIFO) writeResponses(ctx context.Context) {
+	// Signal exit so SendResponse can detect a dead writer instead of
+	// silently absorbing responses into the buffered channel. Ordering
+	// matters: close writerDone AFTER logging so a caller racing on
+	// SendResponse sees the log before observing the closed channel.
+	defer func() {
+		p.logger.Info().
+			Int("undrained_responses", len(p.responses)).
+			Err(ctx.Err()).
+			Msg("writeResponses goroutine exiting")
+		close(p.writerDone)
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case resp := <-p.responses:
+			respID := shortHexID()
+			log := p.logger.With().
+				Str("resp_id", respID).
+				Str("behavior", resp.Behavior).
+				Str("fifo_path", p.responsePath).
+				Logger()
+
+			// Stat the FIFO BEFORE attempting to open. If it
+			// doesn't exist (deleted) or is no longer a named
+			// pipe (race with Close removing it and something
+			// creating a regular file), this gives us a
+			// concrete reason for the impending open failure.
+			statBefore, statErr := os.Stat(p.responsePath)
+			if statErr == nil {
+				sys, _ := statBefore.Sys().(*syscall.Stat_t)
+				if sys != nil {
+					log = log.With().
+						Uint64("fifo_inode", sys.Ino).
+						Uint64("fifo_dev", sys.Dev).
+						Str("fifo_mode", statBefore.Mode().String()).
+						Logger()
+				}
+			} else {
+				log.Warn().Err(statErr).Msg("response FIFO stat failed before open")
+			}
+			log.Info().Msg("writing permission response: opening FIFO")
+
+			// Watchdog: if the open hasn't returned in 30s,
+			// shout. Cancelled when openDone fires.
+			openStart := time.Now()
+			openDone := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-openDone:
+						return
+					case <-ticker.C:
+						log.Warn().
+							Dur("blocked_for", time.Since(openStart)).
+							Msg("response FIFO open is still blocked (no reader yet)")
+					}
+				}
+			}()
+
 			// Open FIFO for writing (blocks until reader connects)
 			file, err := os.OpenFile(p.responsePath, os.O_WRONLY, 0)
+			close(openDone)
+			openElapsed := time.Since(openStart)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				p.logger.Error().Err(err).Msg("failed to open response FIFO")
+				log.Error().
+					Err(err).
+					Dur("open_blocked_for", openElapsed).
+					Msg("failed to open response FIFO")
 				continue
 			}
+			log.Info().Dur("open_blocked_for", openElapsed).Msg("response FIFO open succeeded; writing payload")
 
 			data, err := json.Marshal(resp)
 			if err != nil {
-				p.logger.Error().Err(err).Msg("failed to marshal response")
+				log.Error().Err(err).Msg("failed to marshal response")
 				_ = file.Close()
 				continue
 			}
 
-			_, err = file.Write(append(data, '\n'))
+			writeStart := time.Now()
+			n, err := file.Write(append(data, '\n'))
+			writeElapsed := time.Since(writeStart)
 			if err != nil {
-				p.logger.Error().Err(err).Msg("failed to write response")
+				log.Error().Err(err).Dur("write_blocked_for", writeElapsed).Msg("failed to write response")
 			}
 
 			if err := file.Close(); err != nil {
-				p.logger.Error().Err(err).Msg("failed to close response FIFO")
+				log.Error().Err(err).Msg("failed to close response FIFO")
 			}
 
-			p.logger.Debug().
-				Str("behavior", resp.Behavior).
-				Msg("sent permission response")
+			log.Info().
+				Int("bytes", n).
+				Dur("write_blocked_for", writeElapsed).
+				Dur("total_blocked_for", time.Since(openStart)).
+				Msg("permission response delivered")
 		}
 	}
+}
+
+// shortHexID returns an 8-character random hex string. Cheap (one
+// crypto/rand call, four bytes). Used for diagnostic per-response /
+// per-request correlation; not a security identifier.
+func shortHexID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure is essentially impossible on Linux;
+		// fall back to a stable placeholder so the absence of an id
+		// doesn't propagate as a noisy error.
+		return "????????"
+	}
+	return fmt.Sprintf("%x", b[:])
 }
 
 // Requests returns the channel for receiving permission requests.
@@ -338,19 +546,83 @@ func (p *PermissionFIFO) Requests() <-chan PermissionRequest {
 }
 
 // SendResponse sends a permission response (non-blocking).
+//
+// Logs at Info on the success path so we can see, in the absence of
+// "writing permission response: opening FIFO" from the writer
+// goroutine, whether the queue happened at all. Without this trail
+// a silently-stalled writer is indistinguishable from a never-queued
+// response (2026-06-25 eerie-eagle incident).
+//
+// Also checks writerDone: if the writer goroutine has exited the
+// buffered channel will still accept the send, but nothing will ever
+// drain it. Logs a Warn in that case so the 2026-07-06 eagle wedge
+// (response queued at buffered:1, writer already dead, zero further
+// log evidence) is diagnosable immediately from the log instead of
+// requiring goroutine forensics on the running bot.
 func (p *PermissionFIFO) SendResponse(resp PermissionResponse) {
 	select {
+	case <-p.writerDone:
+		p.logger.Warn().
+			Str("behavior", resp.Behavior).
+			Int("buffered", len(p.responses)).
+			Msg("SendResponse called but writer goroutine has exited; response will not be delivered")
+		return
+	default:
+	}
+	select {
 	case p.responses <- resp:
-		p.logger.Debug().Str("behavior", resp.Behavior).Msg("queued permission response")
+		p.logger.Info().
+			Str("behavior", resp.Behavior).
+			Int("buffered", len(p.responses)).
+			Msg("queued permission response for writer")
 	default:
 		p.logger.Warn().Str("behavior", resp.Behavior).Msg("response channel full, dropping")
 	}
 }
 
 // Close cleans up the FIFO.
+//
+// Unblocking the reader: readRequests spends most of its time blocked
+// in `os.OpenFile(requestPath, O_RDONLY, 0)` — an OS-level open that
+// hangs until a writer connects. Context cancellation cannot interrupt
+// that syscall, so p.cancel() alone is not enough to make the reader
+// exit. To force it out we briefly open the same FIFO for write
+// ourselves; the kernel completes the pending open on both sides, the
+// reader loop's next iteration observes ctx.Done and returns. Without
+// this, each closed PermissionFIFO leaks its reader goroutine — the
+// eagle 07-05 wedge dump showed a reader parked in openat for 20+
+// hours, precisely this leak pattern.
+//
+// O_NONBLOCK|O_WRONLY has an important subtlety on FIFOs: it succeeds
+// only if a reader is already blocked in openat. If no reader is
+// waiting (already unblocked, or never started), open returns ENXIO
+// which we swallow — nothing to unblock. Either outcome is fine.
 func (p *PermissionFIFO) Close() {
 	if p.cancel != nil {
 		p.cancel()
+	}
+
+	// Poke the request-FIFO reader out of any pending openat.
+	if p.requestPath != "" {
+		if fd, err := syscall.Open(p.requestPath, syscall.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			_ = syscall.Close(fd)
+		}
+	}
+
+	// Symmetric poke for the response-FIFO writer: writeResponses
+	// can be stuck inside a blocking os.OpenFile(O_WRONLY) if the
+	// container's permbridge died before opening the reader — see
+	// 2026-07-19 eerie-eagle 00:21 where the orphan-check killed a
+	// container mid-askq and the user's answer arrived after, so
+	// the writer's target FIFO had no reader and never would. A
+	// brief O_RDONLY|O_NONBLOCK open unblocks the writer's open()
+	// syscall; ctx cancellation (already fired above) then routes
+	// it through the ctx.Err() check inside writeResponses so it
+	// exits cleanly instead of looping to write a dead response.
+	if p.responsePath != "" {
+		if fd, err := syscall.Open(p.responsePath, syscall.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
+			_ = syscall.Close(fd)
+		}
 	}
 
 	// Remove the FIFOs
@@ -386,6 +658,26 @@ func (p *PermissionFIFO) ContextPath() string {
 	return p.contextPath
 }
 
+// RuntimeDir returns the absolute path to the per-task runtime dir
+// where all FIFOs, sockets, and embedded bridge binaries live.
+func (p *PermissionFIFO) RuntimeDir() string {
+	return filepath.Dir(p.requestPath)
+}
+
+// SchedBridgePath returns the path to the scheduling MCP shim binary
+// inside the runtime dir. Written to disk by NewPermissionFIFO;
+// referenced by CreateMCPConfig's mcpServers entry.
+func (p *PermissionFIFO) SchedBridgePath() string {
+	return filepath.Join(filepath.Dir(p.requestPath), SchedBridgeName)
+}
+
+// SchedSocketPath returns the path to the Unix socket that the bot
+// listens on for schedbridge connections. schedbridge dials this path
+// after reading CLOD_RUNTIME_DIR from its environment.
+func (p *PermissionFIFO) SchedSocketPath() string {
+	return filepath.Join(filepath.Dir(p.requestPath), SchedSocketName)
+}
+
 // MCPScriptPath returns the path to the in-container permission bridge
 // executable. (Name kept for historical reasons; the bridge is now a Go
 // binary written by NewPermissionFIFO.)
@@ -408,11 +700,27 @@ func (p *PermissionFIFO) CreateMCPConfig() (configPath string, toolName string, 
 	// Running the binary as `command` (no interpreter) is the whole
 	// point of replacing the Python version: no host/container package
 	// dependency, works on any linux base image that can exec an ELF.
+	// Two MCP servers registered:
+	//   "permission" — the existing FIFO-backed permission prompt shim
+	//   "scheduling" — the socket-backed cron/bg shim (see mcp-shim.md)
+	// Both exec their binaries directly; no interpreter needed in the base image.
 	config := map[string]interface{}{
 		"mcpServers": map[string]interface{}{
 			"permission": map[string]interface{}{
 				"command": mcpScript,
 				"args":    []string{},
+			},
+			"scheduling": map[string]interface{}{
+				"command": p.SchedBridgePath(),
+				"args":    []string{},
+				// schedbridge reads CLOD_RUNTIME_DIR to find the socket.
+				// Same env var permbridge uses for its FIFOs, set by
+				// runner.go on `claude` invocation, but we duplicate
+				// here so a stand-alone spawn (e.g. an out-of-band test)
+				// works without the runner wrapping it.
+				"env": map[string]string{
+					"CLOD_RUNTIME_DIR": filepath.Dir(p.requestPath),
+				},
 			},
 		},
 	}
