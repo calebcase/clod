@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] (or [Crush][crush]) in a modestly more secure way.
 
-**Version 0.38.5**
+**Version 0.39.0**
 
 ## Features
 
@@ -158,6 +158,13 @@ domains:
 The host service keeps its `127.0.0.1`-only binding; no host
 networking, no sysctl changes, no root required (`ncat` must be on
 the host).
+
+### External editors
+
+The container image installs `vim` and passes `EDITOR` into the
+container (your host's `$EDITOR` when set, otherwise `vim`), so agent
+features that shell out to an external editor work out of the box —
+e.g. Crush's `ctrl+o` "open editor" for the message textarea.
 
 ## Architecture
 
