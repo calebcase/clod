@@ -1,0 +1,8 @@
+#!/bin/env bash
+# Start a clod session with Claude Code. Equivalent to running `clod`
+# with CLOD_TOOL=claude: persists the tool choice to .clod/tool for
+# this directory and switches it back to claude if it was on
+# something else (e.g. crush).
+set -euo pipefail
+export CLOD_TOOL=claude
+exec "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/clod" "$@"

@@ -5,6 +5,43 @@ All notable changes to clod will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Tool drivers** — `bin/clod` is now agent-agnostic. The container
+  entrypoint, tool install, and per-tool volume mounts are supplied by
+  driver files in `bin/clod-tool/` (see `bin/clod-tool/README.md`).
+- **Crush support** — run [Crush](https://charm.land/crush) instead of
+  Claude Code in a clod domain:
+  - `clod-crush` / `clod-claude` scripts switch the active tool per
+    directory (persisted in `.clod/tool`); `clod` still defaults to
+    Claude Code.
+  - Crush is installed from its GitHub release at build time; pin a
+    version with `.clod/crush-version`.
+  - Host global crush config (`~/.config/crush/crushrc` or `crush.json`)
+    is seeded into `.clod/crush/config/` and bind-mounted; project-local
+    `.crushrc`/`.crush.json` overrides work per crush's merge rules.
+  - Sessions persist in `.clod/crush/data/`, so `crush --resume` works
+    across container rebuilds.
+  - `.clod/crush-default-flags` provides per-domain default flags.
+  - Host service reachability: `://localhost:PORT` provider base_urls
+    in the domain crush config are rewritten to
+    `://host.docker.internal:PORT` (with the matching `--add-host`
+    flag). For each such port, clod starts a host-side `ncat` relay
+    bound to the docker bridge gateway IP only, forwarding to the
+    host's `127.0.0.1`, so ssh-forwarded or loopback-only providers
+    work without host networking; relays are torn down when the
+    session ends.
+- **Install** — quick-install and manual install now also link
+  `clod-claude` and `clod-crush` into `~/bin`.
+
+### Changed
+- Refactored `bin/clod` to assemble `Dockerfile_wrapper` from common
+  sections (user/group setup, SSH known_hosts) plus driver hooks. The
+  generated claude artifacts are byte-identical to the previous release.
+- Switching tools in a directory now triggers a reinit + image rebuild
+  (previously invisible to change detection).
+
 ## [0.7.0] - 2026-04-08
 
 ### Changed
