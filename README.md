@@ -1,6 +1,6 @@
 # clod <sub>*ˈkläd*</sub>
 
-Run [claude code][claude-code] in a modestly more secure way.
+Run [claude code][claude-code] (or [Crush][crush]) in a modestly more secure way.
 
 **Version 0.38.5**
 
@@ -27,7 +27,7 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed release notes and version history.
 Copy and paste this command to install clod:
 
 ```bash
-mkdir -p ~/src/github.com/calebcase && cd ~/src/github.com/calebcase && git clone https://github.com/calebcase/clod.git && mkdir -p ~/bin && ln -sf ~/src/github.com/calebcase/clod/bin/clod ~/bin/clod && RCFILE="${HOME}/.$(basename $SHELL)rc" && grep -q 'PATH.*HOME/bin' "$RCFILE" 2>/dev/null || echo 'export PATH=$PATH:$HOME/bin' >> "$RCFILE" && export PATH=$PATH:$HOME/bin && echo "✓ Installation complete! Run 'clod' to start, or restart your shell."
+mkdir -p ~/src/github.com/calebcase && cd ~/src/github.com/calebcase && git clone https://github.com/calebcase/clod.git && mkdir -p ~/bin && ln -sf ~/src/github.com/calebcase/clod/bin/clod ~/bin/clod && ln -sf ~/src/github.com/calebcase/clod/bin/clod-claude ~/bin/clod-claude && ln -sf ~/src/github.com/calebcase/clod/bin/clod-crush ~/bin/clod-crush && RCFILE="${HOME}/.$(basename $SHELL)rc" && grep -q 'PATH.*HOME/bin' "$RCFILE" 2>/dev/null || echo 'export PATH=$PATH:$HOME/bin' >> "$RCFILE" && export PATH=$PATH:$HOME/bin && echo "✓ Installation complete! Run 'clod' (Claude Code), 'clod-claude', or 'clod-crush' to start, or restart your shell."
 ```
 
 This will:
@@ -35,7 +35,7 @@ This will:
 2. Create `~/bin` directory if needed
 3. Add `~/bin` to your PATH in shell config (`.bashrc`, `.zshrc`, etc.)
 4. Add `~/bin` to current shell's PATH
-5. Create symlink to the clod script
+5. Create symlinks to the `clod`, `clod-claude`, and `clod-crush` scripts
 
 ### Manual Install
 
@@ -43,6 +43,8 @@ If you already have the repo cloned, link it to your home bin directory:
 
 ```bash
 ln -sf ~/src/github.com/calebcase/clod/bin/clod ~/bin/clod
+ln -sf ~/src/github.com/calebcase/clod/bin/clod-claude ~/bin/clod-claude
+ln -sf ~/src/github.com/calebcase/clod/bin/clod-crush ~/bin/clod-crush
 ```
 
 If you don't have a home bin directory:
@@ -101,6 +103,61 @@ cp .clod/claude/claude.json ~/.claude.json
 ```
 
 New directories initialized with clod will use this config as the base.
+
+## Choosing your agent
+
+clod supports multiple coding agents. The default is Claude Code, but you can
+switch a directory to Crush (or back) by using the matching script:
+
+```bash
+clod-claude   # run Claude Code in this directory
+clod-crush    # run Crush in this directory
+```
+
+The tool choice is stored in `.clod/tool` per directory, so each directory
+remembers which agent it last used. `clod` with no tool set defaults to
+Claude Code. `CLOD_TOOL=crush clod ...` is equivalent and persists the
+choice the same way. Switching tools rebuilds the image for that
+directory; staying on the same tool is a no-op rebuild.
+
+### Crush
+
+Crush is installed in the container from its GitHub release, defaulting to
+`latest` at build time. To pin a version (reproducible rebuilds):
+
+```bash
+echo v0.94.2 > .clod/crush-version
+```
+
+Crush picks up your host's global config (`~/.config/crush/crushrc` or
+`crush.json`) on first run; it is copied into `.clod/crush/config/` and
+bind-mounted as the container user's `~/.config/crush/`. After that the
+copy in `.clod/crush/config/` is the per-domain source of truth, so edit it
+to change the provider or model for that domain only. A project-local
+`.crushrc`/`.crush.json` dropped in the domain directory always wins, per
+crush's own config merge rules.
+
+Sessions persist in `.clod/crush/data/`, so `crush --resume` works across
+container rebuilds. Per-domain default flags go in
+`.clod/crush-default-flags` (same shape as `.clod/claude-default-flags`).
+
+One networking note: provider endpoints that listen only on the host's
+`127.0.0.1` (e.g. an `ssh -L` port forward, or a local vLLM/prodia
+instance bound to loopback) are not reachable as `localhost` from
+inside the container. clod handles this automatically for crush
+domains:
+
+1. `://localhost:PORT` provider `base_url`s in `.clod/crush/config/`
+   are rewritten to `://host.docker.internal:PORT`.
+2. `clod` starts a host-side relay for each such port before the
+   container: an `ncat` listener bound to the docker bridge gateway
+   IP only (not the LAN, not host loopback) forwarding to
+   `127.0.0.1`. The relay is killed when the session ends, so the
+   host's visible socket layout is unchanged.
+
+The host service keeps its `127.0.0.1`-only binding; no host
+networking, no sysctl changes, no root required (`ncat` must be on
+the host).
 
 ## Architecture
 
@@ -166,7 +223,7 @@ ENV PATH="$PATH:$USER_HOME/.local/bin"
 #### 4. Dockerfile_wrapper (auto-generated)
 
 - User/group mapping for file permissions
-- Claude Code installation via npm
+- Installs the active tool driver (see [Choosing your agent](#choosing-your-agent))
 - Sets default entrypoint (can be overridden in Dockerfile_user)
 
 The final `Dockerfile` is created by concatenating these four layers during build.
@@ -193,11 +250,17 @@ After initialization, the `.clod/` directory contains:
 ├── concurrent                # Optional: "true" enables concurrent instances
 ├── ssh                       # Optional: SSH forwarding ("true", "false", or key path)
 ├── gpus                      # Optional: GPU support ("all", device IDs, or empty)
+├── tool                      # Active tool: claude (default) or crush
+├── crush-version             # Optional: pinned crush release (e.g. v0.94.2)
 ├── claude-default-flags      # Optional: Default flags
+├── crush-default-flags       # Optional: Default flags (crush only)
 ├── runtime-{suffix}/         # Runtime files (FIFOs, MCP config) - per instance
-└── claude/                   # Claude configuration (gitignored)
-    ├── claude.json           # API key, settings, sessions
-    └── ...
+├── claude/                   # Claude configuration (gitignored)
+│   ├── claude.json           # API key, settings, sessions
+│   └── ...
+└── crush/                    # Crush configuration (gitignored, crush only)
+    ├── config/               # Global crush config (crushrc / crush.json)
+    └── data/                 # Sessions (SQLite) - enables --resume
 ```
 
 ### Automatic Version Management
@@ -997,5 +1060,6 @@ See [LICENSE](../LICENSE) file for details.
 ---
 
 [claude-code]: https://www.anthropic.com/claude-code
+[crush]: https://charm.land/crush
 [claude-permission-modes]: https://docs.anthropic.com/en/docs/claude-code/iam#permission-modes
 [claude-dangerously-skip-permissions]: https://docs.anthropic.com/en/docs/claude-code/devcontainer

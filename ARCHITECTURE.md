@@ -147,8 +147,8 @@ task execution.
 agent_directory/
 ├── .clod/                              # Docker build configuration
 │   ├── system/                         # System-managed files (auto-generated)
-│   │   ├── Dockerfile_base             # Generated: Base image with npm
-│   │   ├── Dockerfile_wrapper          # Generated: User setup, Claude install, entrypoint
+│   │   ├── Dockerfile_base             # Generated: Base image with curl/ca-certificates
+│   │   ├── Dockerfile_wrapper          # Generated: User setup, tool install, entrypoint
 │   │   ├── Dockerfile                  # Combined (auto-generated)
 │   │   ├── build                       # Script: Build Docker image
 │   │   ├── run                         # Script: Run Docker container
@@ -159,12 +159,18 @@ agent_directory/
 │   ├── id                              # Unique container ID
 │   ├── name                            # Container name
 │   ├── image                           # Base image selection
+│   ├── tool                            # Active tool: claude (default) or crush
+│   ├── crush-version                   # Optional: pinned crush release (crush tool)
 │   ├── concurrent                      # Optional: concurrency setting
 │   ├── ssh                             # Optional: SSH forwarding config (auto/true/false/key path)
 │   ├── gpus                            # Optional: GPU config
-│   ├── claude-default-flags            # Optional: default flags
+│   ├── claude-default-flags            # Optional: default flags (claude tool)
+│   ├── crush-default-flags             # Optional: default flags (crush tool)
 │   ├── claude/                         # Claude configuration (gitignored)
 │   │   └── claude.json                 # Settings, sessions, permissions
+│   ├── crush/                          # Crush configuration (gitignored)
+│   │   ├── config/                     # Global crush config (crushrc / crush.json)
+│   │   └── data/                       # Sessions (SQLite), enables --resume
 │   └── runtime-{suffix}/               # Runtime files (per instance)
 │       ├── permission_request.fifo     # Permission requests → bot
 │       ├── permission_response.fifo    # Permission responses → Claude
@@ -195,12 +201,14 @@ User
  ▼
 ┌────────────────────────────────────┐
 │  clod CLI Initialization           │
-│  1. Check if .clod/ exists         │
-│  2. If not, run init:              │
+│  1. Resolve tool (CLOD_TOOL →      │
+│     .clod/tool → claude default)   │
+│  2. Check if .clod/ exists         │
+│  3. If not, run init:              │
 │     - Create .clod/                │
 │     - Generate Dockerfiles         │
 │     - Create build/run scripts     │
-│     - Copy ~/.claude.json          │
+│     - Seed tool config (per driver)│
 └────────────┬───────────────────────┘
              │
              ▼
@@ -209,7 +217,7 @@ User
 │  Execute: .clod/system/build       │
 │  - Builds image from Dockerfiles   │
 │  - Tags as clod-<name>-<id>        │
-│  - Installs Claude Code            │
+│  - Installs the active tool        │
 └────────────┬───────────────────────┘
              │
              ▼
