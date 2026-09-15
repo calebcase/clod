@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generated claude artifacts are byte-identical to the previous release.
 - Switching tools in a directory now triggers a reinit + image rebuild
   (previously invisible to change detection).
+- The container image now installs `vim` and sets `EDITOR` (inheriting
+  the host's `$EDITOR` when set, otherwise defaulting to `vim`) so agent
+  features that shell out to an external editor (e.g. Crush's `ctrl+o`)
+  work inside the container.
 
 ## [0.7.0] - 2026-04-08
 
