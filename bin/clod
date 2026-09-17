@@ -295,6 +295,13 @@ fi
 
 cat .clod/system/Dockerfile_base .clod/Dockerfile_project .clod/system/Dockerfile_wrapper .clod/Dockerfile_user > .clod/system/Dockerfile
 
+# clod-build-time: a per-invocation build secret consumed by tool
+# install RUN steps (see --mount=type=secret in Dockerfile_wrapper)
+# so each rebuild busts their layer cache — e.g. "install latest
+# from GitHub" re-resolves instead of reusing a stale cached layer.
+mkdir -p .clod/system/build-secrets
+printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .clod/system/build-secrets/clod-build-time
+
 # Everything below is build diagnostics — it must NEVER land on stdout,
 # because our caller (e.g. the Slack bot) uses stdout as a strict stream-json
 # channel for claude's output. We redirect docker's stdout to stderr, and use
@@ -307,6 +314,7 @@ exec docker build \
   --build-arg "GROUP_ID=$group_id" \
   --build-arg "GROUP_NAME=$group_name" \
   --build-arg "USER_HOME=$user_home" \
+  --secret "id=clod-build-time,src=.clod/system/build-secrets/clod-build-time" \
   -t "clod-${name,,}-$id" \
   -f .clod/system/Dockerfile \
   . >&2
