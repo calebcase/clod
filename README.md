@@ -123,10 +123,21 @@ directory; staying on the same tool is a no-op rebuild.
 ### Crush
 
 Crush is installed in the container from its GitHub release, defaulting to
-`latest` at build time. To pin a version (reproducible rebuilds):
+`latest` at build time. Every image build passes a per-invocation build
+secret, so re-resolving `latest` happens on each rebuild rather than
+serving a cached layer. To upgrade to the newest release, force a
+rebuild:
+
+```bash
+CLOD_REINIT=true clod-crush
+```
+
+To pin a version (reproducible rebuilds; a pinned version always wins
+over `latest`):
 
 ```bash
 echo v0.94.2 > .clod/crush-version
+clod-crush
 ```
 
 Crush picks up your host's global config (`~/.config/crush/crushrc` or

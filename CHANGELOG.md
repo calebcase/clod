@@ -46,6 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   features that shell out to an external editor (e.g. Crush's `ctrl+o`)
   work inside the container.
 
+### Fixed
+- Crush upgrades from `latest` now actually work: the install step
+  previously hit Docker's layer cache because nothing in the RUN
+  instruction changed between builds, so `latest` stayed frozen at
+  whatever release the layer was first built from. Builds now pass a
+  per-invocation `clod-build-time` build secret into the RUN step's
+  cache key, so `CLOD_REINIT=true clod-crush` (or any other rebuild)
+  re-resolves and reinstalls the current release.
+- An empty or whitespace-only `.clod/crush-version` no longer silently
+  pins; it falls back to `latest` (the build now uses a `-s` size test
+  instead of `-f`).
+
 ## [0.7.0] - 2026-04-08
 
 ### Changed

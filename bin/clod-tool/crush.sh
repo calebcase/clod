@@ -115,14 +115,22 @@ tool_dockerfile_root_section() {
 # top-level file so it's part of the change-detection hash and a
 # version bump rebuilds the image automatically. The release
 # tarball nests its files under `crush_<ver>_<arch>/`.
-RUN set -eux; \
+#
+# The clod-build-time secret (set by .clod/system/build to the
+# wall-clock time of the clod invocation that triggered the build)
+# is part of this RUN step's cache key, so every rebuild re-runs
+# the install and re-resolves `latest` instead of serving a stale
+# cached layer. A non-empty .clod/crush-version always wins, so
+# pinned builds stay reproducible.
+RUN --mount=type=secret,id=clod-build-time,target=/clod-build-time \
+    set -eux; \
     arch="$(uname -m)"; \
     case "$arch" in \
         x86_64)  asset='Linux_x86_64' ;; \
         aarch64) asset='Linux_arm64' ;; \
         *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
-    if [ -f .clod/crush-version ]; then \
+    if [ -s .clod/crush-version ]; then \
         ver="$(cat .clod/crush-version)"; \
     else \
         ver="$(curl -fsSL https://api.github.com/repos/charmbracelet/crush/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"; \
