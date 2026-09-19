@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Truecolor in containers** — `docker run` now sets `COLORTERM=truecolor`
+  (and passes through `$TERM`, defaulting to `xterm-256color`). Crush's
+  renderer (and other tools that honor `COLORTERM`) were downsampled to the
+  256-color palette inside the container because the host's `COLORTERM`
+  wasn't forwarded.
+
+## [0.39.0] - 2026-09-17
+
 ### Added
 - **Tool drivers** — `bin/clod` is now agent-agnostic. The container
   entrypoint, tool install, and per-tool volume mounts are supplied by
