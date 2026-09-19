@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] (or [Crush][crush]) in a modestly more secure way.
 
-**Version 0.39.0**
+**Version 0.39.1**
 
 ## Features
 
