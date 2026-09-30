@@ -2,7 +2,7 @@
 
 Run [claude code][claude-code] (or [Crush][crush]) in a modestly more secure way.
 
-**Version 0.39.1**
+**Version 0.40.0**
 
 ## Features
 
@@ -267,6 +267,7 @@ After initialization, the `.clod/` directory contains:
 ├── image                     # Base image (ubuntu:24.04 or golang:latest)
 ├── concurrent                # Optional: "true" enables concurrent instances
 ├── ssh                       # Optional: SSH forwarding ("true", "false", or key path)
+├── docker                    # Optional: Docker daemon forwarding ("true"/"false", default off)
 ├── gpus                      # Optional: GPU support ("all", device IDs, or empty)
 ├── tool                      # Active tool: claude (default) or crush
 ├── crush-version             # Optional: pinned crush release (e.g. v0.94.2)
@@ -538,6 +539,77 @@ Inside a clod session:
 clod
 # Then in the Claude Code session, ask:
 # "Run nvidia-smi to verify GPU access"
+```
+
+## Docker Daemon Forwarding
+
+Clod can give a domain access to the host's Docker daemon so the agent can
+`docker build`, `docker run`, and manage containers/images while it codes —
+useful for any Docker-related work (writing images, testing them, building
+and pushing).
+
+This is a **socket forward, not Docker-in-Docker**: the host's
+`/var/run/docker.sock` is bind-mounted into the container and `DOCKER_HOST`
+points at it. The daemon runs on the host, so:
+
+- Images and containers the agent creates land in the **host's** docker and
+  are immediately reachable from other clod domains and host tooling.
+- No privileged container or nested daemon is needed.
+- The container image gets the `docker-ce-cli` client installed (client only,
+  ~100 MB) when forwarding is enabled.
+
+> **Security note:** a forwarded docker socket is equivalent to root on the
+> host (a container can `--privileged` its way out). clod enables it
+> per-domain, only when you ask for it — keep it `false` for domains that
+> don't need docker.
+
+### Configuration Methods
+
+Docker forwarding is off by default. Enable it via:
+
+1. **Configuration file** (per-directory):
+   ```bash
+   echo "true" > .clod/docker
+   ```
+
+2. **Environment variable** (overrides file, for a single run):
+   ```bash
+   export CLOD_DOCKER="true"
+   ```
+
+When enabled, clod:
+- Installs the Docker CLI in the image (via the official Docker apt repo).
+- Bind-mounts `/var/run/docker.sock` into the container.
+- Sets `DOCKER_HOST=unix:///var/run/docker.sock`.
+- Adds the socket's group as a supplementary group (`--group-add`) so the
+  non-root container user can connect.
+
+### Requirements
+
+- Docker running on the host with the socket at `/var/run/docker.sock`
+  (or `DOCKER_HOST=unix://...` set on the host).
+- A debian-family base image (all of clod's defaults are).
+
+### Usage Examples
+
+**Enable Docker for a domain:**
+
+```bash
+echo "true" > .clod/docker
+clod "Add a Dockerfile that builds this Go service and verify it with docker build"
+```
+
+**One-off enable without changing the domain default:**
+
+```bash
+CLOD_DOCKER=true clod "Spin up a container from the image and run its tests"
+```
+
+**Verify access inside a session:**
+
+```bash
+clod
+# Then ask: "Run docker info and docker ps to verify docker access"
 ```
 
 ## Configuration File for Default Flags
@@ -868,6 +940,7 @@ Clod configuration is "relocatable" (with care) - you can check in parts of
 - `.clod/image` - Base image selection (optional)
 - `.clod/concurrent` - Concurrency setting (optional)
 - `.clod/gpus` - GPU configuration (optional)
+- `.clod/docker` - Docker daemon forwarding (optional, default off)
 - `.clod/claude-default-flags` - Default flags (optional)
 
 ### Example Team Workflow
@@ -892,6 +965,7 @@ contains no credentials or hard-coded paths.
 - `CLOD_CONCURRENT` - Enable concurrent instances (overrides `.clod/concurrent` file)
 - `CLOD_RUNTIME_SUFFIX` - Specify runtime directory suffix (auto-generated if not set)
 - `CLOD_SSH` - SSH credential forwarding: `true`, `false`, or path to key file (overrides `.clod/ssh` file)
+- `CLOD_DOCKER` - Docker daemon forwarding: `true` or `false` (overrides `.clod/docker` file)
 - `CLOD_GPUS` - GPU support: `all`, specific GPU IDs, or empty to disable (overrides `.clod/gpus` file)
 - `MCP_TOOL_TIMEOUT` - Permission prompt timeout (optional)
 
