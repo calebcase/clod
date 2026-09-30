@@ -42,6 +42,18 @@ var initSSHOptions = []initSSHOption{
 	{"true", "true", "Require a pre-existing SSH agent; fail if none."},
 }
 
+// initDockerOption is one docker forwarding mode for `.clod/docker`.
+type initDockerOption struct {
+	Value       string
+	Label       string
+	Description string
+}
+
+var initDockerOptions = []initDockerOption{
+	{"false", "false (recommended)", "No Docker access from the container."},
+	{"true", "true", "Forward the host Docker daemon into the container (docker CLI installed; DOCKER_HOST set)."},
+}
+
 // initModelOption is one model choice for `claude --model`. Values must
 // match what the model-switch reaction emoji mapping uses so that the
 // indicator reaction ends up consistent after setup.
@@ -213,6 +225,7 @@ type pendingInit struct {
 	Templates    []string // sibling task names available as templates (empty for none)
 	SelImage     string   // currently-selected image value
 	SelSSH       string   // currently-selected ssh mode
+	SelDocker    string   // currently-selected docker forwarding mode
 	SelModel     string   // currently-selected model (value from initModelOptions)
 	SelTemplate  string   // currently-selected template (sibling task name) or "" for none
 	SelPackages  []string // currently-selected package indices (as strings)
@@ -402,6 +415,35 @@ func buildInitPromptBlocks(p *pendingInit, progressKey string) []slack.Block {
 	sshRadio.InitialOption = initialSSH
 	blocks = append(blocks, slack.NewActionBlock("init_ssh_row", sshRadio))
 
+	// Docker daemon forwarding (radio).
+	dockerOpts := make([]*slack.OptionBlockObject, 0, len(initDockerOptions))
+	var initialDocker *slack.OptionBlockObject
+	for _, o := range initDockerOptions {
+		label := truncateForSlackText(o.Label, 75)
+		desc := truncateForSlackText(o.Description, 75)
+		opt := slack.NewOptionBlockObject(
+			o.Value,
+			slack.NewTextBlockObject("plain_text", label, false, false),
+			slack.NewTextBlockObject("plain_text", desc, false, false),
+		)
+		dockerOpts = append(dockerOpts, opt)
+		if o.Value == p.SelDocker {
+			initialDocker = opt
+		}
+	}
+	if initialDocker == nil && len(dockerOpts) > 0 {
+		initialDocker = dockerOpts[0]
+	}
+	blocks = append(blocks,
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", "*Docker daemon forwarding*", false, false),
+			nil, nil,
+		),
+	)
+	dockerRadio := slack.NewRadioButtonsBlockElement("init_docker", dockerOpts...)
+	dockerRadio.InitialOption = initialDocker
+	blocks = append(blocks, slack.NewActionBlock("init_docker_row", dockerRadio))
+
 	// Model (radio). The selection becomes the thread's stored Model
 	// preference and gets forwarded to claude as --model on every run
 	// until the user switches via reaction emoji.
@@ -506,7 +548,7 @@ var requiredAptPackages = []string{}
 // CreateDir is set) using the user's selections. Mirrors the file layout
 // that `bin/clod`'s `initialize()` produces; clod's next invocation will
 // detect the missing `.clod/system/` and populate it automatically.
-func writeInitFiles(p *pendingInit, image, sshMode string, packages []string) error {
+func writeInitFiles(p *pendingInit, image, sshMode, dockerMode string, packages []string) error {
 	if p.CreateDir {
 		if err := os.MkdirAll(p.TaskPath, 0o755); err != nil {
 			return fmt.Errorf("create task dir: %w", err)
@@ -530,6 +572,9 @@ func writeInitFiles(p *pendingInit, image, sshMode string, packages []string) er
 		return err
 	}
 	if err := writeFile("ssh", sshMode+"\n"); err != nil {
+		return err
+	}
+	if err := writeFile("docker", dockerMode+"\n"); err != nil {
 		return err
 	}
 

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Docker daemon forwarding** — a domain can now use the host's Docker
+  daemon from inside its container so Docker-related coding (writing and
+  building images, running and debugging containers, pushing) works
+  in-sandbox.
+  - Opt-in per domain: `echo "true" > .clod/docker`, or one-shot
+    `CLOD_DOCKER=true clod ...`. Off by default.
+  - clod installs the `docker-ce-cli` client in the image (official Docker
+    apt repo) only when forwarding is enabled, bind-mounts
+    `/var/run/docker.sock` at the same path, sets `DOCKER_HOST`, and adds
+    the socket's group via `--group-add` so the non-root user can connect.
+  - This is a socket forward, not Docker-in-Docker: no nested daemon, no
+    privileged container, and images/containers the agent creates land in
+    the host's docker (visible to other domains and host tooling). The
+    forwarded socket is root-equivalent on the host, so keep it off for
+    domains that don't need it.
+  - The Slack bot's domain setup prompt now offers the docker forwarding
+    choice alongside image, SSH, and model.
+
+## [0.39.1] - 2026-09-29
+
 ### Fixed
 - **Truecolor in containers** — `docker run` now sets `COLORTERM=truecolor`
   (and passes through `$TERM`, defaulting to `xterm-256color`). Crush's

@@ -3452,6 +3452,7 @@ func (h *Handler) postInitPrompt(
 		Templates:    templates,
 		SelImage:     initImageOptions[0].Value,
 		SelSSH:       initSSHOptions[0].Value,
+		SelDocker:    initDockerOptions[0].Value,
 		SelModel:     selModel,
 		SelTemplate:  "",
 		SelPackages:  selPkgs,
@@ -5071,6 +5072,7 @@ func (h *Handler) HandleBlockAction(
 	isAskQuestionDiscuss := action.ActionID == "askq_discuss"
 	isInitSelect := action.ActionID == "init_image" ||
 		action.ActionID == "init_ssh" ||
+		action.ActionID == "init_docker" ||
 		action.ActionID == "init_model" ||
 		action.ActionID == "init_template" ||
 		action.ActionID == "init_step1_choice" ||
@@ -5427,6 +5429,10 @@ func (h *Handler) handleInitSelect(
 		if action.SelectedOption.Value != "" {
 			state.SelSSH = action.SelectedOption.Value
 		}
+	case "init_docker":
+		if action.SelectedOption.Value != "" {
+			state.SelDocker = action.SelectedOption.Value
+		}
 	case "init_model":
 		if action.SelectedOption.Value != "" {
 			state.SelModel = action.SelectedOption.Value
@@ -5461,6 +5467,7 @@ func (h *Handler) handleInitSelect(
 		Str("action_id", action.ActionID).
 		Str("image", state.SelImage).
 		Str("ssh", state.SelSSH).
+		Str("docker", state.SelDocker).
 		Str("model", state.SelModel).
 		Str("template", state.SelTemplate).
 		Strs("packages", state.SelPackages).
@@ -5583,7 +5590,7 @@ func (h *Handler) handleInitFinal(
 		state.CreateDir = false
 	}
 
-	if err := writeInitFiles(state, state.SelImage, state.SelSSH, chosenPkgs); err != nil {
+	if err := writeInitFiles(state, state.SelImage, state.SelSSH, state.SelDocker, chosenPkgs); err != nil {
 		logger.Error().Err(err).Msg("failed to write init files")
 		msg := fmt.Sprintf(":x: Couldn't create the domain setup: %v", err)
 		if updErr := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, msg); updErr != nil {
@@ -5619,8 +5626,8 @@ func (h *Handler) handleInitFinal(
 		tplLine = fmt.Sprintf("\n• Template: `%s`", state.SelTemplate)
 	}
 	outcome := fmt.Sprintf(
-		":white_check_mark: *Domain `%s` initialized* by <@%s>\n• Image: `%s`\n• SSH: `%s`\n• Model: `%s`%s%s\n_Starting the session now…_",
-		state.TaskName, callback.User.ID, state.SelImage, state.SelSSH, state.SelModel, tplLine, pkgLine,
+		":white_check_mark: *Domain `%s` initialized* by <@%s>\n• Image: `%s`\n• SSH: `%s`\n• Docker: `%s`\n• Model: `%s`%s%s\n_Starting the session now…_",
+		state.TaskName, callback.User.ID, state.SelImage, state.SelSSH, state.SelDocker, state.SelModel, tplLine, pkgLine,
 	)
 	if err := h.bot.UpdateMessage(state.ChannelID, state.MessageTS, outcome); err != nil {
 		logger.Error().Err(err).Msg("failed to update init prompt after success")
