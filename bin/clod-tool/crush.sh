@@ -108,20 +108,30 @@ sync_crush_config() {
 # binary from the GitHub release and writes the crush-wrapper
 # entrypoint script.
 tool_dockerfile_root_section() {
+    # Bake the version pin into an ARG (read host-side). The .clod/
+    # dir is a hidden directory and is EXCLUDED from the docker build
+    # context, so the build-time RUN cannot `cat .clod/crush-version`
+    # directly. Editing the pin file still changes the .clod hash
+    # (top-level file), which re-runs initialize() and re-emits this
+    # ARG with the new value.
+    local pin=""
+    if [[ -f .clod/crush-version ]]; then
+        pin="$(tr -d '[:space:]' < .clod/crush-version)"
+    fi
+    printf 'ARG CRUSH_PIN="%s"\n' "$pin"
     cat <<'EOF'
 # Install Crush from the GitHub release. The version is pinned via
-# .clod/crush-version if present, otherwise `latest` is resolved
-# through the GitHub API at build time. .clod/crush-version is a
-# top-level file so it's part of the change-detection hash and a
-# version bump rebuilds the image automatically. The release
-# tarball nests its files under `crush_<ver>_<arch>/`.
+# .clod/crush-version if present (baked into CRUSH_PIN by the driver),
+# otherwise `latest` is resolved through the GitHub API at build
+# time. The release tarball nests its files under
+# `crush_<ver>_<arch>/`.
 #
 # The clod-build-time secret (set by .clod/system/build to the
 # wall-clock time of the clod invocation that triggered the build)
 # is part of this RUN step's cache key, so every rebuild re-runs
 # the install and re-resolves `latest` instead of serving a stale
-# cached layer. A non-empty .clod/crush-version always wins, so
-# pinned builds stay reproducible.
+# cached layer. A non-empty pin always wins, so pinned builds stay
+# reproducible.
 RUN --mount=type=secret,id=clod-build-time,target=/clod-build-time \
     set -eux; \
     arch="$(uname -m)"; \
@@ -130,8 +140,8 @@ RUN --mount=type=secret,id=clod-build-time,target=/clod-build-time \
         aarch64) asset='Linux_arm64' ;; \
         *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
-    if [ -s .clod/crush-version ]; then \
-        ver="$(cat .clod/crush-version)"; \
+    if [ -n "$CRUSH_PIN" ]; then \
+        ver="$CRUSH_PIN"; \
     else \
         ver="$(curl -fsSL https://api.github.com/repos/charmbracelet/crush/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"; \
     fi; \

@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Codex support** — run [OpenAI Codex](https://github.com/openai/codex)
+  instead of Claude Code or Crush in a clod domain:
+  - `clod-codex` switches the active tool per directory (persisted in
+    `.clod/tool`), like `clod-crush`.
+  - Codex is installed from its GitHub release (the packaged
+    `codex-package-*.tar.gz`, verified by SHA-256) at build time; pin a
+    version with `.clod/codex-version` (bare version,
+    e.g. `0.160.1` — release tags are `rust-vX.Y.Z`). The package is
+    installed to `/opt/codex` inside the image so codex's app-server
+    daemon finds its complete local package (the bare single-binary
+    release fails with "no complete local package").
+  - All codex state (config.toml, auth.json, sessions) lives under
+    `CODEX_HOME`, which clod pins to the container user's `~/.codex`
+    and bind-mounts `.clod/codex/` over it, so a single volume covers
+    config, credentials, and session persistence.
+  - Auth is shared with the host both ways: a host `~/.codex` login is
+    seeded into the domain on first use, and if the host has no codex
+    config at all, a login done in the container initializes the
+    host's `~/.codex` (so neither side re-logs-in on the next start).
+    Once the host has any `~/.codex` content, clod leaves it alone.
+  - Sessions persist in `.clod/codex/sessions/`, so
+    `codex resume --last` works across container rebuilds.
+  - The container is the sandbox: codex runs with
+    `--sandbox danger-full-access` by default (its own bubblewrap
+    sandbox needs user namespaces that Docker's default seccomp
+    profile blocks). Override per domain with `.clod/codex-sandbox`
+    (`container` | `off` | `workspace-write` | `read-only`; the last two
+    add `--privileged` to the container). A `--sandbox` you pass
+    yourself always wins.
+  - `.clod/codex-default-flags` provides per-domain default flags.
+### Fixed
+- **Crush version pinning** — `.clod/crush-version` was silently ignored:
+  the build-time install read the file from the docker build context, but
+  the hidden `.clod/` directory is excluded from that context, so every
+  build fell back to `latest`. The pin is now baked into the Dockerfile
+  as an ARG at init time, which works regardless of context filtering.
+  (The same bug affected codex's `.clod/codex-version`, which was
+  introduced in this release and fixed before shipping.)
 - **Docker daemon forwarding** — a domain can now use the host's Docker
   daemon from inside its container so Docker-related coding (writing and
   building images, running and debugging containers, pushing) works
