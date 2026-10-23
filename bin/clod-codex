@@ -1,0 +1,8 @@
+#!/bin/env bash
+# Start a clod session with Codex. Equivalent to running `clod` with
+# CLOD_TOOL=codex: persists the tool choice to .clod/tool for this
+# directory and switches it to codex if it was on something else
+# (e.g. claude).
+set -euo pipefail
+export CLOD_TOOL=codex
+exec "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/clod" "$@"

@@ -1,8 +1,8 @@
 # clod <sub>*ˈkläd*</sub>
 
-Run [claude code][claude-code] (or [Crush][crush]) in a modestly more secure way.
+Run [claude code][claude-code] (or [Crush][crush] or [Codex][codex]) in a modestly more secure way.
 
-**Version 0.40.0**
+**Version 0.41.3**
 
 ## Features
 
@@ -27,7 +27,7 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed release notes and version history.
 Copy and paste this command to install clod:
 
 ```bash
-mkdir -p ~/src/github.com/calebcase && cd ~/src/github.com/calebcase && git clone https://github.com/calebcase/clod.git && mkdir -p ~/bin && ln -sf ~/src/github.com/calebcase/clod/bin/clod ~/bin/clod && ln -sf ~/src/github.com/calebcase/clod/bin/clod-claude ~/bin/clod-claude && ln -sf ~/src/github.com/calebcase/clod/bin/clod-crush ~/bin/clod-crush && RCFILE="${HOME}/.$(basename $SHELL)rc" && grep -q 'PATH.*HOME/bin' "$RCFILE" 2>/dev/null || echo 'export PATH=$PATH:$HOME/bin' >> "$RCFILE" && export PATH=$PATH:$HOME/bin && echo "✓ Installation complete! Run 'clod' (Claude Code), 'clod-claude', or 'clod-crush' to start, or restart your shell."
+mkdir -p ~/src/github.com/calebcase && cd ~/src/github.com/calebcase && git clone https://github.com/calebcase/clod.git && mkdir -p ~/bin && ln -sf ~/src/github.com/calebcase/clod/bin/clod ~/bin/clod && ln -sf ~/src/github.com/calebcase/clod/bin/clod-claude ~/bin/clod-claude && ln -sf ~/src/github.com/calebcase/clod/bin/clod-crush ~/bin/clod-crush && ln -sf ~/src/github.com/calebcase/clod/bin/clod-codex ~/bin/clod-codex && RCFILE="${HOME}/.$(basename $SHELL)rc" && grep -q 'PATH.*HOME/bin' "$RCFILE" 2>/dev/null || echo 'export PATH=$PATH:$HOME/bin' >> "$RCFILE" && export PATH=$PATH:$HOME/bin && echo "✓ Installation complete! Run 'clod' (Claude Code), 'clod-claude', 'clod-crush', or 'clod-codex' to start, or restart your shell."
 ```
 
 This will:
@@ -35,7 +35,7 @@ This will:
 2. Create `~/bin` directory if needed
 3. Add `~/bin` to your PATH in shell config (`.bashrc`, `.zshrc`, etc.)
 4. Add `~/bin` to current shell's PATH
-5. Create symlinks to the `clod`, `clod-claude`, and `clod-crush` scripts
+5. Create symlinks to the `clod`, `clod-claude`, `clod-crush`, and `clod-codex` scripts
 
 ### Manual Install
 
@@ -45,6 +45,7 @@ If you already have the repo cloned, link it to your home bin directory:
 ln -sf ~/src/github.com/calebcase/clod/bin/clod ~/bin/clod
 ln -sf ~/src/github.com/calebcase/clod/bin/clod-claude ~/bin/clod-claude
 ln -sf ~/src/github.com/calebcase/clod/bin/clod-crush ~/bin/clod-crush
+ln -sf ~/src/github.com/calebcase/clod/bin/clod-codex ~/bin/clod-codex
 ```
 
 If you don't have a home bin directory:
@@ -107,16 +108,17 @@ New directories initialized with clod will use this config as the base.
 ## Choosing your agent
 
 clod supports multiple coding agents. The default is Claude Code, but you can
-switch a directory to Crush (or back) by using the matching script:
+switch a directory to Crush or Codex (or back) by using the matching script:
 
 ```bash
 clod-claude   # run Claude Code in this directory
 clod-crush    # run Crush in this directory
+clod-codex    # run Codex in this directory
 ```
 
 The tool choice is stored in `.clod/tool` per directory, so each directory
 remembers which agent it last used. `clod` with no tool set defaults to
-Claude Code. `CLOD_TOOL=crush clod ...` is equivalent and persists the
+Claude Code. `CLOD_TOOL=<tool> clod ...` is equivalent and persists the
 choice the same way. Switching tools rebuilds the image for that
 directory; staying on the same tool is a no-op rebuild.
 
@@ -169,6 +171,64 @@ domains:
 The host service keeps its `127.0.0.1`-only binding; no host
 networking, no sysctl changes, no root required (`ncat` must be on
 the host).
+
+### Codex
+
+Codex is installed in the container from its GitHub release, defaulting
+to `latest` at build time. Every image build passes a per-invocation
+build secret, so re-resolving `latest` happens on each rebuild rather
+than serving a cached layer. To upgrade to the newest release, force a
+rebuild:
+
+```bash
+CLOD_REINIT=true clod-codex
+```
+
+To pin a version (reproducible rebuilds; a pinned version always wins
+over `latest`; bare version, e.g. `0.160.1` — release tags are
+`rust-vX.Y.Z`):
+
+```bash
+echo 0.160.1 > .clod/codex-version
+clod-codex
+```
+
+Codex keeps all of its state under `CODEX_HOME`; clod pins that to the
+container user's `~/.codex` and bind-mounts `.clod/codex/` over it.
+Sessions persist in `.clod/codex/sessions/`, so `codex resume --last`
+works across container rebuilds. Per-domain default flags go in
+`.clod/codex-default-flags` (same shape as `.clod/claude-default-flags`).
+
+The container is the sandbox: by default clod runs codex with
+`--sandbox danger-full-access`, so codex skips its own bubblewrap
+sandbox (which double-sandboxes the container and needs user
+namespaces that Docker's default seccomp profile blocks) while keeping
+its approval prompts. Override per domain with `.clod/codex-sandbox`:
+`container` (default), `off` (you manage `--sandbox` yourself), or
+`workspace-write` / `read-only` to run codex's own sandbox (clod adds
+`--privileged` to the container for these). A `--sandbox` you pass on
+the command line or in `.clod/codex-default-flags` always wins.
+
+Authenticate once (credentials land in `.clod/codex/auth.json` and
+stick):
+
+```bash
+clod-codex login                  # browser OAuth
+clod-codex login --device-auth    # no local browser needed (e.g. SSH)
+```
+
+Codex credentials are shared with the host, like the other drivers: if
+the host has a usable file-based login (`~/.codex/auth.json` with
+tokens or an API key), the domain picks it up automatically — and if
+the domain's own `auth.json` is missing or broken (e.g. a tokenless
+placeholder that makes codex exit with "plan type is required"), clod
+replaces it with the host's. A valid domain login is never overwritten.
+If the host has no codex config at all, a login done in the container
+initializes the host's `~/.codex` so neither side logs in again. Once
+the host has any `~/.codex` content, host-side state belongs to the
+host and clod leaves it alone. Note codex's default "auto" credential
+storage may keep a host login in the OS keyring; only a file-based
+host login is shareable.
 
 ### External editors
 
@@ -269,17 +329,24 @@ After initialization, the `.clod/` directory contains:
 ├── ssh                       # Optional: SSH forwarding ("true", "false", or key path)
 ├── docker                    # Optional: Docker daemon forwarding ("true"/"false", default off)
 ├── gpus                      # Optional: GPU support ("all", device IDs, or empty)
-├── tool                      # Active tool: claude (default) or crush
+├── tool                      # Active tool: claude (default), crush, or codex
 ├── crush-version             # Optional: pinned crush release (e.g. v0.94.2)
+├── codex-version             # Optional: pinned codex release (e.g. 0.160.1)
+├── codex-sandbox             # Optional: container (default) | off | workspace-write | read-only
 ├── claude-default-flags      # Optional: Default flags
 ├── crush-default-flags       # Optional: Default flags (crush only)
+├── codex-default-flags       # Optional: Default flags (codex only)
 ├── runtime-{suffix}/         # Runtime files (FIFOs, MCP config) - per instance
 ├── claude/                   # Claude configuration (gitignored)
 │   ├── claude.json           # API key, settings, sessions
 │   └── ...
-└── crush/                    # Crush configuration (gitignored, crush only)
-    ├── config/               # Global crush config (crushrc / crush.json)
-    └── data/                 # Sessions (SQLite) - enables --resume
+├── crush/                    # Crush configuration (gitignored, crush only)
+│   ├── config/               # Global crush config (crushrc / crush.json)
+│   └── data/                 # Sessions (SQLite) - enables --resume
+└── codex/                    # Codex state (gitignored, codex only)
+    ├── auth.json             # Credentials (clod-codex login)
+    ├── config.toml           # Codex config
+    └── sessions/             # Rollout transcripts - enables codex resume
 ```
 
 ### Automatic Version Management
@@ -1153,5 +1220,6 @@ See [LICENSE](../LICENSE) file for details.
 
 [claude-code]: https://www.anthropic.com/claude-code
 [crush]: https://charm.land/crush
+[codex]: https://github.com/openai/codex
 [claude-permission-modes]: https://docs.anthropic.com/en/docs/claude-code/iam#permission-modes
 [claude-dangerously-skip-permissions]: https://docs.anthropic.com/en/docs/claude-code/devcontainer

@@ -11,8 +11,8 @@ Resolution order (first match wins):
 
 1. `CLOD_TOOL` environment variable.
 2. `.clod/tool` file in the working directory — persistent per-directory
-   choice, written by `clod-claude` / `clod-crush` (thin wrappers that set
-   `CLOD_TOOL` and exec `clod`).
+   choice, written by `clod-claude` / `clod-crush` / `clod-codex` (thin
+   wrappers that set `CLOD_TOOL` and exec `clod`).
 3. `claude` — the default, for backwards compatibility with
    pre-multi-tool clod.
 
@@ -62,3 +62,17 @@ known_hosts pinning, the SSH-agent/GPU/concurrency/run plumbing) live in
   change contents between runs unless you want a rebuild.
 - The container's stdout is a strict channel for the agent's output;
   diagnostic noise belongs on stderr with a `[clod]` prefix.
+- Build-time `RUN` steps cannot read files from the build context,
+  and the hidden `.clod/` directory is **excluded from the docker
+  build context** (BuildKit omits dot-dirs without a `.dockerignore`).
+  So a per-domain knob like `.clod/<tool>-version` must be baked into
+  the Dockerfile by `tool_dockerfile_root_section` reading the file
+  host-side (e.g. as `ARG TOOL_PIN="..."`); see the crush/codex
+  drivers. Runtime scripts and in-image scripts can read `.clod/`
+  freely because the domain dir is bind-mounted.
+- Inside a `COPY <<DEOF ...` in-image script (unquoted marker),
+  BuildKit expands `\$` to `$` and *removes* a backslash that
+  immediately precedes a newline while keeping the newline — so a
+  shell line continuation (`\` at end of line) does not join lines
+  the way it would in a quoted heredoc. Write multi-condition
+  commands on one line, or use a quoted marker and pre-escape.
